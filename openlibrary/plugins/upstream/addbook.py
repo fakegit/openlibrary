@@ -474,7 +474,7 @@ class SaveBookHelper:
         comment = formdata.pop('_comment', '')
 
         user = accounts.get_current_user()
-        delete = user and user.is_admin() and formdata.pop('_delete', '')
+        delete = user and (user.is_admin() or user.is_librarian()) and formdata.pop('_delete', '')
 
         formdata = utils.unflatten(formdata)
         work_data, edition_data = self.process_input(formdata)
@@ -687,7 +687,7 @@ class SaveBookHelper:
     def _prevent_system_subjects_deletion(self, work):
         # Allow admins to modify system systems
         user = accounts.get_current_user()
-        if user and user.is_admin():
+        if user and (user.is_admin() or user.is_librarian()):
             return
 
         # Note: work is the new work object from the formdata and self.work is the work doc from the database.
@@ -707,7 +707,7 @@ class SaveBookHelper:
     def _prevent_ocaid_deletion(self, edition):
         # Allow admins to modify ocaid
         user = accounts.get_current_user()
-        if user and user.is_admin():
+        if user and (user.is_admin() or user.is_librarian()):
             return
 
         # read ocaid from form data
