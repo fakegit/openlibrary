@@ -15,7 +15,7 @@ from infogami import config
 from infogami.utils import delegate
 from infogami.utils.view import render, public
 from infogami.utils.context import context
-from infogami.utils.view import add_flash_message
+from infogami.utils.flash import add_flash_message
 
 from openlibrary.catalog.add_book import update_ia_metadata_for_ol_edition, \
     create_ol_subjects_for_ocaid
