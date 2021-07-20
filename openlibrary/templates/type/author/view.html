@@ -1,42 +1,4 @@
 $def with (page)
-$if ctx.user and ("merge-authors" in ctx.features or ctx.user.is_admin()) and query_param('merge', 'false') == 'true':
-    <script type="text/javascript">
-    // <!--
-    window.q.push(function() {
-        if ("$query_param('merge', 'false')" == "true") {
-            \$("#preMerge").parent().andSelf().show();
-
-            $ duplicates = ["/authors/" + k for k in query_param("duplicates", "").split(",")]
-            var data = {
-                "master": "$page.key",
-                "duplicates": $:json_encode(duplicates)
-            };
-            /*
-            \$.post("/authors/merge.json", JSON.stringify(data),
-                function(result, status, req) {
-                    \$("#preMerge").fadeOut(); \$("#postMerge").fadeIn();
-                },
-                "json"
-            );
-            */
-
-            \$.ajax({
-                url: "/authors/merge.json",
-                type: "POST",
-                data: JSON.stringify(data),
-                success: function(data, textStatus, XMLHttpRequest) {
-                    \$("#preMerge").fadeOut();
-                    \$("#postMerge").fadeIn();
-                },
-                error: function(XMLHttpRequest, textStatus, errorThrown) {
-                    \$("#preMerge").fadeOut();
-                    \$("#errorMerge").fadeIn();
-                }
-            });
-        }
-    });
-    //-->
-    </script>
 
 $# Most authors are people, so only use org in the exceptional case that
 $# the record explicitly is labelled as such.
@@ -93,14 +55,14 @@ $set_share_links(url=request.canonical_url, title=title, view_context=ctx)
 <div id="contentBody">
 
     $if ctx.user and ("merge-authors" in ctx.features or ctx.user.is_admin()) and query_param('merge', 'false') == 'true':
-       <div class="message" style="display: none;">
-            <div id="preMerge" style="display: none;">
+        $ duplicates = ["/authors/" + k for k in query_param("duplicates", "").split(",")]
+        <div class="message" style="display: none;">
+            <div id="preMerge" style="display: none;" data-keys="$dumps({'master': page.key, 'duplicates': duplicates})">
                 <p class="larger collapse"><strong>$_('Merging Authors...')</strong></p>
                 <p class="collapse adjust"><img src="/images/ajax-loader-bar.gif" width="220" height="19" alt="$_('In progress...')"/></p>
                 <p class="smaller lightgreen collapse">$_('Duplicates')</p>
                 <p class="small collapse">
                     <ul>
-                        $ duplicates = ["/authors/" + k for k in query_param("duplicates", "").split(",")]
                         $for key in duplicates:
                              $ doc = get_document(key)
                              $if doc:
@@ -144,18 +106,9 @@ $set_share_links(url=request.canonical_url, title=title, view_context=ctx)
                     $ungettext("1 work", "%(count)d works", books.num_found, count=books.num_found)
                     <span class="count smaller"><a href="/books/add?author=$page.key">$_('Add another?')</a></span>
                 </h2>
-                <p id="books"><span class="tools">
+                <p id="books">
                 $if books.num_found > 1:
-                    <img src="/images/icons/icon_sort.png" alt="$_('Sorting by')" width="9" height="11" style="margin-right:5px;"/>
-                    $if books.sort == 'editions':
-                        <strong class="lightgreen">$_('Most Editions')</strong> | <a href="$changequery(sort='old')#editions">$_('First Published')</a> | <a href="$changequery(sort='new')#editions">$_('Most Recent')</a>
-                    $elif books.sort == 'old':
-                        <a href="$changequery(sort=None)#editions">$_('Most Editions')</a> | <strong class="lightgreen">$_('First Published')</strong> | <a href="$changequery(sort='new')#editions">$_('Most Recent')</a>
-                    $elif books.sort == 'new':
-                        <a href="$changequery(sort=None)#editions">$_('Most Editions')</a> |  <a href="$changequery(sort='old')#editions">$_('First Published')</a> | <strong class="lightgreen">$_('Most Recent')</strong>
-                    $elif books.sort == 'title':
-                        <a href="$changequery(sort=None)#editions">$_('Most Editions')</a> |  <a href="$changequery(sort='old')#editions">$_('First Published')</a> | <a href="$changequery(sort='new')#editions">$_('Most Recent')</a> | <strong class="lightgreen">$_('Title')</strong>
-                </span>
+                    $:render_template("search/sort_options.html", books.sort, exclude='relevance', default_sort='editions')
 
                 <p>
                   $if input(mode="everything").mode == "everything":
@@ -215,14 +168,11 @@ $set_share_links(url=request.canonical_url, title=title, view_context=ctx)
             $if page.links or page.remote_ids or (page.wikipedia and page.wikipedia.startswith("http")):
                 <ul class="booklinks sansserif">
                 $if page.remote_ids:
-                    $if page.remote_ids.isni:
-                       $ isni = page.remote_ids.isni
-                       <li>ISNI: <a itemprop="sameAs" href="http://www.isni.org/$isni">$' '.join([isni[i:i+4] for i in range(0, 16, 4)])</a></li>
-                    $if page.remote_ids.viaf:
-                        $ viaf = page.remote_ids.viaf
-                        <li>VIAF: <a itemprop="sameAs" href="https://viaf.org/viaf/$viaf">$viaf</a></li>
-                    $if page.remote_ids.wikidata:
-                        <li>Wikidata: <a itemprop="sameAs" href="https://tools.wmflabs.org/reasonator/?q=$page.remote_ids.wikidata">$page.remote_ids.wikidata</a></li>
+                    $ configured_ids = get_author_config()['identifiers']
+                    $for id in configured_ids:
+                        $if id.name in page.remote_ids:
+                            $ href = id.url.replace('@@@', page.remote_ids[id.name])
+                            <li>$id.label: <a itemprop="sameAs" href="$href">$page.remote_ids[id.name]</a></li>
                 $if page.wikipedia and page.wikipedia.startswith("http"):
                     <li><a itemprop="sameAs" href="$page.wikipedia">Wikipedia</a></li>
                 $for link in page.links:

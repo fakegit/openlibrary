@@ -13,6 +13,7 @@ import random
 import datetime
 import logging
 from time import time
+import math
 
 import infogami
 
@@ -346,6 +347,18 @@ class robotstxt(delegate.page):
         try:
             robots_file = 'norobots.txt' if 'dev' in infogami.config.features else 'robots.txt'
             data = open('static/' + robots_file).read()
+            raise web.HTTPError('200 OK', {}, data)
+        except IOError:
+            raise web.notfound()
+
+
+class opensearchxml(delegate.page):
+    path = '/opensearch.xml'
+
+    def GET(self):
+        web.header('Content-Type', 'text/plain')
+        try:
+            data = open('static/opensearch.xml').read()
             raise web.HTTPError('200 OK', {}, data)
         except IOError:
             raise web.notfound()
@@ -884,6 +897,8 @@ def setup_template_globals():
         'isbn_10_to_isbn_13': isbn_10_to_isbn_13,
         'NEWLINE': '\n',
         'random': random.Random(),
+        'get_lang': lambda: web.ctx.lang,
+        'ceil': math.ceil,
 
         # bad use of globals
         'is_bot': is_bot,

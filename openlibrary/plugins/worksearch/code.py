@@ -133,7 +133,7 @@ SORTS = {
 }
 OLID_URLS = {'A': 'authors', 'M': 'books', 'W': 'works'}
 
-re_to_esc = re.compile(r'[\[\]:]')
+re_to_esc = re.compile(r'[\[\]:/]')
 re_isbn_field = re.compile(r'^\s*(?:isbn[:\s]*)?([-0-9X]{9,})\s*$', re.I)
 re_author_key = re.compile(r'(OL\d+A)')
 re_fields = re.compile(r'(-?%s):' % '|'.join(ALL_FIELDS + list(FIELD_NAME_MAP)), re.I)
@@ -322,7 +322,10 @@ def parse_query_fields(q):
 def build_q_list(param):
     q_list = []
     if 'q' in param:
-        q_param = param['q'].strip()
+        # Solr 4+ has support for regexes (eg `key:/foo.*/`)! But for now, let's not
+        # expose that and escape all '/'. Otherwise `key:/works/OL1W` is interpreted as
+        # a regex.
+        q_param = param['q'].strip().replace('/', '\\/')
     else:
         q_param = None
     use_dismax = False
@@ -353,7 +356,10 @@ def build_q_list(param):
                 if v:
                     q_list.append("(author_name:(%(name)s) OR author_alternative_name:(%(name)s))" % {'name': v})
 
-        check_params = ['title', 'publisher', 'oclc', 'lccn', 'contribtor', 'subject', 'place', 'person', 'time']
+        check_params = [
+            'title', 'publisher', 'oclc', 'lccn', 'contributor', 'subject', 'place',
+            'person', 'time'
+        ]
         q_list += [
             '%s:(%s)' % (k, re_to_esc.sub(r'\\\g<0>', param[k]))
             for k in check_params if k in param
@@ -428,8 +434,12 @@ def run_solr_query(param=None, rows=100, page=1, sort=None, spellcheck_count=Non
         if use_dismax:
             params.append(('q', ' '.join(q_list)))
             params.append(('defType', 'dismax'))
-            params.append(('qf', 'text title^5 author_name^5'))
-            params.append(('bf', 'sqrt(edition_count)^10'))
+            if config.plugin_worksearch.get('solr8'):
+                params.append(('qf', 'text title^20 author_name^20'))
+                params.append(('bf', 'min(100,edition_count)'))
+            else:
+                params.append(('qf', 'text title^5 author_name^5'))
+                params.append(('bf', 'sqrt(edition_count)^10'))
         else:
             params.append(('q', ' '.join(q_list + ['_val_:"sqrt(edition_count)"^10'])))
 
@@ -1034,7 +1044,15 @@ class search_json(delegate.page):
     encoding = "json"
 
     def GET(self):
-        i = web.input()
+        i = web.input(author_key=[],
+                      subject_facet=[],
+                      person_facet=[],
+                      place_facet=[],
+                      time_facet=[],
+                      first_publish_year=[],
+                      publisher_facet=[],
+                      language=[],
+                      public_scan_b=[])
         if 'query' in i:
             query = json.loads(i.query)
         else:
