@@ -1,0 +1,163 @@
+{
+    "short_name": "Open Library",
+    "name": "Open Library: A page for every book published",
+    "description": "Open Library is an open, editable library catalog, building towards a web page for every book ever published. Read, borrow, and discover more than 3M books for free.",
+    "icons": [
+        {
+            "src": "/static/images/openlibrary-192x192.png",
+            "type": "image/png",
+            "sizes": "192x192"
+        },
+        {
+            "src": "/static/images/openlibrary-192x192-mask.png",
+            "type": "image/png",
+            "sizes": "192x192",
+            "purpose": "maskable"
+        },
+        {
+            "src": "/static/images/openlibrary-512x512.png",
+            "type": "image/png",
+            "sizes": "512x512"
+        },
+        {
+            "src": "/static/images/openlibrary-512x512-mask.png",
+            "type": "image/png",
+            "sizes": "512x512",
+            "purpose": "maskable"
+        }
+    ],
+    "start_url": "/?source=pwa",
+    "scope": "/",
+    "background_color": "#e2dcc5",
+    "display": "standalone",
+    "theme_color": "#e2dcc5",
+    "share_target": {
+        "action": "/search",
+        "method": "GET",
+        "enctype": "application/x-www-form-urlencoded",
+        "params": {
+            "text": "q"
+        }
+    },
+      "screenshots": [
+        {
+          "src": "/static/images/screenshots/desktop/MainPageDesktop.png",
+          "sizes": "1280x720",
+          "type": "image/png",
+          "form_factor": "wide",
+          "label": "Main Page - Desktop"
+        },
+        {
+          "src": "/static/images/screenshots/desktop/SearchBooksDesktop.png",
+          "sizes": "1280x720",
+          "type": "image/png",
+          "form_factor": "wide",
+          "label": "Search Books - Desktop"
+        },
+        {
+          "src": "/static/images/screenshots/desktop/StudentLibraryDesktop.png",
+          "sizes": "1280x720",
+          "type": "image/png",
+          "form_factor": "wide",
+          "label": "Student Library - Desktop"
+        },
+        {
+          "src": "/static/images/screenshots/desktop/TrendingDesktop.png",
+          "sizes": "1280x720",
+          "type": "image/png",
+          "form_factor": "wide",
+          "label": "Trending - Desktop"
+        },
+        {
+          "src": "/static/images/screenshots/desktop/ListsDesktop.png",
+          "sizes": "1280x720",
+          "type": "image/png",
+          "form_factor": "wide",
+          "label": "Lists - Desktop"
+        },
+        {
+          "src": "/static/images/screenshots/mobile/MainPageMobile.png",
+          "sizes": "1080x2160",
+          "type": "image/png",
+          "form_factor": "narrow",
+          "label": "Main Page - Mobile"
+        },
+        {
+          "src": "/static/images/screenshots/mobile/BorrowMobile.png",
+          "sizes": "1080x2160",
+          "type": "image/png",
+          "form_factor": "narrow",
+          "label": "Borrow - Mobile"
+        },
+        {
+          "src": "/static/images/screenshots/mobile/ExplorerMobile.png",
+          "sizes": "1080x2160",
+          "type": "image/png",
+          "form_factor": "narrow",
+          "label": "Explorer - Mobile"
+        },
+        {
+          "src": "/static/images/screenshots/mobile/SearchMobile.png",
+          "sizes": "1080x2160",
+          "type": "image/png",
+          "form_factor": "narrow",
+          "label": "Search Books - Mobile"
+        },
+        {
+          "src": "/static/images/screenshots/mobile/StudentLibraryMobile.png",
+          "sizes": "1080x2160",
+          "type": "image/png",
+          "form_factor": "narrow",
+          "label": "Student Library - Mobile"
+        },
+        {
+          "src": "/static/images/screenshots/mobile/ListsMobile.png",
+          "sizes": "1080x2160",
+          "type": "image/png",
+          "form_factor": "narrow",
+          "label": "Lists - Mobile"
+        }
+      ],
+    "shortcuts": [
+      {
+        "name": "My Books",
+        "url": "/account/books",
+        "description": "Your loans, lists, and reading log"
+      },
+      {
+        "name": "Subjects",
+        "url": "/subjects",
+        "description": "Browse books by subject"
+      },
+      {
+        "name": "Trending",
+        "url": "/trending",
+        "description": "Browse books that are trending"
+      },
+      {
+        "name": "Explore",
+        "url": "/explore",
+        "description": "Browse books using the Library Explorer"
+      },
+      {
+        "name": "Collections",
+        "url": "/collections",
+        "description": "Browse collections curated by our community librarians"
+      },
+      {
+        "name": "Lists",
+        "url": "/lists",
+        "description": "Browse book lists created by members of the community"
+      },
+      {
+        "name": "Random Book",
+        "url": "/random",
+        "description": "Teleport to a random, readable book"
+      },
+      {
+        "name": "Advanced Search",
+        "url": "/advancedsearch",
+        "description": "Search for books using specific fields like publication date"
+      }
+  ]
+}

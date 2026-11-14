@@ -1,0 +1,103 @@
+.right.illustration {
+  margin: 0 0 var(--spacing-stack-xl) 30px;
+}
+.left.illustration {
+  margin: 0 30px var(--spacing-stack-xl) 0;
+}
+.illustration {
+  text-align: center;
+  margin-bottom: var(--spacing-stack-sm);
+  position: relative;
+  z-index: var(--z-index-base);
+  /* Contain the cover's behind-parent animation layer (.cover-animation,
+     z-index: behind) explicitly, so it stays contained even if the z-index
+     above is ever removed. */
+  isolation: isolate;
+}
+.illustration img {
+  width: 180px;
+  border-radius: var(--border-radius-thumbnail);
+  box-shadow: 1px 1px 2px 0 var(--book-cover-shadow-color);
+}
+/* Enlarged cover in the preview <ol-dialog>, inside .illustration. Shown at
+   intrinsic size, capped to the dialog's max height minus body
+   padding and the ~3rem title row, so it never scrolls. */
+ol-dialog img.cover-preview {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: calc(
+    var(--ol-dialog-max-height) - 2 * var(--ol-dialog-padding) - 3.5rem
+  );
+  margin-inline: auto;
+}
+.illustration .SRPCoverBlank {
+  position: relative;
+  width: 148px;
+  height: 225px;
+  min-width: 175px;
+  min-height: 250px;
+  padding: var(--spacing-inset-md);
+  text-align: center;
+  background: var(--lighter-grey);
+  font-size: inherit;
+  display: none;
+}
+.illustration .SRPCoverBlank .innerBorder {
+  border: 2px solid var(--white);
+  width: 144px;
+  height: 221px;
+  margin: 0 auto;
+}
+.illustration .SRPCoverBlank.author {
+  position: relative;
+  width: 131px;
+  height: 180px;
+  text-align: center;
+  background: transparent url(/static/images/icons/avatar_author-lg.png) 15px
+    15px no-repeat;
+  font-size: inherit;
+  margin: 0 auto;
+  display: none;
+}
+.illustration .BookTitle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 108px;
+  margin-left: -54px;
+  height: 100px;
+  margin-top: -50px;
+  color: var(--color-text);
+  overflow-wrap: break-word;
+}
+.illustration .author .BookTitle {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 108px;
+  margin-left: -54px;
+  height: 80px;
+  margin-top: -40px;
+  color: var(--black);
+  display: none;
+}
+.illustration .Author {
+  color: var(--color-text-secondary);
+  font-style: italic;
+  padding: var(--spacing-inset-xs) var(--spacing-inset-xs) 0;
+  font-size: var(--font-size-label-small);
+}
+.illustration .edition {
+  font-size: 0.6875em;
+  font-family: var(--font-family-body);
+  margin: var(--spacing-stack-sm) auto;
+}
+.editionCover .SRPCoverBlank {
+  width: auto;
+  height: auto;
+}
+.editEditionCover .SRPCoverBlank {
+  left: 22px;
+}

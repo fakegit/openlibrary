@@ -1,0 +1,95 @@
+/**
+ * PageBanner
+ * https://docs.openlibrary.org/designers/design-pattern-library.html#pagebanner
+ */
+.page-banner {
+  display: block;
+  color: var(--white);
+  font-family: var(--font-family-body);
+  background: var(--dark-grey);
+  padding: 15px;
+  border-bottom: 1px solid var(--color-border-subtle);
+  z-index: var(--z-index-raised);
+}
+.page-banner-mybooks {
+  color: var(--black);
+  background: var(--grey-blue);
+  border: 1px solid var(--blue-b0bed9);
+  font-weight: var(--font-weight-medium);
+}
+.page-banner-black {
+  background-color: var(--dark-grey);
+  padding: 5px;
+}
+.page-banner-black .cta {
+  padding: 4px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--grey-555);
+  font-weight: var(--font-weight-medium);
+  text-decoration: none;
+  background: var(--grey-464646);
+  margin: 0 5px;
+}
+.page-banner .button {
+  border-radius: 5px;
+  padding: 8px 10px;
+  cursor: pointer;
+  display: inline;
+  border: 1px solid var(--mid-blue);
+}
+/* stylelint-disable selector-max-specificity */
+/* FIXME: Is this actually used anywhere? I think this block can be removed. */
+.page-banner a.button {
+  text-decoration: none;
+  background: var(--mid-blue);
+  color: var(--white);
+}
+.page-banner a.button:hover {
+  background: var(--button-hover-blue);
+  color: var(--white);
+}
+/* stylelint-enable selector-max-specificity */
+.page-banner-body {
+  font-size: 0.9em;
+  padding: 10px;
+  line-height: 25px;
+  text-align: center;
+}
+.page-banner--dismissable {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--white);
+  font-family: var(--font-family-body);
+  background: var(--dark-grey);
+  padding: 15px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.page-banner--dismissable-content {
+  flex: 1;
+  text-align: center;
+}
+.page-banner--dismissable-close {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  cursor: pointer;
+}
+.page-banner--dismissable-close::before,
+.page-banner--dismissable-close::after {
+  width: var(--focus-width);
+  height: var(--font-size-title-large);
+  background-color: var(--grey);
+  content: " ";
+  display: block;
+  position: absolute;
+  border-radius: var(--border-radius-sm);
+}
+.page-banner--dismissable-close::after {
+  transform: rotate(45deg);
+}
+.page-banner--dismissable-close::before {
+  transform: rotate(-45deg);
+}

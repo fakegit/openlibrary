@@ -12,10 +12,12 @@ $var title: $page.key
     <p><strong>$_("What would you like to do?")</strong></p>
 
     <ul>
-      <li><a href="javascript:;" onclick="history.go(-1);">$_("Go back where I came from")</a></li>
-      $if ctx.user and ctx.user.is_admin():
+      <li><a href="javascript:;" class="go-back-link">$_("Go back where I came from")</a></li>
+      $if ctx.user:
+        $# Prevent crawling; only show to logged-in users
         <li><a href="$url(v=page.revision - 1)">$_("View the previous version")</a></li>
-        <li><a href="$url(m='edit', v=page.revision - 1)">$_("Recreate it")</a></li>
         <li><a href="$url(m='history')">$_("See the page's history")</a></li>
+        $if ctx.user.is_librarian_or_higher():
+            <li><a href="$url(m='edit', v=page.revision - 1)">$_("Recreate it")</a></li>
     </ul>
 </div>

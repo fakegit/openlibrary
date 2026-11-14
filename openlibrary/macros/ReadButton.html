@@ -1,4 +1,4 @@
-$def with(ocaid, borrow=False, listen=False, loan=None, label='', printdisabled=False)
+$def with(ocaid, analytics_attr, borrow=False, listen=False, loan=None, label='', printdisabled=False, edition_key=None, book_title='')
 
 $ stream_url = "/borrow/ia/%s?ref=ol" % ocaid
 
@@ -6,32 +6,41 @@ $if printdisabled:
   $ action = "read"
   $ label = _("Special Access")
   $ title = _("Special ebook access from the Internet Archive for patrons with qualifying print disabilities")
+  $ analytics_action = "PrintDisabled"
 $elif (borrow and not loan):
   $ action = "borrow"
   $ label = label or _("Borrow")
   $ title = _("Borrow ebook from Internet Archive")
+  $ analytics_action = "Borrow"
 $else:
   $ action = "read"
   $ label = _("Read")
   $ title = _("Read ebook from Internet Archive")
+  $ analytics_action = "Read"
 
-<div class="cta-button-group">
-  <a href="$(stream_url)" title="$title" class="cta-btn cta-btn--available cta-btn--$(action)"
-     $if loan:
-       data-userid="$(loan['userid'])"
-     $elif printdisabled:
-       data-ol-link-track="CTAClick|PrintDisabled"
-     $elif borrow:
-       data-ol-link-track="CTAClick|Borrow"
-     $else:
-       data-ol-link-track="CTAClick|Read"
-    >$label</a>
-  $if listen:
-    <a href="$(stream_url)&_autoReadAloud=show"
-       title="$title using Read Aloud"
-       data-ol-link-track="CTAClick|$(action.capitalize())Listen"
-       class="cta-btn cta-btn--available">
-      <span class="btn-icon read-aloud"></span>
-      <span class="btn-label">$_('Listen')</span>
-    </a>
-</div>
+$ user = get_current_user()
+$ data_attr = get_preserve_intent_attrs(label, book_title, "book", "/books/%s" % edition_key) if (action == 'borrow') else ""
+$ login_class = "js-login-intent" if (data_attr and not user) else ""
+
+$ menu_items = [listen, edition_key]
+$ is_carousel = "BookCarousel" in str(analytics_attr(analytics_action))
+$if any(menu_items) and not is_carousel:
+  <div class="cta-dropper cta-button-group">
+    <a href="$(stream_url)" title="$title" class="cta-btn cta-btn--available cta-btn--$(action) $(login_class)"
+        $:analytics_attr(analytics_action)
+        $:data_attr
+        $if loan:
+          data-userid="$(loan['userid'])"
+        >$label</a>
+    $ listen_url = (stream_url + "&_autoReadAloud=show") if listen else None
+    $:macros.ReadingOptionsMenu(edition_key, listen_url=listen_url, listen_title="%s using Read Aloud" % title, listen_track=analytics_attr(action.capitalize() + 'Listen'))
+  </div>
+$else:
+  <div class="cta-button-group">
+    <a href="$(stream_url)" title="$title" class="cta-btn cta-btn--available cta-btn--$(action) $(login_class)"
+        $:analytics_attr(analytics_action)
+        $:data_attr
+        $if loan:
+          data-userid="$(loan['userid'])"
+        >$label</a>
+  </div>

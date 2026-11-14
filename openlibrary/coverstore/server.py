@@ -1,28 +1,15 @@
-#! /usr/bin/env python
-"""coverstore server.
-"""
+#!/usr/bin/env python
+"""coverstore server."""
 
 import sys
+
 import yaml
-import web
 
-from openlibrary.coverstore import config, code, archive
-from openlibrary.utils.sentry import Sentry
+from openlibrary.coverstore import config
+from openlibrary.utils.sentry import init_sentry
 
+_setup_done = False
 
-def runfcgi(func, addr=('localhost', 8000)):
-    """Runs a WSGI function as a FastCGI pre-fork server."""
-    config = dict(web.config.get("fastcgi", {}))
-
-    mode = config.pop("mode", None)
-    if mode == "prefork":
-        import flup.server.fcgi_fork as flups
-    else:
-        import flup.server.fcgi as flups
-
-    return flups.WSGIServer(func, multiplexed=True, bindAddress=addr, **config).run()
-
-web.wsgi.runfcgi = runfcgi
 
 def load_config(configfile):
     with open(configfile) as in_file:
@@ -30,28 +17,32 @@ def load_config(configfile):
     for k, v in d.items():
         setattr(config, k, v)
 
-    if 'fastcgi' in d:
-        web.config.fastcgi = d['fastcgi']
 
+def setup(configfile: str) -> None:
+    """Load config and init sentry. Idempotent: gunicorn imports the app factory
+    per worker, and code.py may already have loaded the config at import time."""
+    global _setup_done
+    if _setup_done:
+        return
+    _setup_done = True
 
-def setup(configfile):
-    # type: (str) -> None
     load_config(configfile)
 
-    sentry = Sentry(getattr(config, 'sentry', {}))
+    sentry = init_sentry(getattr(config, "sentry", {}))
     if sentry.enabled:
-        sentry.init()
-        sentry.bind_to_webpy_app(code.app)
+        # The cover metadata still goes through web.py's db layer.
+        sentry.bind_to_webpy_db()
 
 
 def main(configfile, *args):
-    setup(configfile)
+    from openlibrary.coverstore import archive
 
-    if '--archive' in args:
+    setup(configfile)
+    if "--archive" in args:
         archive.archive()
     else:
-        sys.argv = [sys.argv[0]] + list(args)
-        code.app.run()
+        raise SystemExit("Serving is handled by openlibrary.coverstore.asgi_app; see scripts/coverstore-server")
+
 
 if __name__ == "__main__":
     main(*sys.argv[1:])

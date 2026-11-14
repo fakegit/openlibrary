@@ -1,0 +1,11 @@
+$def with (link_markup, class_list='')
+$# :param str link_markup: Markup for the element that opens the book notes dialog
+$# :param str class_list: HTML classes for this component
+$#
+$# NotesModalDialog renders the dialog outside `.modal-links`: that container is
+$# display:none at mobile widths, and a <dialog> under a hidden ancestor opens
+$# invisibly while still making the rest of the page inert.
+
+<div class="$class_list">
+  $:link_markup
+</div>

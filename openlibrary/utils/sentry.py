@@ -1,14 +1,24 @@
 import logging
+import re
+from dataclasses import dataclass
+from os import getenv
 
 import sentry_sdk
 import web
+from sentry_sdk.tracing import Transaction, TransactionSource
+from sentry_sdk.tracing_utils import add_query_source, record_sql_queries
 from sentry_sdk.utils import capture_internal_exceptions
+from web import DB
 
+from infogami.utils.app import (
+    find_page,
+    modes,
+)
+from infogami.utils.types import type_patterns
 from openlibrary.utils import get_software_version
 
 
-def header_name_from_env(env_name):
-    # type: (str) -> str
+def header_name_from_env(env_name: str) -> str:
     """
     Convert an env name as stored in web.ctx.env to a "normal"
     header name
@@ -19,13 +29,12 @@ def header_name_from_env(env_name):
     'content-length'
     """
     header_name = env_name
-    if env_name.startswith('HTTP_'):
+    if env_name.startswith("HTTP_"):
         header_name = env_name[5:]
-    return header_name.lower().replace('_', '-')
+    return header_name.lower().replace("_", "-")
 
 
-def add_web_ctx_to_event(event, hint):
-    # type: (dict, dict) -> dict
+def add_web_ctx_to_event(event: dict, hint: dict) -> dict:
     if not web.ctx:
         return event
 
@@ -35,7 +44,10 @@ def add_web_ctx_to_event(event, hint):
         headers = {}
         env = {}
         for k, v in web.ctx.env.items():
-            if k.startswith('HTTP_') or k in ('CONTENT_LENGTH', 'CONTENT_TYPE'):
+            # Don't forward cookies to Sentry
+            if k == "HTTP_COOKIE":
+                continue
+            if k.startswith("HTTP_") or k in ("CONTENT_LENGTH", "CONTENT_TYPE"):
                 headers[header_name_from_env(k)] = v
             else:
                 env[k] = v
@@ -48,20 +60,23 @@ def add_web_ctx_to_event(event, hint):
 
 
 class Sentry:
-    def __init__(self, config):
-        # type: (dict) -> None
+    def __init__(self, config: dict) -> None:
         self.config = config
-        self.enabled = config.get('enabled')  # type: bool
+        self.enabled = bool(config.get("enabled"))
         self.logger = logging.getLogger("sentry")
-        self.logger.info("Setting up sentry (enabled={})".format(self.enabled))
+        self.logger.info(f"Setting up sentry (enabled={self.enabled})")
 
     def init(self):
-        sentry_sdk.init(dsn=self.config['dsn'],
-                        environment=self.config['environment'],
-                        release=get_software_version())
+        sentry_sdk.init(
+            dsn=self.config["dsn"],
+            environment=getenv("OL_SENTRY_ENVIRONMENT", self.config["environment"]),
+            traces_sample_rate=self.config.get("traces_sample_rate", 0.0),
+            profiles_sample_rate=self.config.get("profiles_sample_rate", 0.0),
+            release=get_software_version(),
+            enable_logs=self.config.get("enable_logs", True),
+        )
 
-    def bind_to_webpy_app(self, app):
-        # type: (web.application) -> None
+    def bind_to_webpy_app(self, app: web.application) -> None:
         _internalerror = app.internalerror
 
         def capture_exception():
@@ -69,8 +84,193 @@ class Sentry:
             return _internalerror()
 
         app.internalerror = capture_exception
+        app.add_processor(WebPySentryProcessor(app))
 
-    def capture_exception_webpy(self):
+    def capture_exception_webpy(self) -> str | None:
         with sentry_sdk.push_scope() as scope:
             scope.add_event_processor(add_web_ctx_to_event)
+            scope.add_error_processor(add_web_ctx_to_event)
             sentry_sdk.capture_exception()
+            transaction = sentry_sdk.get_current_scope().transaction
+            trace_id = transaction.trace_id if transaction else None
+            return trace_id
+
+    def capture_exception(self, ex, extras: dict | None = None):
+        with sentry_sdk.new_scope() as scope:
+            if extras:
+                for key, value in extras.items():
+                    scope.set_extra(key, value)
+            scope.add_event_processor(add_web_ctx_to_event)
+            sentry_sdk.capture_exception(ex)
+
+    def bind_to_webpy_db(self):
+        """Allow Sentry to record DB events."""
+        real_db_execute = DB._db_execute
+
+        def _db_execute(self, cur, sql_query):
+            clean_sql_query = re.sub(r"(username='|account/|/people/)[^' ]+", r"\g<1>***", str(sql_query))
+            with record_sql_queries(
+                cur,
+                clean_sql_query,
+                params_list=None,
+                paramstyle=None,
+                executemany=False,
+            ) as span:
+                result = real_db_execute(self, cur, sql_query)
+
+                with capture_internal_exceptions():
+                    add_query_source(span)
+            return result
+
+        DB._db_execute = _db_execute
+
+    def get_frontend_config(self) -> dict:
+        """Return Sentry config for browser SDK initialization."""
+        if not self.config.get("frontend"):
+            return {}
+        config = {} | self.config | self.config["frontend"]
+        del config["frontend"]
+        result: dict = {
+            "dsn": config.get("dsn"),
+            "environment": config.get("environment"),
+            "tracesSampleRate": config.get("traces_sample_rate", 0.0),
+            "sampleRate": config.get("sample_rate", 0.0),
+            "release": get_software_version(),
+        }
+        # The Hub-based processor (WebPySentryProcessor) stashes the normalized route name on
+        # web.ctx so it's reachable here without fighting sentry_sdk 2.x scope threading.
+        if route_name := getattr(web.ctx, "sentry_route_name", None):
+            result["transactionName"] = route_name
+
+        return result
+
+    def get_traceparent(self) -> str | None:
+        """Return sentry-trace header value for the active transaction (for meta tag injection)."""
+        return sentry_sdk.get_traceparent()
+
+    def get_baggage(self) -> str | None:
+        """Return W3C baggage header value for the active transaction (for meta tag injection)."""
+        return sentry_sdk.get_baggage()
+
+
+@dataclass
+class InfogamiRoute:
+    route: str
+    mode: str = "view"
+    encoding: str | None = None
+    path: str = ""  # the path the route was matched against
+
+    def to_sentry_name(self) -> str:
+        return self.route + (f".{self.encoding}" if self.encoding else "") + (f"?m={self.mode}" if self.mode != "view" else "")
+
+
+def find_infogami_route() -> InfogamiRoute:
+    """Return the route matched by the current Infogami request.
+
+    This lookup is shared by Sentry and request metrics so route naming still
+    works when Sentry is disabled.
+    """
+
+    def find_type() -> tuple[str, str] | None:
+        return next(
+            ((pattern, typename) for pattern, typename in type_patterns.items() if re.search(pattern, web.ctx.path)),
+            None,
+        )
+
+    result = InfogamiRoute("<other>", path=web.ctx.path)
+
+    cls, _args = find_page()
+    if cls:
+        result.route = cls.path if hasattr(cls, "path") else "/" + cls.__name__
+    elif type_page := find_type():
+        result.route = type_page[0]
+
+    if web.ctx.get("encoding"):
+        result.encoding = web.ctx.encoding
+
+    requested_mode = web.input(_method="GET").get("m", "view")
+    if requested_mode in modes:
+        result.mode = requested_mode
+
+    return result
+
+
+def webpy_framework_tag_processor(handler):
+    """
+    Outermost web.py processor: tag every event in the request, including errors
+    raised in processors that run before InfogamiSentryProcessor (e.g. the layout).
+    Remove with web.py, along with the `fastapi` and `framework` tags on the FastAPI side
+    (see create_app in openlibrary/asgi_app.py).
+    """
+    with sentry_sdk.isolation_scope() as scope:
+        scope.set_tag("framework", "webpy")
+        return handler()
+
+
+class WebPySentryProcessor:
+    def __init__(self, app: web.application):
+        self.app = app
+
+    def find_route_name(self) -> str:
+        handler, groups = self.app._match(self.app.mapping, web.ctx.path)
+        web.debug("ROUTE HANDLER", handler, groups)
+        return handler or "<other>"
+
+    def __call__(self, handler):
+        route_name = self.find_route_name()
+        hub = sentry_sdk.Hub.current
+        with sentry_sdk.Hub(hub) as hub:
+            with hub.configure_scope() as scope:
+                scope.clear_breadcrumbs()
+                scope.add_event_processor(add_web_ctx_to_event)
+
+            environ = dict(web.ctx.env)
+            # Don't forward cookies to Sentry
+            environ.pop("HTTP_COOKIE", None)
+
+            transaction = Transaction.continue_from_environ(
+                environ,
+                op="http.server",
+                name=route_name,
+                source=TransactionSource.ROUTE,
+            )
+
+            with hub.start_transaction(transaction):
+                web.ctx.sentry_route_name = route_name
+                try:
+                    return handler()
+                finally:
+                    transaction.set_http_status(int(web.ctx.status.split()[0]))
+
+
+class InfogamiSentryProcessor(WebPySentryProcessor):
+    """
+    Processor to profile the webpage and send a transaction to Sentry.
+    """
+
+    def find_route_name(self) -> str:
+        return find_infogami_route().to_sentry_name()
+
+
+_sentry: Sentry | None = None
+
+
+def get_sentry() -> Sentry | None:
+    """Return the active Sentry singleton, or None if not initialized / disabled."""
+    return _sentry
+
+
+def init_sentry(config_dict: dict) -> Sentry:
+    global _sentry
+
+    if _sentry is not None:
+        if config_dict.get("dsn") != _sentry.config.get("dsn"):
+            raise ValueError(f"Sentry initialized with different DSNs: {_sentry.config.get('dsn')} != {config_dict.get('dsn')}.")
+        return _sentry
+
+    _sentry = Sentry(config_dict)
+
+    if _sentry.enabled:
+        _sentry.init()
+
+    return _sentry

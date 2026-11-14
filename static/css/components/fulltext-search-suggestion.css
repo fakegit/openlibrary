@@ -1,0 +1,46 @@
+/* Search Inside band at the foot of /search (macros/FulltextSearchSuggestion.html.jinja). */
+.fulltext-suggestions {
+  margin: var(--spacing-stack-lg) 0;
+}
+
+.fulltext-suggestions__header {
+  align-items: center;
+  gap: var(--spacing-2xs);
+}
+
+.fulltext-suggestions__header .ol-icon {
+  flex-shrink: 0;
+}
+
+/* Rows render without lending/list controls; drop the column they'd occupy. */
+.fulltext-suggestions .searchResultItemCTA {
+  display: none;
+}
+
+.fulltext-suggestions__footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--spacing-stack-sm);
+}
+
+/* Nothing new to preview: label and button share one row. */
+.fulltext-suggestions--compact {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-inline-md);
+  flex-wrap: wrap;
+}
+
+.fulltext-suggestions--compact .fulltext-suggestions__header {
+  margin-bottom: 0;
+}
+
+/* Injected by fulltext-search-suggestion.js when the fetch fails. */
+.fulltext-suggestions__retry {
+  display: block;
+  padding: var(--spacing-inset-xs);
+  text-align: center;
+  font-size: var(--font-size-body-medium);
+  color: var(--color-text-muted);
+}

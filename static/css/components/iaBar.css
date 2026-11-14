@@ -1,0 +1,49 @@
+/* GLOBAL TOP NOTICE */
+/* (Internet Archive Bar) */
+
+.iaBar {
+  display: flex;
+  max-width: 1060px;
+  margin: 0 auto;
+  -webkit-box-align: center;
+  -ms-flex-align: center;
+  align-items: center;
+  /* This is to right align the donate button and language dropdown */
+}
+
+.iaBar .iaLogo {
+  flex: 1;
+}
+
+.iaBar .iaLogo img {
+  max-width: 160px;
+  min-width: 60px;
+  width: 100%;
+}
+
+.iaBar .ghost-btn {
+  margin-right: 20px;
+}
+
+/* Changes color of heart unicode character */
+.heart {
+  color: var(--heart-color);
+  font-size: inherit;
+}
+
+/* stylelint-disable selector-max-specificity */
+#topNotice {
+  font-size: var(--font-size-body-medium);
+}
+
+/* @width-breakpoint-mobile: 450px */
+@media only screen and (max-width: 450px) {
+  #topNotice .iabar-mobile {
+    font-size: var(--font-size-body-small);
+  }
+  #topNotice .ghost-btn.iabar-mobile {
+    padding: var(--spacing-inset-xs) var(--spacing-inset-sm);
+    margin-right: var(--spacing-inline-lg);
+    margin-left: var(--spacing-inline-lg);
+  }
+}

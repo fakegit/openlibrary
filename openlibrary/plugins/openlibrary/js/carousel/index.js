@@ -1,15 +1,15 @@
-// Slick#1.6.0 is not on npm
-import 'slick-carousel';
-import '../../../../../static/css/components/carousel--js.less';
-import Carousel from './Carousel';
+import $ from 'jquery';
+import { Carousel } from './Carousel';
 
-/**
- * @param {jQuery.Object} $carouselElements
- */
-export function init($carouselElements) {
-    $carouselElements.each(function (_i, carouselElement) {
-        Carousel.add.apply(Carousel,
-            JSON.parse(carouselElement.dataset.config)
-        );
+export function initialzeCarousels(elems) {
+    elems.forEach(elem => {
+        new Carousel($(elem)).init();
+        const elemSlides = elem.querySelectorAll('.slick-slide');
+        elemSlides.forEach(slide => {
+            const $slide = $(slide);
+            if ($slide.attr('aria-describedby') !== undefined) {
+                $slide.attr('id', $(this).attr('aria-describedby'));
+            }
+        });
     });
 }

@@ -4,126 +4,52 @@ its experience. This does not include public facing APIs with LTS
 (long term support)
 """
 
-import web
-import re
+from __future__ import annotations
+
 import json
+import logging
 from collections import defaultdict
+from typing import TYPE_CHECKING, Any, Literal
+from warnings import deprecated
 
-from infogami import config
+import web
+
+from infogami import config  # noqa: F401 side effects may be needed
+from infogami.infobase.client import ClientException
 from infogami.utils import delegate
-from infogami.utils.view import render_template  # noqa: F401 used for its side effects
-from infogami.plugins.api.code import jsonapi
-from infogami.utils.view import add_flash_message
+from infogami.utils.view import (
+    render_template,  # noqa: F401 used for its side effects
+)
 from openlibrary import accounts
-from openlibrary.utils.isbn import isbn_10_to_isbn_13, normalize_isbn
-from openlibrary.utils import extract_numeric_id_from_olid
-from openlibrary.plugins.worksearch.subjects import get_subject
-from openlibrary.accounts.model import OpenLibraryAccount
-from openlibrary.core import ia, db, models, lending, helpers as h
-from openlibrary.core.observations import get_observations, Observations
+from openlibrary.accounts.model import (
+    OpenLibraryAccount,  # noqa: F401 side effects may be needed
+)
+from openlibrary.core import cache
+from openlibrary.core.auth import ExpiredTokenError, HMACToken
+from openlibrary.core.bestbook import Bestbook
 from openlibrary.core.models import Booknotes
-from openlibrary.core.sponsorships import qualifies_for_sponsorship
+from openlibrary.core.observations import Observations
 from openlibrary.core.vendors import (
-    get_amazon_metadata, create_edition_from_amazon_metadata,
-    search_amazon, get_betterworldbooks_metadata)
+    create_edition_from_amazon_metadata,
+    get_amazon_metadata_async,
+    get_betterworldbooks_metadata,
+)
+from openlibrary.i18n import gettext as _
+from openlibrary.plugins.openlibrary.code import can_write
+from openlibrary.plugins.openlibrary.home import get_cached_featured_subjects
+from openlibrary.utils import extract_numeric_id_from_olid
+from openlibrary.utils.isbn import normalize_isbn
+from openlibrary.utils.request_context import req_context, site
+
+if TYPE_CHECKING:
+    from starlette.datastructures import URL
+
+    from openlibrary.core.models import Work
+
+logger = logging.getLogger(__name__)
 
 
-class book_availability(delegate.page):
-    path = "/availability/v2"
-
-    def GET(self):
-        i = web.input(type='', ids='')
-        id_type = i.type
-        ids = i.ids.split(',')
-        result = self.get_book_availability(id_type, ids)
-        return delegate.RawText(json.dumps(result),
-                                content_type="application/json")
-
-    def POST(self):
-        i = web.input(type='')
-        j = json.loads(web.data())
-        id_type = i.type
-        ids = j.get('ids', [])
-        result = self.get_book_availability(id_type, ids)
-        return delegate.RawText(json.dumps(result),
-                                content_type="application/json")
-
-    def get_book_availability(self, id_type, ids):
-        return (
-            lending.get_availability_of_works(ids) if id_type == "openlibrary_work"
-            else
-            lending.get_availability_of_editions(ids) if id_type == "openlibrary_edition"
-            else
-            lending.get_availability_of_ocaids(ids) if id_type == "identifier"
-            else []
-        )
-
-
-class browse(delegate.page):
-    path = "/browse"
-    encoding = "json"
-
-    def GET(self):
-        i = web.input(q='', page=1, limit=100, subject='',
-                      work_id='', _type='', sorts='')
-        sorts = i.sorts.split(',')
-        page = int(i.page)
-        limit = int(i.limit)
-        url = lending.compose_ia_url(
-            query=i.q, limit=limit, page=page, subject=i.subject,
-            work_id=i.work_id, _type=i._type, sorts=sorts)
-        works = lending.get_available(url=url) if url else []
-        result = {
-            'query': url,
-            'works': [work.dict() for work in works],
-        }
-        return delegate.RawText(
-            json.dumps(result),
-            content_type="application/json")
-
-class ratings(delegate.page):
-    path = r"/works/OL(\d+)W/ratings"
-    encoding = "json"
-
-    def POST(self, work_id):
-        """Registers new ratings for this work"""
-        user = accounts.get_current_user()
-        i = web.input(edition_id=None, rating=None, redir=False)
-        key = i.edition_id if i.edition_id else ('/works/OL%sW' % work_id)
-        edition_id = int(extract_numeric_id_from_olid(i.edition_id)) if i.edition_id else None
-
-        if not user:
-            raise web.seeother('/account/login?redirect=%s' % key)
-
-        username = user.key.split('/')[2]
-
-        def response(msg, status="success"):
-            return delegate.RawText(json.dumps({
-                status: msg
-            }), content_type="application/json")
-
-        if i.rating is None:
-            models.Ratings.remove(username, work_id)
-            r = response('removed rating')
-
-        else:
-            try:
-                rating = int(i.rating)
-                if rating not in models.Ratings.VALID_STAR_RATINGS:
-                    raise ValueError
-            except ValueError:
-                return response('invalid rating', status="error")
-
-            models.Ratings.add(
-                username=username, work_id=work_id,
-                rating=rating, edition_id=edition_id)
-            r = response('rating added')
-
-        if i.redir:
-            raise web.seeother(key)
-        return r
-
-
+@deprecated("migrated to fastapi")
 class booknotes(delegate.page):
     path = r"/works/OL(\d+)W/notes"
     encoding = "json"
@@ -140,300 +66,178 @@ class booknotes(delegate.page):
         :return: the note
         """
         user = accounts.get_current_user()
-        i = web.input(notes=None, edition_id=None, redir=None)
-        edition_id = int(extract_numeric_id_from_olid(i.edition_id)) if i.edition_id else None
-
         if not user:
-            raise web.seeother('/account/login?redirect=/works/%s' % work_id)
+            raise web.seeother("/account/login?redirect=/works/%s" % work_id)
 
-        username = user.key.split('/')[2]
+        i = web.input(notes=None, edition_id=None, redir=None)
+        edition_id = int(extract_numeric_id_from_olid(i.edition_id)) if i.edition_id else -1
+
+        username = user.key.split("/")[2]
 
         def response(msg, status="success"):
-            return delegate.RawText(json.dumps({
-                status: msg
-            }), content_type="application/json")
+            return delegate.RawText(json.dumps({status: msg}), content_type="application/json")
 
         if i.notes is None:
-            Booknotes.remove(username, work_id)
-            return response('removed note')
+            Booknotes.remove_sync(username, work_id, edition_id=edition_id)
+            return response("removed note")
 
-        Booknotes.add(
-            username=username,
-            work_id=work_id,
-            notes=i.notes,
-            edition_id=edition_id
-        )
+        Booknotes.add_sync(username=username, work_id=work_id, notes=i.notes, edition_id=edition_id)
 
         if i.redir:
             raise web.seeother("/works/%s" % work_id)
 
-        return response('note added')
+        return response("note added")
 
 
+async def get_bookshelves_summary(work_id):
+    from openlibrary.core.models import Bookshelves
 
-# The GET of work_bookshelves, work_ratings, and work_likes should return some summary of likes,
-# not a value tied to this logged in user. This is being used as debugging.
-
-class work_bookshelves(delegate.page):
-    path = r"/works/OL(\d+)W/bookshelves"
-    encoding = "json"
-
-    @jsonapi
-    def GET(self, work_id):
-        from openlibrary.core.models import Bookshelves
-
-        result = {'counts': {}}
-        counts = Bookshelves.get_num_users_by_bookshelf_by_work_id(work_id)
-        for (shelf_name, shelf_id) in Bookshelves.PRESET_BOOKSHELVES_JSON.items():
-            result['counts'][shelf_name] = counts.get(shelf_id, 0)
-
-        return json.dumps(result)
-
-    def POST(self, work_id):
-        """
-        Add a work (or a work and an edition) to a bookshelf.
-
-        GET params:
-        - edition_id str (optional)
-        - action str: e.g. "add", "remove"
-        - redir bool: if patron not logged in, redirect back to page after login
-        - bookshelf_id int: which bookshelf? e.g. the ID for "want to read"?
-        - dont_remove bool: if book exists & action== "add", don't try removal
-
-        :param str work_id: e.g. OL123W
-        :rtype: json
-        :return: a list of bookshelves_affected
-        """
-        from openlibrary.core.models import Bookshelves
-
-        user = accounts.get_current_user()
-        i = web.input(edition_id=None, action="add", redir=False, bookshelf_id=None, dont_remove=False)
-        key = i.edition_id if i.edition_id else ('/works/OL%sW' % work_id)
-
-        if not user:
-            raise web.seeother('/account/login?redirect=%s' % key)
-
-        username = user.key.split('/')[2]
-        current_status = Bookshelves.get_users_read_status_of_work(username, work_id)
-
-        try:
-            bookshelf_id = int(i.bookshelf_id)
-            shelf_ids = Bookshelves.PRESET_BOOKSHELVES.values()
-            if bookshelf_id != -1 and bookshelf_id not in shelf_ids:
-                raise ValueError
-        except (TypeError, ValueError):
-            return delegate.RawText(json.dumps({
-                'error': 'Invalid bookshelf'
-            }), content_type="application/json")
-
-        if (not i.dont_remove) and bookshelf_id == current_status or bookshelf_id == -1:
-            work_bookshelf = Bookshelves.remove(
-                username=username, work_id=work_id, bookshelf_id=current_status)
-
-        else:
-            edition_id = int(i.edition_id.split('/')[2][2:-1]) if i.edition_id else None
-            work_bookshelf = Bookshelves.add(
-                username=username, bookshelf_id=bookshelf_id,
-                work_id=work_id, edition_id=edition_id)
-
-        if i.redir:
-            raise web.seeother(key)
-        return delegate.RawText(json.dumps({
-            'bookshelves_affected': work_bookshelf
-        }), content_type="application/json")
+    return {"counts": await Bookshelves.get_work_summary(str(work_id))}
 
 
-class work_editions(delegate.page):
-    path = r"(/works/OL\d+W)/editions"
-    encoding = "json"
+async def process_work_bookshelves(username, work_id, bookshelf_id, edition_id=None, dont_remove=False):
+    from openlibrary.core.models import Bookshelves
 
-    def GET(self, key):
-        doc = web.ctx.site.get(key)
-        if not doc or doc.type.key != "/type/work":
-            raise web.notfound('')
-        else:
-            i = web.input(limit=50, offset=0)
-            limit = h.safeint(i.limit) or 50
-            offset = h.safeint(i.offset) or 0
+    if bookshelf_id is None:
+        return {"error": "Invalid bookshelf"}
 
-            data = self.get_editions_data(doc, limit=limit, offset=offset)
-            return delegate.RawText(json.dumps(data), content_type="application/json")
+    work_id_str = str(work_id)
+    current_status = await Bookshelves.get_users_read_status_of_work(username, work_id_str)
 
-    def get_editions_data(self, work, limit, offset):
-        if limit > 1000:
-            limit = 1000
+    try:
+        bookshelf_id_val = int(bookshelf_id)
+        shelf_ids = Bookshelves.PRESET_BOOKSHELVES.values()
+        if bookshelf_id_val != -1 and bookshelf_id_val not in shelf_ids:
+            return {"error": "Invalid bookshelf"}
+    except TypeError, ValueError:
+        return {"error": "Invalid bookshelf"}
 
-        keys = web.ctx.site.things({"type": "/type/edition", "works": work.key, "limit": limit, "offset": offset})
-        editions = web.ctx.site.get_many(keys, raw=True)
+    if ((not dont_remove) and bookshelf_id_val == current_status) or bookshelf_id_val == -1:
+        work_bookshelf = await Bookshelves.remove(
+            username=username,
+            work_id=work_id_str,
+            bookshelf_id=str(current_status) if current_status else None,
+        )
+    else:
+        from openlibrary.utils import extract_numeric_id_from_olid
 
-        size = work.edition_count
-        links = {
-            "self": web.ctx.fullpath,
-            "work": work.key,
+        resolved_edition_id = int(extract_numeric_id_from_olid(edition_id)) if edition_id else None
+        work_bookshelf = await Bookshelves.add(
+            username=username,
+            bookshelf_id=str(bookshelf_id_val),
+            work_id=work_id_str,
+            edition_id=resolved_edition_id,
+        )
+
+    return {"bookshelves_affected": work_bookshelf}
+
+
+def get_editions_data(key: str, url: URL, limit: int, offset: int) -> dict[str, Any] | None:
+    current_site = site.get()
+    work = current_site.get(key)
+    if not work or work.type.key != "/type/work":
+        return None
+
+    limit = min(limit or 50, 1000)
+    keys = current_site.things(
+        {
+            "type": "/type/edition",
+            "works": work.key,
+            "limit": limit,
+            "offset": offset,
         }
+    )
+    editions = current_site.get_many(keys, raw=True)
 
-        if offset > 0:
-            links['prev'] = web.changequery(offset=min(0, offset-limit))
+    url = url.replace(scheme="", netloc="")
+    links = {
+        "self": str(url),
+        "work": work.key,
+    }
+    if offset > 0:
+        links["prev"] = str(url.include_query_params(offset=max(0, offset - limit)))
+    if offset + len(editions) < work.edition_count:
+        links["next"] = str(url.include_query_params(offset=offset + limit))
 
-        if offset + len(editions) < size:
-            links['next'] = web.changequery(offset=offset+limit)
+    return {"links": links, "size": work.edition_count, "entries": editions}
 
-        return {
-            "links": links,
-            "size": size,
-            "entries": editions
+
+async def get_works_data_async(key: str, url: URL, limit: int, offset: int) -> dict[str, Any] | None:
+    """Get paginated works for an author, shared by the legacy and FastAPI works.json endpoints."""
+    current_site = site.get()
+    author = current_site.get(key)
+    if not author or author.type.key != "/type/author":
+        return None
+
+    limit = min(limit, 1000)
+    keys = current_site.things(
+        {
+            "type": "/type/work",
+            "authors": {"author": {"key": author.key}},
+            "limit": limit,
+            "offset": offset,
         }
+    )
+    works = current_site.get_many(keys, raw=True)
+    size = await author.get_work_count()
+
+    url = url.replace(scheme="", netloc="")
+    links = {
+        "self": str(url),
+        "author": author.key,
+    }
+    if offset > 0:
+        links["prev"] = str(url.include_query_params(offset=max(0, offset - limit)))
+    if offset + len(works) < size:
+        links["next"] = str(url.include_query_params(offset=offset + limit))
+
+    return {"links": links, "size": size, "entries": works}
 
 
-class author_works(delegate.page):
-    path = r"(/authors/OL\d+A)/works"
-    encoding = "json"
+async def get_price_data_async(isbn: str, asin: str) -> dict[str, Any]:
+    id_type_short: Literal["asin", "isbn"] = "asin" if asin else "isbn"
+    id_ = asin or (normalize_isbn(isbn) or isbn)
 
-    def GET(self, key):
-        doc = web.ctx.site.get(key)
-        if not doc or doc.type.key != "/type/author":
-            raise web.notfound('')
-        else:
-            i = web.input(limit=50, offset=0)
-            limit = h.safeint(i.limit) or 50
-            offset = h.safeint(i.offset) or 0
+    metadata: dict = {
+        "amazon": await get_amazon_metadata_async(id_, id_type=id_type_short) or {},
+        "betterworldbooks": {},
+    }
+    if id_type_short == "isbn":
+        metadata["betterworldbooks"] = await get_betterworldbooks_metadata(id_)
 
-            data = self.get_works_data(doc, limit=limit, offset=offset)
-            return delegate.RawText(json.dumps(data), content_type="application/json")
-
-    def get_works_data(self, author, limit, offset):
-        if limit > 1000:
-            limit = 1000
-
-        keys = web.ctx.site.things({"type": "/type/work", "authors": {"author": {"key": author.key}}, "limit": limit, "offset": offset})
-        works = web.ctx.site.get_many(keys, raw=True)
-
-        size = author.get_work_count()
-        links = {
-            "self": web.ctx.fullpath,
-            "author": author.key,
+    # fetch book by isbn if it exists
+    # TODO: perform existing OL lookup by ASIN if supplied, if possible
+    id_type_long = "asin" if asin else "isbn_13" if len(id_) == 13 else "isbn_10"
+    matches = site.get().things(
+        {
+            "type": "/type/edition",
+            id_type_long: id_,
         }
+    )
 
-        if offset > 0:
-            links['prev'] = web.changequery(offset=min(0, offset-limit))
+    book_key = matches[0] if matches else None
 
-        if offset + len(works) < size:
-            links['next'] = web.changequery(offset=offset+limit)
+    # if no OL edition for isbn, attempt to create
+    if (not book_key) and metadata.get("amazon"):
+        book_key = create_edition_from_amazon_metadata(id_, id_type=id_type_short)
 
-        return {
-            "links": links,
-            "size": size,
-            "entries": works
-        }
+    # include ol edition metadata in response, if available
+    if book_key:
+        ed = site.get().get(book_key)
+        if ed:
+            metadata["key"] = ed.key
+            if getattr(ed, "ocaid"):  # noqa: B009
+                metadata["ocaid"] = ed.ocaid
 
-class amazon_search_api(delegate.page):
-    """Librarian + admin only endpoint to check for books
-    avaialable on Amazon via the Product Advertising API
-    ItemSearch operation.
+    return metadata
 
-    https://docs.aws.amazon.com/AWSECommerceService/latest/DG/ItemSearch.html
 
-    Currently experimental to explore what data is avaialable to affiliates.
-
-    :return: JSON {"results": []} containing Amazon product metadata
-             for items matching the title and author search parameters.
-    :rtype: str
+class patrons_observations(delegate.page):
+    """
+    Fetches a patron's observations for a work, requires auth, intended
+    to be used internally to power the My Books Page & books pages modal
     """
 
-    path = '/_tools/amazon_search'
-
-    @jsonapi
-    def GET(self):
-        user = accounts.get_current_user()
-        if not (user and (user.is_admin() or user.is_librarian())):
-            return web.HTTPError('403 Forbidden')
-        i = web.input(title='', author='')
-        if not (i.author or i.title):
-            return json.dumps({
-                'error': 'author or title required'
-            })
-        results = search_amazon(title=i.title, author=i.author)
-        return json.dumps(results)
-
-
-class sponsorship_eligibility_check(delegate.page):
-    path = r'/sponsorship/eligibility/(.*)'
-
-    @jsonapi
-    def GET(self, _id):
-        i = web.input(patron=None, scan_only=False)
-        edition = (
-            web.ctx.site.get('/books/%s' % _id)
-            if re.match(r'OL[0-9]+M', _id)
-            else models.Edition.from_isbn(_id)
-
-        )
-        if not edition:
-            return json.dumps({"status": "error", "reason": "Invalid ISBN 13"})
-        return json.dumps(
-            qualifies_for_sponsorship(edition, scan_only=i.scan_only, patron=i.patron)
-        )
-
-
-class price_api(delegate.page):
-    path = r'/prices'
-
-    @jsonapi
-    def GET(self):
-        i = web.input(isbn='', asin='')
-        if not (i.isbn or i.asin):
-            return json.dumps({
-                'error': 'isbn or asin required'
-            })
-        id_ = i.asin if i.asin else normalize_isbn(i.isbn)
-        id_type = 'asin' if i.asin else 'isbn_' + ('13' if len(id_) == 13 else '10')
-
-        metadata = {
-            'amazon': get_amazon_metadata(id_, id_type=id_type[:4]) or {},
-            'betterworldbooks': get_betterworldbooks_metadata(id_) if id_type.startswith('isbn_') else {}
-        }
-        # if user supplied isbn_{n} fails for amazon, we may want to check the alternate isbn
-
-        # if bwb fails and isbn10, try again with isbn13
-        if id_type == 'isbn_10' and \
-           metadata['betterworldbooks'].get('price') is None:
-            isbn_13 = isbn_10_to_isbn_13(id_)
-            metadata['betterworldbooks'] = isbn_13 and get_betterworldbooks_metadata(
-                isbn_13) or {}
-
-        # fetch book by isbn if it exists
-        # TODO: perform exisiting OL lookup by ASIN if supplied, if possible
-        matches = web.ctx.site.things({
-            'type': '/type/edition',
-            id_type: id_,
-        })
-
-        book_key = matches[0] if matches else None
-
-        # if no OL edition for isbn, attempt to create
-        if (not book_key) and metadata.get('amazon'):
-            book_key = create_edition_from_amazon_metadata(id_, id_type[:4])
-
-        # include ol edition metadata in response, if available
-        if book_key:
-            ed = web.ctx.site.get(book_key)
-            if ed:
-                metadata['key'] = ed.key
-                if getattr(ed, 'ocaid'):
-                    metadata['ocaid'] = ed.ocaid
-
-        return json.dumps(metadata)
-
-
-class observations(delegate.page):
-    path = "/observations"
-    encoding = "json"
-
-    def GET(self):
-        return delegate.RawText(json.dumps(get_observations()), content_type="application/json")
-
-
-class patron_observations(delegate.page):
     path = r"/works/OL(\d+)W/observations"
     encoding = "json"
 
@@ -441,37 +245,434 @@ class patron_observations(delegate.page):
         user = accounts.get_current_user()
 
         if not user:
-            raise web.seeother('/account/login')
+            raise web.seeother("/account/login")
 
-        username = user.key.split('/')[2]
+        username = user.key.split("/")[2]
         existing_records = Observations.get_patron_observations(username, work_id)
 
         patron_observations = defaultdict(list)
 
         for r in existing_records:
-            kv_pair = Observations.get_key_value_pair(r['type'], r['value'])
+            kv_pair = Observations.get_key_value_pair(r["type"], r["value"])
             patron_observations[kv_pair.key].append(kv_pair.value)
-            
+
         return delegate.RawText(json.dumps(patron_observations), content_type="application/json")
 
     def POST(self, work_id):
         user = accounts.get_current_user()
 
         if not user:
-            raise web.seeother('/account/login')
+            raise web.seeother("/account/login")
 
         data = json.loads(web.data())
 
-        Observations.persist_observation(
-            data['username'],
-            work_id,
-            data['observation'],
-            data['action']
-        )
+        Observations.persist_observation(user.key.split("/")[-1], work_id, data["observation"], data["action"])
 
         def response(msg, status="success"):
-            return delegate.RawText(json.dumps({
-                status: msg
-            }), content_type="application/json")
+            return delegate.RawText(json.dumps({status: msg}), content_type="application/json")
 
-        return response('Observations added')
+        return response("Observations added")
+
+    def DELETE(self, work_id):
+        user = accounts.get_current_user()
+
+        if not user:
+            raise web.seeother("/account/login")
+
+        username = user.key.split("/")[2]
+        Observations.remove_observations(username, work_id)
+
+        def response(msg, status="success"):
+            return delegate.RawText(json.dumps({status: msg}), content_type="application/json")
+
+        return response("Observations removed")
+
+
+class work_delete(delegate.page):
+    path = r"/works/(OL\d+W)/[^/]+/delete"
+
+    def get_editions_of_work(self, work: Work) -> list[dict]:
+        i = web.input(bulk=False)
+        limit = 1_000  # This is the max limit of the things function
+        all_keys: list = []
+        offset = 0
+
+        while True:
+            keys: list = site.get().things(
+                {
+                    "type": "/type/edition",
+                    "works": work.key,
+                    "limit": limit,
+                    "offset": offset,
+                }
+            )
+            all_keys.extend(keys)
+            if len(keys) == limit:
+                if not i.bulk:
+                    raise web.HTTPError(
+                        "400 Bad Request",
+                        data=json.dumps(
+                            {
+                                "error": f"API can only delete {limit} editions per work.",
+                            }
+                        ),
+                        headers={"Content-Type": "application/json"},
+                    )
+                else:
+                    offset += limit
+            else:
+                break
+
+        return site.get().get_many(all_keys, raw=True)
+
+    def POST(self, work_id: str):
+        if not can_write():
+            return web.HTTPError("403 Forbidden")
+
+        web_input = web.input(comment=None)
+
+        comment = web_input.get("comment")
+
+        work: Work = site.get().get(f"/works/{work_id}")
+        if work is None:
+            return web.HTTPError(status="404 Not Found")
+
+        editions: list[dict] = self.get_editions_of_work(work)
+        keys_to_delete: list = [el.get("key") for el in [*editions, work.dict()]]
+        delete_payload: list[dict] = [{"key": key, "type": {"key": "/type/delete"}} for key in keys_to_delete]
+
+        site.get().save_many(delete_payload, comment, action="bulk-delete-books")
+        return delegate.RawText(
+            json.dumps(
+                {
+                    "status": "ok",
+                }
+            ),
+            content_type="application/json",
+        )
+
+
+class bestbook_award:
+    """Legacy helper for the FastAPI bestbook award endpoints.
+
+    The POST /works/OL{work_id}W/awards.json endpoint is served by FastAPI
+    (openlibrary/fastapi/internal/api.py) and reuses this helper.
+    """
+
+    @staticmethod
+    async def process_bestbook_award(work_id, op, edition_key, topic, comment, username):
+        OPS = ["add", "remove", "update"]
+        edition_id = edition_key and int(extract_numeric_id_from_olid(edition_key))
+        errors = []
+
+        if username:
+            try:
+                if op in ["add", "update"]:
+                    # Make sure the topic is free
+                    if op == "update":
+                        await Bestbook.remove(username, topic=topic)
+                        await Bestbook.remove(username, work_id=work_id)
+                    return {
+                        "success": True,
+                        "award": await Bestbook.add(
+                            username=username,
+                            work_id=work_id,
+                            edition_id=edition_id or None,
+                            comment=comment,
+                            topic=topic,
+                        ),
+                    }
+                elif op == "remove":
+                    # Remove any award this patron has given this work_id
+                    return {
+                        "success": True,
+                        "rows": await Bestbook.remove(username, work_id=work_id),
+                    }
+                else:
+                    errors.append(f"Invalid op {op}: valid ops are {OPS}")
+            except Bestbook.AwardConditionsError as e:
+                errors.append(str(e))
+        else:
+            errors.append("Authentication failed")
+        return {"errors": ", ".join(errors)}
+
+
+def get_opds_data_provider():
+    from pyopds2_openlibrary import OpenLibraryDataProvider
+
+    provider = OpenLibraryDataProvider()
+    protocol = "https" if "localhost" not in web.ctx.host else "http"
+    OpenLibraryDataProvider.BASE_URL = f"{protocol}://{web.ctx.host}"
+    OpenLibraryDataProvider.SEARCH_URL = "/opds/search"
+    return provider
+
+
+class opds_search(delegate.page):
+    path = r"/opds/search"
+
+    def GET(self):
+        from pyopds2 import Catalog, Link, Metadata
+
+        i = web.input(
+            query="trending_score_hourly_sum:[1 TO *]",
+            limit=25,
+            page=1,
+            sort=None,
+            mode="ebooks",
+        )
+
+        provider = get_opds_data_provider()
+        catalog = Catalog.create(
+            metadata=Metadata(title=_("Search Results")),
+            response=provider.search(
+                query=i.query,
+                limit=int(i.limit),
+                offset=(int(i.page) - 1) * int(i.limit),
+                sort=i.sort,
+                facets={"mode": i.mode},
+            ),
+            links=[
+                Link(
+                    rel="self",
+                    href=provider.BASE_URL + web.ctx.fullpath,
+                    type="application/opds+json",
+                ),
+                Link(
+                    rel="search",
+                    href=f"{provider.BASE_URL}/opds/search{{?query,mode}}",
+                    type="application/opds+json",
+                    templated=True,
+                ),
+                Link(
+                    rel="http://opds-spec.org/shelf",
+                    href="https://archive.org/services/loans/loan/?action=user_bookshelf",
+                    type="application/opds+json",
+                ),
+                Link(
+                    rel="profile",
+                    href="https://archive.org/services/loans/loan/?action=user_profile",
+                    type="application/opds-profile+json",
+                ),
+            ],
+        )
+        web.header("Content-Type", "application/opds+json")
+        return delegate.RawText(json.dumps(catalog.model_dump()))
+
+
+class opds_books(delegate.page):
+    path = r"/opds/books/(OL\d+M)"
+
+    def GET(self, edition_olid: str):
+
+        provider = get_opds_data_provider()
+        resp = provider.search(query=f"edition_key:{edition_olid}")
+        web.header("Content-Type", "application/opds-publication+json")
+        if not resp.records:
+            raise web.HTTPError(
+                "404 Not Found",
+                data=json.dumps({"error": "Edition not found"}),
+            )
+
+        pub = resp.records[0].to_publication()
+        return delegate.RawText(json.dumps(pub.model_dump()))
+
+
+class opds_home(delegate.page):
+    path = r"/opds"
+
+    def GET(self):
+        def build_homepage():
+            from pyopds2 import Catalog, Link, Metadata, Navigation
+
+            provider = get_opds_data_provider()
+            catalog = Catalog(
+                metadata=Metadata(title=_("Open Library")),
+                publications=[],
+                navigation=[
+                    Navigation(
+                        type="application/opds+json",
+                        title=subject["presentable_name"],
+                        href=f'{provider.BASE_URL}{provider.SEARCH_URL}?sort=trending&query=subject_key:{subject["key"].split("/")[-1]} -subject:"content_warning:cover" ebook_access:[borrowable TO *]',  # noqa: E501
+                    )
+                    for subject in get_cached_featured_subjects()
+                ],
+                groups=[
+                    Catalog.create(
+                        metadata=Metadata(title=_("Trending Books")),
+                        response=provider.search(
+                            query='trending_score_hourly_sum:[1 TO *] -subject:"content_warning:cover" ebook_access:[borrowable TO *] readinglog_count:[4 TO *]',
+                            sort="trending",
+                            limit=25,
+                        ),
+                    ),
+                    Catalog.create(
+                        metadata=Metadata(title=_("Classic Books")),
+                        response=provider.search(
+                            query='ddc:8* first_publish_year:[* TO 1950] publish_year:[2000 TO *] NOT public_scan_b:false -subject:"content_warning:cover"',
+                            sort="trending",
+                            limit=25,
+                        ),
+                    ),
+                    Catalog.create(
+                        metadata=Metadata(title=_("Romance")),
+                        response=provider.search(
+                            query='subject:romance ebook_access:[borrowable TO *] first_publish_year:[1930 TO *] trending_score_hourly_sum:[1 TO *] -subject:"content_warning:cover"',  # noqa: E501
+                            sort="trending,trending_score_hourly_sum",
+                            limit=25,
+                        ),
+                    ),
+                    Catalog.create(
+                        metadata=Metadata(title=_("Kids")),
+                        response=provider.search(
+                            query='ebook_access:[borrowable TO *] trending_score_hourly_sum:[1 TO *] (subject_key:(juvenile_audience OR children\'s_fiction OR juvenile_nonfiction OR juvenile_encyclopedias OR juvenile_riddles OR juvenile_poetry OR juvenile_wit_and_humor OR juvenile_limericks OR juvenile_dictionaries OR juvenile_non-fiction) OR subject:("Juvenile literature" OR "Juvenile fiction" OR "pour la jeunesse" OR "pour enfants"))',  # noqa: E501
+                            sort="random.hourly",
+                            limit=25,
+                        ),
+                    ),
+                    Catalog.create(
+                        metadata=Metadata(title=_("Thrillers")),
+                        response=provider.search(
+                            query='subject:thrillers ebook_access:[borrowable TO *] trending_score_hourly_sum:[1 TO *] -subject:"content_warning:cover"',
+                            sort="trending,trending_score_hourly_sum",
+                            limit=25,
+                        ),
+                    ),
+                    Catalog.create(
+                        metadata=Metadata(title=_("Textbooks")),
+                        response=provider.search(
+                            query="subject_key:textbooks publish_year:[1990 TO *] ebook_access:[borrowable TO *]",
+                            sort="trending",
+                            limit=25,
+                        ),
+                    ),
+                ],
+                facets=None,
+                links=[
+                    Link(
+                        rel="self",
+                        href=provider.BASE_URL + web.ctx.fullpath,
+                        type="application/opds+json",
+                    ),
+                    Link(
+                        rel="start",
+                        href=provider.BASE_URL,
+                        type="application/opds+json",
+                    ),
+                    Link(
+                        rel="search",
+                        href=f"{provider.BASE_URL}/opds/search{{?query}}",
+                        type="application/opds+json",
+                        templated=True,
+                    ),
+                    Link(
+                        rel="http://opds-spec.org/shelf",
+                        href="https://archive.org/services/loans/loan/?action=user_bookshelf",
+                        type="application/opds+json",
+                    ),
+                    Link(
+                        rel="profile",
+                        href="https://archive.org/services/loans/loan/?action=user_profile",
+                        type="application/opds-profile+json",
+                    ),
+                ],
+            )
+            return catalog.model_dump()
+
+        def get_cached_homepage():
+            from openlibrary.plugins.openlibrary.code import is_bot
+            from openlibrary.utils import dateutil
+            from openlibrary.utils.request_context import caching_prethread
+
+            five_minutes = 5 * dateutil.MINUTE_SECS
+            lang = web.ctx.lang
+            key = f"home.homepage-opds.{lang}"
+            ctx = req_context.get()
+            if ctx.print_disabled:
+                key += ".pd"
+            if ctx.sfw:
+                key += ".sfw"
+            if is_bot():
+                key += ".bot"
+
+            mc = cache.memcache_memoize(build_homepage, key, timeout=five_minutes, prethread=caching_prethread())
+            page = mc()
+
+            if not page:
+                mc.memcache_delete_by_args()
+                mc()
+
+            return page
+
+        web.header("Content-Type", "application/opds+json")
+        return delegate.RawText(json.dumps(get_cached_homepage()))
+
+
+DEFAULT_UNLINK_COMMENT = "Unlink OCAID: Item no longer available"
+
+
+@deprecated("migrated to fastapi")
+class unlink_ia_ol(delegate.page):
+    path = "/api/unlink"
+    encoding = "json"
+
+    def POST(self):
+        i = web.input(digest="", msg="", comment="")
+
+        digest = i.digest
+        msg = i.msg
+
+        try:
+            if not HMACToken.verify(digest, msg, "ia_sync_secret", unix_time=True):
+                raise web.HTTPError("401 Unauthorized", {"Content-Type": "application/json"})
+        except ValueError, ExpiredTokenError:
+            raise web.HTTPError("401 Unauthorized", {"Content-Type": "application/json"})
+
+        parts = msg.split("|", maxsplit=1)
+        if len(parts) != 2 or not all(parts):
+            raise web.HTTPError(
+                "400 Bad Request",
+                {"Content-Type": "application/json"},
+                data=json.dumps({"error": "Invalid inputs"}),
+            )
+        ocaid, _ts = parts
+
+        # Fetch affected editions
+        edition_keys = site.get().things({"type": "/type/edition", "ocaid": ocaid})
+        edition_keys.extend(site.get().things({"type": "/type/edition", "source_records": f"ia:{ocaid}"}))
+        edition_keys = list(set(edition_keys))
+        if not edition_keys:
+            raise web.HTTPError("404 Not Found", {"Content-Type": "application/json"})
+
+        editions = site.get().get_many(edition_keys)
+        logger.info(f"Disassociating {ocaid} from the following editions: {', '.join(edition_keys)}")
+
+        # Update records
+        try:
+            for edition in editions:
+                self.make_dark(edition, ocaid, i.comment)
+        except ClientException as e:
+            logger.error(f"Failed to disassociate record with key {edition.key}", exc_info=True)
+            raise web.HTTPError(
+                "500 Internal Server Error",
+                {"Content-Type": "application/json"},
+                data=json.dumps({"error": str(e)}),
+            )
+
+        return delegate.RawText(json.dumps({"status": "ok"}))
+
+    @staticmethod
+    def make_dark(edition, ocaid, comment=""):
+        data = edition.dict()
+        if "ocaid" in data and data["ocaid"] == ocaid:
+            del data["ocaid"]
+        source_records = data.get("source_records", [])
+        data["source_records"] = [rec for rec in source_records if rec != f"ia:{ocaid}"]
+        if not data["source_records"]:
+            del data["source_records"]
+        with accounts.RunAs("ImportBot"):
+            web.ctx.ip = web.ctx.ip or "127.0.0.1"
+            site.get().save(
+                data,
+                comment or DEFAULT_UNLINK_COMMENT,
+                action="edit-edition-ocaid",
+            )

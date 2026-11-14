@@ -1,177 +1,258 @@
-from __future__ import print_function
+import importlib
 import json
-import web
+import re
 import sys
+from collections.abc import Hashable, Iterable
+from collections.abc import Set as AbstractSet
+from copy import deepcopy
+from typing import Any, Literal, Required, TypedDict, cast
 
-from openlibrary.plugins.openlibrary.processors import urlsafe
-from openlibrary.core import helpers as h
-from openlibrary.core import ia
-import six
+import web
 
 from infogami.utils.delegate import register_exception
+from openlibrary.core import helpers as h
+from openlibrary.core import infobase_async, lending
+from openlibrary.core.imports import ImportItem
+from openlibrary.core.models import Edition
+from openlibrary.plugins.openlibrary.processors import urlsafe
+from openlibrary.plugins.worksearch.search import get_solr
+from openlibrary.solr.solr_types import SolrDocument
+from openlibrary.utils.request_context import site
 
-def split_key(bib_key):
+# Import from manage-imports, but get around hyphen problem.
+imports_module = "scripts.manage-imports"
+manage_imports = importlib.import_module(imports_module)
+
+
+DynlinksPreview = Literal["full", "borrow", "restricted", "noview"]
+
+
+class DynlinksOptions(TypedDict, total=False):
+    format: Literal["json", "js"]
+    callback: str
+    jscmd: Literal["details", "data", "viewapi"]
+    details: Literal["true", "false"]
+    high_priority: bool
+
+
+# Small dummy wrappers until we have something more formal
+class OpenLibraryThing(TypedDict, total=False):
+    key: Required[str]
+
+
+class OpenLibraryEdition(OpenLibraryThing, total=False):
+    title: str
+    ocaid: str
+    covers: list[int]
+    authors: list[dict]
+    works: list[dict]
+    publishers: list[str]
+    publish_places: list[str]
+
+
+class OpenLibraryAuthor(OpenLibraryThing):
+    name: str
+
+
+class OpenLibraryEditionWithPreview(OpenLibraryEdition):
+    preview: Required[DynlinksPreview]
+
+
+def split_key(bib_key: str) -> tuple[str | None, str | None]:
     """
-        >>> split_key('1234567890')
-        ('isbn_', '1234567890')
-        >>> split_key('ISBN:1234567890')
-        ('isbn_', '1234567890')
-        >>> split_key('ISBN1234567890')
-        ('isbn_', '1234567890')
-        >>> split_key('ISBN1234567890123')
-        ('isbn_', '1234567890123')
-        >>> split_key('LCCNsa 64009056')
-        ('lccn', 'sa 64009056')
-        >>> split_key('badkey')
-        (None, None)
+    >>> split_key('1234567890')
+    ('isbn_', '1234567890')
+    >>> split_key('ISBN:1234567890')
+    ('isbn_', '1234567890')
+    >>> split_key('ISBN1234567890')
+    ('isbn_', '1234567890')
+    >>> split_key('ISBN1234567890123')
+    ('isbn_', '1234567890123')
+    >>> split_key('LCCNsa 64009056')
+    ('lccn', 'sa 64009056')
+    >>> split_key('badkey')
+    (None, None)
     """
     bib_key = bib_key.strip()
     if not bib_key:
         return None, None
 
-    valid_keys = ['isbn', 'lccn', 'oclc', 'ocaid', 'olid']
+    valid_keys = ["isbn", "lccn", "oclc", "ocaid", "olid"]
     key, value = None, None
 
     # split with : when possible
-    if ':' in bib_key:
-        key, value = bib_key.split(':', 1)
+    if ":" in bib_key:
+        key, value = bib_key.split(":", 1)
         key = key.lower()
     else:
         # try prefix match
         for k in valid_keys:
             if bib_key.lower().startswith(k):
                 key = k
-                value = bib_key[len(k):]
+                value = bib_key[len(k) :]
                 continue
 
     # treat plain number as ISBN
     if key is None and bib_key[0].isdigit():
-        key = 'isbn'
+        key = "isbn"
         value = bib_key
 
     # treat OLxxxM as OLID
-    re_olid = web.re_compile(r'OL\d+M(@\d+)?')
+    re_olid = re.compile(r"OL\d+M(@\d+)?")
     if key is None and re_olid.match(bib_key.upper()):
-        key = 'olid'
+        key = "olid"
         value = bib_key.upper()
 
-    if key == 'isbn':
+    if key == "isbn":
         # 'isbn_' is a special indexed field that gets both isbn_10 and isbn_13 in the normalized form.
-        key = 'isbn_'
-        value = value.replace("-", "") # normalize isbn by stripping hyphens
+        key = "isbn_"
+        value = (value or "").replace("-", "")  # normalize isbn by stripping hyphens
 
-    if key == 'oclc':
-        key = 'oclc_numbers'
+    if key == "oclc":
+        key = "oclc_numbers"
 
-    if key == 'olid':
-        key = 'key'
-        value = '/books/' + value.upper()
+    if key == "olid":
+        key = "key"
+        value = "/books/" + (value or "").upper()
 
     return key, value
 
 
-def ol_query(name, value):
+async def ol_query(name: str, value: str) -> str | None:
     query = {
-        'type': '/type/edition',
+        "type": "/type/edition",
         name: value,
     }
-    keys = web.ctx.site.things(query)
-    if keys:
-        return keys[0]
+    try:
+        keys = await infobase_async.things(query)
+    except infobase_async.UnsupportedQuery:
+        keys = site.get().things(query)
+    return keys[0] if keys else None
 
-def ol_get_many_as_dict(keys):
-    keys_with_revisions = [k for k in keys if '@' in k]
-    keys2 = [k for k in keys if '@' not in k]
 
-    result = dict((doc['key'], doc) for doc in ol_get_many(keys2))
+# TODO: Wrong type; can be any infobase Thing
+def ol_get_many_as_dict(keys: Iterable[str]) -> dict[str, OpenLibraryEdition]:
+    """
+    Ex.: ol_get_many_as_dict(['/books/OL2058361M', '/works/OL54120W'])
+    """
+    keys_with_revisions = [k for k in keys if "@" in k]
+    keys2 = [k for k in keys if "@" not in k]
+
+    result = {doc["key"]: doc for doc in ol_get_many(keys2)}
 
     for k in keys_with_revisions:
-        key, revision = k.split('@', 1)
-        revision = h.safeint(revision, None)
-        doc = web.ctx.site.get(key, revision)
+        key, revision = k.split("@", 1)
+        doc = site.get().get(key, h.safeint(revision) or None)
         result[k] = doc and doc.dict()
 
     return result
 
-def ol_get_many(keys):
-    return [doc.dict() for doc in web.ctx.site.get_many(keys)]
 
-def query_keys(bib_keys):
+# TODO: Wrong type; can be any infobase Thing
+def ol_get_many(keys: Iterable[str]) -> list[OpenLibraryEdition]:
+    return [doc.dict() for doc in site.get().get_many(keys)]
+
+
+async def query_keys(bib_keys: Iterable[str]) -> dict[str, str]:
     """Given a list of bibkeys, returns a mapping from bibkey to OL key.
 
-        >> query(["isbn:1234567890"])
-        {"isbn:1234567890": "/books/OL1M"}
+    >> query(["isbn:1234567890"])
+    {"isbn:1234567890": "/books/OL1M"}
     """
-    def query(bib_key):
+
+    async def query(bib_key):
         name, value = split_key(bib_key)
         if name is None:
             return None
-        elif name == 'key':
+        elif name == "key":
             return value
         else:
-            return ol_query(name, value)
+            assert value is not None
+            return await ol_query(name, value)
 
-    d = dict((bib_key, query(bib_key)) for bib_key in bib_keys)
-    return dict((k, v) for k, v in d.items() if v is not None)
+    d = {bib_key: await query(bib_key) for bib_key in bib_keys}
+    return {k: v for k, v in d.items() if v is not None}
 
-def query_docs(bib_keys):
-    """Given a list of bib_keys, returns a mapping from bibkey to OL doc.
-    """
-    mapping = query_keys(bib_keys)
+
+async def query_docs(bib_keys: Iterable[str]) -> dict[str, OpenLibraryEdition]:
+    """Given a list of bib_keys, returns a mapping from bibkey to OL doc."""
+    mapping = await query_keys(bib_keys)
     thingdict = ol_get_many_as_dict(uniq(mapping.values()))
-    return dict((bib_key, thingdict[key]) for bib_key, key in mapping.items() if key in thingdict)
+    return {bib_key: thingdict[key] for bib_key, key in mapping.items() if key in thingdict}
 
-def uniq(values):
+
+def uniq[T: Hashable](values: Iterable[T]) -> list[T]:
     return list(set(values))
 
-def process_result(result, jscmd):
-    d = {
-        "details": process_result_for_details,
-        "data": DataProcessor().process,
-        "viewapi": process_result_for_viewapi
-    }
 
-    f = d.get(jscmd) or d['viewapi']
-    return f(result)
+def process_result(
+    result: dict[str, OpenLibraryEditionWithPreview],
+    jscmd: Literal["details", "data", "viewapi"] | str | None,  # noqa: PYI051
+    checked_out_ocaids: AbstractSet[str] = frozenset(),
+    base_url: str | None = None,
+) -> dict:
+    match jscmd:
+        case "details":
+            return process_result_for_details(result, base_url)
+        case "data":
+            return DataProcessor(checked_out_ocaids, base_url).process(result)
+        case _:
+            return process_result_for_viewapi(result, base_url)
 
-def get_many_as_dict(keys):
-    return dict((doc['key'], doc) for doc in ol_get_many(keys))
 
-def get_url(doc):
-    base = web.ctx.get("home", "https://openlibrary.org")
-    if base == 'http://[unknown]':
+def get_many_as_dict(keys: Iterable[str]) -> dict[str, OpenLibraryEdition]:
+    return {doc["key"]: doc for doc in ol_get_many(keys)}
+
+
+def get_url(doc: OpenLibraryThing, base_url: str | None = None) -> str:
+    base = base_url or cast(str, web.ctx.get("home", "https://openlibrary.org"))
+    if base == "http://[unknown]":
         base = "https://openlibrary.org"
-    if doc['key'].startswith("/books/") or doc['key'].startswith("/works/"):
-        return base + doc['key'] + "/" + urlsafe(doc.get("title", "untitled"))
-    elif doc['key'].startswith("/authors/"):
-        return base + doc['key'] + "/" + urlsafe(doc.get("name", "unnamed"))
+    if doc["key"].startswith(("/books/", "/works/")):
+        book = cast(OpenLibraryEdition, doc)
+        return base + doc["key"] + "/" + urlsafe(book.get("title", "untitled"))
+    elif doc["key"].startswith("/authors/"):
+        author = cast(OpenLibraryAuthor, doc)
+        return base + doc["key"] + "/" + urlsafe(author.get("name", "unnamed"))
     else:
-        return base + doc['key']
+        return base + doc["key"]
+
 
 class DataProcessor:
-    """Processor to process the result when jscmd=data.
-    """
-    def process(self, result):
-        work_keys = [w['key'] for doc in result.values() for w in doc.get('works', [])]
+    """Processor to process the result when jscmd=data."""
+
+    def __init__(self, checked_out_ocaids: AbstractSet[str] = frozenset(), base_url: str | None = None):
+        """checked_out_ocaids: ocaids to report as checked out; see get_checked_out_ocaids"""
+        self.checked_out_ocaids = checked_out_ocaids
+        self.base_url = base_url
+
+    def process(self, result: dict[str, OpenLibraryEditionWithPreview]) -> dict:
+        work_keys = [w["key"] for doc in result.values() for w in doc.get("works", [])]
         self.works = get_many_as_dict(work_keys)
 
-        author_keys = [a['author']['key'] for w in self.works.values() for a in w.get('authors', [])]
+        author_keys = [a["author"]["key"] for w in self.works.values() for a in w.get("authors", [])]
         self.authors = get_many_as_dict(author_keys)
 
-        return dict((k, self.process_doc(doc)) for k, doc in result.items())
+        return {k: self.process_doc(doc) for k, doc in result.items()}
 
     def get_authors(self, work):
-        author_keys = [a['author']['key'] for a in work.get('authors', [])]
-        return [{"url": get_url(self.authors[key]), "name": self.authors[key].get("name", "")} for key in author_keys]
+        author_keys = [a["author"]["key"] for a in work.get("authors", [])]
+        return [
+            {
+                "url": get_url(self.authors[key], self.base_url),
+                "name": self.authors[key].get("name", ""),
+            }
+            for key in author_keys
+        ]
 
     def get_work(self, doc):
-        works = [self.works[w['key']] for w in doc.get('works', [])]
+        works = [self.works[w["key"]] for w in doc.get("works", [])]
         if works:
             return works[0]
         else:
             return {}
 
-    def process_doc(self, doc):
+    def process_doc(self, doc: OpenLibraryEditionWithPreview) -> dict:
         """Processes one document.
         Should be called only after initializing self.authors and self.works.
         """
@@ -180,234 +261,268 @@ class DataProcessor:
         def subject(name, prefix):
             # handle bad subjects loaded earlier.
             if isinstance(name, dict):
-                if 'value' in name:
-                    name = name['value']
-                elif 'key' in name:
-                    name = name['key'].split("/")[-1].replace("_", " ")
+                if "value" in name:
+                    name = name["value"]
+                elif "key" in name:
+                    name = name["key"].split("/")[-1].replace("_", " ")
                 else:
                     return {}
 
             return {
                 "name": name,
-                "url": "https://openlibrary.org/subjects/%s%s" % (prefix, name.lower().replace(" ", "_"))
+                "url": "https://openlibrary.org/subjects/{}{}".format(prefix, name.lower().replace(" ", "_")),
             }
 
         def get_subjects(name, prefix):
-            return [subject(s, prefix) for s in w.get(name, '')]
+            return [subject(s, prefix) for s in w.get(name, "")]
 
         def get_value(v):
             if isinstance(v, dict):
-                return v.get('value', '')
+                return v.get("value", "")
             else:
                 return v
 
         def format_excerpt(e):
             return {
                 "text": get_value(e.get("excerpt", {})),
-                "comment": e.get("comment", "")
+                "comment": e.get("comment", ""),
             }
 
         def format_table_of_contents(toc):
             # after openlibrary.plugins.upstream.models.get_table_of_contents
             def row(r):
-                if isinstance(r, six.string_types):
+                if isinstance(r, str):
                     level = 0
                     label = ""
                     title = r
                     pagenum = ""
                 else:
-                    level = h.safeint(r.get('level', '0'), 0)
-                    label = r.get('label', '')
-                    title = r.get('title', '')
-                    pagenum = r.get('pagenum', '')
-                r = dict(level=level, label=label, title=title, pagenum=pagenum)
+                    level = h.safeint(r.get("level", "0"), 0)
+                    label = r.get("label", "")
+                    title = r.get("title", "")
+                    pagenum = r.get("pagenum", "")
+                r = {"level": level, "label": label, "title": title, "pagenum": pagenum}
                 return r
+
             d = [row(r) for r in toc]
             return [row for row in d if any(row.values())]
 
         d = {
-            "url": get_url(doc),
-            "key": doc['key'],
+            "url": get_url(doc, self.base_url),
+            "key": doc["key"],
             "title": doc.get("title", ""),
             "subtitle": doc.get("subtitle", ""),
-
             "authors": self.get_authors(w),
-
             "number_of_pages": doc.get("number_of_pages", ""),
             "pagination": doc.get("pagination", ""),
-
             "weight": doc.get("weight", ""),
-
             "by_statement": doc.get("by_statement", ""),
-
-            'identifiers': web.dictadd(doc.get('identifiers', {}), {
-                'isbn_10': doc.get('isbn_10', []),
-                'isbn_13': doc.get('isbn_13', []),
-                'lccn': doc.get('lccn', []),
-                'oclc': doc.get('oclc_numbers', []),
-                'openlibrary': [doc['key'].split("/")[-1]]
-            }),
-
-            'classifications': web.dictadd(doc.get('classifications', {}), {
-                'lc_classifications': doc.get('lc_classifications', []),
-                'dewey_decimal_class': doc.get('dewey_decimal_class', [])
-            }),
-
+            "identifiers": web.dictadd(
+                doc.get("identifiers", {}),
+                {
+                    "isbn_10": doc.get("isbn_10", []),
+                    "isbn_13": doc.get("isbn_13", []),
+                    "lccn": doc.get("lccn", []),
+                    "oclc": doc.get("oclc_numbers", []),
+                    "openlibrary": [doc["key"].split("/")[-1]],
+                },
+            ),
+            "classifications": web.dictadd(
+                doc.get("classifications", {}),
+                {
+                    "lc_classifications": doc.get("lc_classifications", []),
+                    "dewey_decimal_class": doc.get("dewey_decimal_class", []),
+                },
+            ),
             "publishers": [{"name": p} for p in doc.get("publishers", "")],
             "publish_places": [{"name": p} for p in doc.get("publish_places", "")],
             "publish_date": doc.get("publish_date"),
-
             "subjects": get_subjects("subjects", ""),
             "subject_places": get_subjects("subject_places", "place:"),
             "subject_people": get_subjects("subject_people", "person:"),
             "subject_times": get_subjects("subject_times", "time:"),
             "excerpts": [format_excerpt(e) for e in w.get("excerpts", [])],
-
             "notes": get_value(doc.get("notes", "")),
             "table_of_contents": format_table_of_contents(doc.get("table_of_contents", [])),
-
-            "links": [dict(title=link.get("title"), url=link['url']) for link in w.get('links', '') if link.get('url')],
+            "links": [{"title": link.get("title"), "url": link["url"]} for link in w.get("links", "") if link.get("url")],
         }
 
-        for fs in [doc.get("first_sentence"), w.get('first_sentence')]:
+        for fs in [doc.get("first_sentence"), w.get("first_sentence")]:
             if fs:
-                e = {
-                    "text": get_value(fs),
-                    "comment": "",
-                    "first_sentence": True
-                    }
-                d['excerpts'].insert(0, e)
+                e = {"text": get_value(fs), "comment": "", "first_sentence": True}
+                d["excerpts"].insert(0, e)
                 break
 
-        def ebook(doc):
-            itemid = doc['ocaid']
-            availability = get_ia_availability(itemid)
+        def ebook(doc: OpenLibraryEditionWithPreview) -> dict:
+            itemid = doc.get("ocaid")
+            assert itemid
+            availability = doc.get("preview")
 
-            d = {
+            d: dict = {
                 "preview_url": "https://archive.org/details/" + itemid,
                 "availability": availability,
-                "formats": {}
+                "formats": {},
             }
 
-            prefix = "https://archive.org/download/%s/%s" % (itemid, itemid)
-            if availability == 'full':
+            prefix = f"https://archive.org/download/{itemid}/{itemid}"
+            if availability == "full":
                 d["read_url"] = "https://archive.org/stream/%s" % (itemid)
-                d['formats'] = {
-                    "pdf": {
-                        "url": prefix + ".pdf"
-                    },
-                    "epub": {
-                        "url": prefix + ".epub"
-                    },
-                    "text": {
-                        "url": prefix + "_djvu.txt"
-                    }
+                d["formats"] = {
+                    "pdf": {"url": prefix + ".pdf"},
+                    "epub": {"url": prefix + ".epub"},
+                    "text": {"url": prefix + "_djvu.txt"},
                 }
             elif availability == "borrow":
-                d['borrow_url'] = u"https://openlibrary.org%s/%s/borrow" % (doc['key'], h.urlsafe(doc.get("title", "untitled")))
-                loanstatus =  web.ctx.site.store.get('ebooks/' + doc['ocaid'], {'borrowed': 'false'})
-                d['checkedout'] = (loanstatus['borrowed'] == 'true')
+                d["borrow_url"] = "https://openlibrary.org{}/{}/borrow".format(doc["key"], h.urlsafe(doc.get("title", "untitled")))
+                d["checkedout"] = itemid in self.checked_out_ocaids
 
             return d
 
         if doc.get("ocaid"):
-            d['ebooks'] = [ebook(doc)]
+            d["ebooks"] = [ebook(doc)]
 
-        if doc.get('covers'):
-            cover_id = doc['covers'][0]
-            d['cover'] = {
+        if covers := doc.get("covers"):
+            cover_id = covers[0]
+            d["cover"] = {
                 "small": "https://covers.openlibrary.org/b/id/%s-S.jpg" % cover_id,
                 "medium": "https://covers.openlibrary.org/b/id/%s-M.jpg" % cover_id,
                 "large": "https://covers.openlibrary.org/b/id/%s-L.jpg" % cover_id,
             }
 
-        d['identifiers'] = trim(d['identifiers'])
-        d['classifications'] = trim(d['classifications'])
+        d["identifiers"] = trim(d["identifiers"])
+        d["classifications"] = trim(d["classifications"])
         return trim(d)
 
-def trim(d):
-    """Remote empty values from given dictionary.
 
-        >>> trim({"a": "x", "b": "", "c": [], "d": {}})
-        {'a': 'x'}
+def trim(d: dict) -> dict:
+    """Remove empty values from given dictionary.
+
+    >>> trim({"a": "x", "b": "", "c": [], "d": {}})
+    {'a': 'x'}
     """
-    return dict((k, v) for k, v in d.items() if v)
+    return {k: v for k, v in d.items() if v}
+
 
 def get_authors(docs):
-    """Returns a dict of author_key to {"key", "...", "name": "..."} for all authors in docs.
-    """
-    authors = [a['key'] for doc in docs for a in doc.get('authors', [])]
+    """Returns a dict of author_key to {"key", "...", "name": "..."} for all authors in docs."""
+    authors = [a["key"] for doc in docs for a in doc.get("authors", [])]
     author_dict = {}
 
     if authors:
         for a in ol_get_many(uniq(authors)):
-            author_dict[a['key']] = {"key": a['key'], "name": a.get("name", "")}
+            author_dict[a["key"]] = {"key": a["key"], "name": a.get("name", "")}
 
     return author_dict
 
-def process_result_for_details(result):
-    def f(bib_key, doc):
-        d = process_doc_for_viewapi(bib_key, doc)
 
-        if 'authors' in doc:
-            doc['authors'] = [author_dict[a['key']] for a in doc['authors']]
+# TODO: Dry with SolrDocument in solr_types.py
+SolrEbookAccess = Literal["no_ebook", "unclassified", "printdisabled", "borrowable", "public"]
 
-        d['details'] = doc
+
+async def add_availability(
+    editions_map: dict[str, OpenLibraryEdition],
+) -> dict[str, OpenLibraryEditionWithPreview]:
+    availability_to_preview: dict[SolrEbookAccess, DynlinksPreview] = {
+        "no_ebook": "noview",
+        "unclassified": "noview",
+        "printdisabled": "restricted",
+        "borrowable": "borrow",
+        "public": "full",
+    }
+
+    editions = list(editions_map.values())
+
+    solr_docs = cast(
+        list[SolrDocument],
+        await get_solr().get_many_async(
+            (ed["key"] for ed in editions),
+            fields=["key", "ebook_access"],
+        ),
+    )
+
+    keys_to_solr_doc = {doc["key"]: doc for doc in solr_docs}
+
+    result = cast(dict[str, OpenLibraryEditionWithPreview], editions_map)
+    for doc in result.values():
+        solr_doc = keys_to_solr_doc.get(doc["key"])
+        if solr_doc and (ebook_access := solr_doc.get("ebook_access")):
+            doc["preview"] = availability_to_preview.get(ebook_access) or "noview"
+        else:
+            doc["preview"] = "noview"
+    return result
+
+
+async def get_checked_out_ocaids(docs: Iterable[OpenLibraryEditionWithPreview]) -> set[str]:
+    """Returns the ocaids of the borrowable docs that are currently checked out on IA."""
+    return await lending.get_checked_out_async(doc["ocaid"] for doc in docs if doc.get("preview") == "borrow" and doc.get("ocaid"))
+
+
+def process_result_for_details(
+    result: dict[str, OpenLibraryEditionWithPreview],
+    base_url: str | None = None,
+) -> dict:
+    def f(bib_key: str, doc: OpenLibraryEditionWithPreview) -> dict:
+        d = process_doc_for_viewapi(bib_key, doc, base_url)
+
+        if "authors" in doc:
+            doc["authors"] = [author_dict[a["key"]] for a in doc["authors"]]
+
+        if "preview" in doc:
+            # preview should not be in details when reported to the public API
+            details = cast(dict, deepcopy(doc))
+            del details["preview"]
+            d["details"] = cast(OpenLibraryEdition, details)
+        else:
+            d["details"] = doc
+
         return d
 
     author_dict = get_authors(result.values())
-    return dict((k, f(k, doc)) for k, doc in result.items())
-
-def process_result_for_viewapi(result):
-    return dict((k, process_doc_for_viewapi(k, doc)) for k, doc in result.items())
+    return {k: f(k, doc) for k, doc in result.items()}
 
 
-def get_ia_availability(itemid):
-    collections = ia.get_metadata(itemid).get('collection', [])
+def process_result_for_viewapi(
+    result: dict[str, OpenLibraryEditionWithPreview],
+    base_url: str | None = None,
+) -> dict:
+    return {k: process_doc_for_viewapi(k, doc, base_url) for k, doc in result.items()}
 
-    if 'lendinglibrary' in collections or 'inlibrary' in collections:
-        return 'borrow'
-    elif 'printdisabled' in collections:
-        return 'restricted'
+
+def process_doc_for_viewapi(bib_key: str, page: OpenLibraryEditionWithPreview, base_url: str | None = None) -> dict:
+    url = get_url(page, base_url)
+
+    if "ocaid" in page:
+        preview = page.get("preview")
+        preview_url = "https://archive.org/details/" + page["ocaid"]
     else:
-        return 'full'
-
-def process_doc_for_viewapi(bib_key, page):
-    key = page['key']
-
-    url = get_url(page)
-
-    if 'ocaid' in page:
-        preview = get_ia_availability(page['ocaid'])
-        preview_url = 'https://archive.org/details/' + page['ocaid']
-    else:
-        preview = 'noview'
+        preview = "noview"
         preview_url = url
 
     d = {
-        'bib_key': bib_key,
-        'info_url': url,
-        'preview': preview,
-        'preview_url': preview_url,
+        "bib_key": bib_key,
+        "info_url": url,
+        "preview": preview,
+        "preview_url": preview_url,
     }
 
-    if page.get('covers'):
-        d['thumbnail_url'] = 'https://covers.openlibrary.org/b/id/%s-S.jpg' % page["covers"][0]
+    if covers := page.get("covers"):
+        d["thumbnail_url"] = "https://covers.openlibrary.org/b/id/%s-S.jpg" % covers[0]
 
     return d
 
-def format_result(result, options):
+
+def format_result(result: dict, options: DynlinksOptions) -> str:
     """Format result as js or json.
 
-        >>> format_result({'x': 1}, {})
-        'var _OLBookInfo = {"x": 1};'
-        >>> format_result({'x': 1}, {'callback': 'f'})
-        '{"x": 1}'
+    >>> format_result({'x': 1}, {})
+    'var _OLBookInfo = {"x": 1};'
+    >>> format_result({'x': 1}, {'callback': 'f'})
+    '{"x": 1}'
     """
-    format = options.get('format', '').lower()
-    if format == 'json':
+    format = options.get("format", "").lower()
+    if format == "json":
         return json.dumps(result)
-    else: # js
+    else:  # js
         json_data = json.dumps(result)
         callback = options.get("callback")
         if callback:
@@ -416,21 +531,87 @@ def format_result(result, options):
         else:
             return "var _OLBookInfo = %s;" % json_data
 
-def dynlinks(bib_keys, options):
+
+def is_isbn(bib_key: str) -> bool:
+    """Return True if the bib_key is ostensibly an ISBN (i.e. 10 or 13 characters)."""
+    return len(bib_key) in {10, 13}
+
+
+def get_missed_isbn_bib_keys(bib_keys: Iterable[str], found_records: dict) -> list[str]:
+    """
+    Return a Generator[str, None, None] with all ISBN bib_keys not in `found_records`.
+    """
+    return [bib_key for bib_key in bib_keys if bib_key not in found_records and is_isbn(bib_key)]
+
+
+def get_isbn_editiondict_map(isbns: Iterable[str], high_priority: bool = False) -> dict[str, Any]:
+    """
+    Attempts to import items from their ISBN, returning a mapping of possibly
+    imported edition_dicts in the following form:
+        {isbn_string: edition_dict...}}
+    """
+    # Supplement non-ISBN ASIN records with BookWorm metadata for that ASIN.
+    if high_priority:
+        for isbn in isbns:
+            if not isbn.upper().startswith("B"):
+                continue
+
+            if item_to_import := ImportItem.find_staged_or_pending([isbn]).first():
+                item_edition = ImportItem(item_to_import)
+                manage_imports.do_import(item_edition, require_marc=False)
+
+    # Get a mapping of ISBNs to new Editions (or `None`)
+    isbn_edition_map = {isbn: Edition.from_isbn(isbn_or_asin=isbn, high_priority=high_priority) for isbn in isbns}
+
+    # Convert editions to dicts, dropping ISBNs for which no edition was created.
+    return {isbn: edition.dict() for isbn, edition in isbn_edition_map.items() if edition}
+
+
+async def dynlinks(bib_keys: Iterable[str], options: DynlinksOptions, base_url: str | None = None) -> str:
+    """
+    Return a JSONified dictionary of bib_keys (e.g. ISBN, LCCN) and select URLs
+    associated with the corresponding edition, if any.
+
+    `base_url` is the URL prefix ("scheme://host") used when building the returned
+    links. It defaults to `web.ctx.home` for web.py callers.
+
+    If a bib key is an ISBN, options.high_priority=True, and no edition is found,
+    an import is attempted with high priority; otherwise missed bib_keys are queued
+    for lookup via the affiliate-server and responses are `staged` in `import_item`.
+
+    Example return value for a bib key of the ISBN "1452303886":
+        '{"1452303886": {"bib_key": "1452303886", "info_url": '
+        '"http://localhost:8080/books/OL24630277M/Fires_of_Prophecy_The_Morcyth_Saga_Book_Two", '
+        '"preview": "restricted", "preview_url": '
+        '"https://archive.org/details/978-1-4523-0388-8"}}'
+    """
     # for backward-compatibility
     if options.get("details", "").lower() == "true":
         options["jscmd"] = "details"
+    high_priority = options.get("high_priority", False)
 
     try:
-        result = query_docs(bib_keys)
-        result = process_result(result, options.get('jscmd'))
+        edition_dicts = await query_docs(bib_keys)
+
+        # For any ISBN bib_keys without hits, attempt to import+use immediately if
+        # `high_priority`. Otherwise, queue them for lookup via the AMZ Products
+        # API and process whatever editions were found in existing data.
+        if missed_isbns := get_missed_isbn_bib_keys(bib_keys, edition_dicts):
+            new_editions = get_isbn_editiondict_map(isbns=missed_isbns, high_priority=high_priority)
+            edition_dicts.update(new_editions)
+
+        docs = await add_availability(edition_dicts)
+        checked_out_ocaids = await get_checked_out_ocaids(docs.values()) if options.get("jscmd") == "data" else frozenset()
+        edition_dicts = process_result(docs, options.get("jscmd"), checked_out_ocaids, base_url)
     except:
         print("Error in processing Books API", file=sys.stderr)
         register_exception()
 
-        result = {}
-    return format_result(result, options)
+        edition_dicts = {}
+    return format_result(edition_dicts, options)
+
 
 if __name__ == "__main__":
     import doctest
+
     doctest.testmod()

@@ -1,0 +1,1112 @@
+import functools
+import logging
+import time
+import typing
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from typing import Literal, TypedDict, TypeVar, cast, override
+from urllib import parse
+
+from web import uniq
+
+from openlibrary.app import render_template
+from openlibrary.core.provider_loans import get_provider_loan
+from openlibrary.plugins.upstream.models import Edition
+from openlibrary.plugins.upstream.utils import get_coverstore_public_url
+from openlibrary.utils import OrderedEnum, multisort_best
+from openlibrary.utils.request_context import get_provider_pref, site
+
+if typing.TYPE_CHECKING:
+    from web.template import TemplateResult
+
+logger = logging.getLogger("openlibrary.book_providers")
+
+
+def is_safe_provider_url(url: str | None) -> bool:
+    """A provider URL is safe to store and render only if it is an absolute
+    http(s) URL with a host. Blocks javascript:, data:, and scheme-relative
+    URLs, which can otherwise reach an unescaped href on the borrow
+    interstitial. A scheme obfuscated with HTML character references fails
+    this check too, since urlparse never sees the literal scheme."""
+    if not isinstance(url, str) or not url:
+        return False
+    parsed = parse.urlparse(url)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+AcquisitionAccessLiteral = Literal["sample", "buy", "open-access", "borrow", "subscribe"]
+
+
+class EbookAccess(OrderedEnum):
+    # Keep in sync with solr/conf/enumsConfig.xml !
+    NO_EBOOK = 0
+    UNCLASSIFIED = 1
+    PRINTDISABLED = 2
+    BORROWABLE = 3
+    PUBLIC = 4
+
+    def to_solr_str(self):
+        return self.name.lower()
+
+    @staticmethod
+    def from_solr_str(literal: str) -> EbookAccess:
+        try:
+            return EbookAccess[literal.upper()]
+        except KeyError:
+            raise ValueError(f"Unknown access literal: {literal}")
+
+    @staticmethod
+    def from_acquisition_access(literal: AcquisitionAccessLiteral) -> EbookAccess:
+        if literal == "sample":
+            # We need to update solr to handle these! Requires full reindex
+            return EbookAccess.PRINTDISABLED
+        elif literal == "buy":
+            return EbookAccess.NO_EBOOK
+        elif literal == "open-access":
+            return EbookAccess.PUBLIC
+        elif literal == "borrow":
+            return EbookAccess.BORROWABLE
+        elif literal == "subscribe":
+            return EbookAccess.NO_EBOOK
+        else:
+            raise ValueError(f"Unknown access literal: {literal}")
+
+    def to_acquisition_access_literal(self) -> AcquisitionAccessLiteral | None:
+        if self == EbookAccess.PRINTDISABLED:
+            return "sample"
+        elif self == EbookAccess.PUBLIC:
+            return "open-access"
+        elif self == EbookAccess.BORROWABLE:
+            return "borrow"
+        else:
+            return None
+
+
+@dataclass
+class Acquisition:
+    """
+    Acquisition represents a book resource found on another website, such as
+    Standard Ebooks.
+
+    Wording inspired by OPDS; see https://specs.opds.io/opds-1.2#23-acquisition-feeds
+    """
+
+    access: AcquisitionAccessLiteral
+    format: Literal["web", "pdf", "epub", "audio"]
+    price: str | None
+    url: str
+    provider_name: str | None = None
+    # The OPDS `rel="self"` link: this publication on the provider's own feed.
+    # Distinct from `url`, which is the acquisition link -- what a reader
+    # follows to buy, borrow or read. A consumer that wants the source record
+    # needs this one, and today reverse-engineers it per provider.
+    source_url: str | None = None
+    # The provider's human-readable name ("Project Gutenberg"), where
+    # `provider_name` is a slug ("gutenberg"). Filled from the provider's
+    # `long_name` by `get_acquisitions`.
+    feed_name: str | None = None
+
+    @property
+    def ebook_access(self) -> EbookAccess:
+        return EbookAccess.from_acquisition_access(self.access)
+
+    @staticmethod
+    def from_json(json: dict) -> Acquisition:
+        if "href" in json:
+            # OPDS-style provider
+            return Acquisition.from_opds_json(json)
+        elif "url" in json:
+            # We have an inconsistency in our API
+            html_access: dict[str, AcquisitionAccessLiteral] = {
+                "read": "open-access",
+                "listen": "open-access",
+                "buy": "buy",
+                "borrow": "borrow",
+                "preview": "sample",
+            }
+            access = json.get("access", "open-access")
+            if access in html_access:
+                access = html_access[access]
+            if not is_safe_provider_url(json["url"]):
+                raise ValueError(f"Unsafe acquisition URL scheme: {json['url']!r}")
+            # Pressbooks/OL-style
+            return Acquisition(
+                access=access,
+                format=json.get("format", "web"),
+                price=json.get("price"),
+                url=json["url"],
+                provider_name=json.get("provider_name"),
+                source_url=json.get("source_url"),
+                feed_name=json.get("feed_name"),
+            )
+        else:
+            raise ValueError(f"Unknown ebook acquisition format: {json}")
+
+    @staticmethod
+    def from_json_safe(json: dict) -> Acquisition | None:
+        try:
+            return Acquisition.from_json(json)
+        except ValueError as e:
+            logger.warning(f"Failed to parse acquisition from json: {json} with error {e}")
+            return None
+
+    @staticmethod
+    def from_opds_json(json: dict) -> Acquisition:
+        if json.get("properties", {}).get("indirectAcquisition", None):
+            mimetype = json["properties"]["indirectAcquisition"][0]["type"]
+        else:
+            mimetype = json["type"]
+
+        fmt: Literal["web", "pdf", "epub", "audio"] = "web"
+        if mimetype.startswith("audio/"):
+            fmt = "audio"
+        elif mimetype == "application/pdf":
+            fmt = "pdf"
+        elif mimetype == "application/epub+zip":
+            fmt = "epub"
+        elif mimetype == "text/html":
+            fmt = "web"
+        else:
+            logger.warning(f"Unknown mimetype: {mimetype}")
+            fmt = "web"
+
+        if json.get("properties", {}).get("price", None):
+            price = f"{json['properties']['price']['value']} {json['properties']['price']['currency']}"
+        else:
+            price = None
+
+        if not is_safe_provider_url(json["href"]):
+            raise ValueError(f"Unsafe acquisition URL scheme: {json['href']!r}")
+        return Acquisition(
+            access=json["rel"].split("/")[-1],
+            format=fmt,
+            price=price,
+            url=json["href"],
+            provider_name=json.get("name"),
+        )
+
+
+class IALiteMetadata(TypedDict):
+    boxid: set[str]
+    collection: set[str]
+    access_restricted_item: Literal["true", "false"] | None
+
+
+TProviderMetadata = TypeVar("TProviderMetadata")
+
+
+class AbstractBookProvider[TProviderMetadata]:
+    short_name: str
+
+    """Human-readable name of the provider, used in the UI."""
+    long_name: str | None = None
+
+    """
+    The key in the identifiers field on editions;
+    see https://openlibrary.org/config/edition
+    """
+    identifier_key: str | None
+
+    @property
+    def provider_name(self) -> str:
+        return self.identifier_key or self.short_name
+
+    def get_olids(self, identifier: str) -> list[str]:
+        return site.get().things({"type": "/type/edition", self.db_selector: identifier})
+
+    @property
+    def editions_query(self):
+        return {f"{self.db_selector}~": "*"}
+
+    @property
+    def db_selector(self) -> str:
+        return f"identifiers.{self.identifier_key}"
+
+    @property
+    def solr_key(self):
+        return f"id_{self.identifier_key}"
+
+    def get_identifiers(self, ed_or_solr: Edition | dict) -> list[str]:
+        return (
+            # If it's an edition
+            ed_or_solr.get("identifiers", {}).get(self.identifier_key, [])
+            or
+            # if it's a solr work record
+            ed_or_solr.get(f"id_{self.identifier_key}", [])
+        )
+
+    def choose_best_identifier(self, identifiers: list[str]) -> str:
+        return identifiers[0]
+
+    def get_best_identifier(self, ed_or_solr: Edition | dict) -> str:
+        identifiers = self.get_identifiers(ed_or_solr)
+        assert identifiers
+        return self.choose_best_identifier(identifiers)
+
+    def get_best_identifier_slug(self, ed_or_solr: Edition | dict) -> str:
+        """Used in eg /work/OL1W?edition=ia:foobar URLs, for example"""
+        return f"{self.short_name}:{self.get_best_identifier(ed_or_solr)}"
+
+    def get_template_path(self, typ: Literal["read_button", "download_options"]) -> str:
+        return f"book_providers/{self.short_name}_{typ}.html"
+
+    def get_read_acquisition(self, ed_or_solr: Edition | dict) -> Acquisition | None:
+        """The acquisition the read button offers: the most open one, if any is readable."""
+        readable = [p for p in self.get_acquisitions(ed_or_solr) if p.ebook_access >= EbookAccess.PRINTDISABLED]
+        return max(readable, key=lambda p: p.ebook_access, default=None)
+
+    def render_read_button(
+        self,
+        edition_key: str,
+        ed_or_solr: Edition | dict,
+        analytics_attr: Callable[[str], str],
+        show_locate: bool = False,
+        check_loan_status: bool = False,
+    ) -> TemplateResult | str:
+        if not (acquisition := self.get_read_acquisition(ed_or_solr)):
+            return ""
+
+        # Asked here rather than in the template so the lookup needs no template
+        # global, and only when the caller says this page is worth asking on --
+        # see LoanStatus.html, which keeps it off carousels and search results.
+        provider_loan = get_provider_loan(ed_or_solr.get("key"), None) if check_loan_status else None
+        # pre-process acquisition.url so ParseResult.netloc is always the domain. Only netloc is used.
+        url = "https://" + acquisition.url if not acquisition.url.startswith("http") else acquisition.url
+        parsed_url = parse.urlparse(url)
+        domain = parsed_url.netloc
+        return render_template(
+            "book_providers/read_button.html",
+            edition_key,
+            acquisition,
+            self.long_name or domain,
+            analytics_attr,
+            show_locate=show_locate,
+            provider_loan=provider_loan,
+        )
+
+    def render_download_options(self, edition: Edition, extra_args: list | None = None) -> TemplateResult:
+        return render_template(
+            self.get_template_path("download_options"),
+            self.get_best_identifier(edition),
+            *(extra_args or []),
+        )
+
+    def is_own_ocaid(self, ocaid: str) -> bool:
+        """Whether the ocaid is an archive of content from this provider"""
+        return False
+
+    def get_access(
+        self,
+        edition: dict,
+        metadata: TProviderMetadata | None = None,
+    ) -> EbookAccess:
+        """
+        Return the access level of the edition.
+        """
+        # Most providers are for public-only ebooks right now
+        return EbookAccess.PUBLIC
+
+    def get_acquisitions(
+        self,
+        ed_or_solr: Edition | dict,
+    ) -> list[Acquisition]:
+        if providers := ed_or_solr.get("providers", []):
+            return [acq for p in providers if (acq := Acquisition.from_json_safe(dict(p)))]
+        else:
+            return []
+
+
+class InternetArchiveProvider(AbstractBookProvider[IALiteMetadata]):
+    short_name = "ia"
+    long_name = "Internet Archive"
+    identifier_key = "ocaid"
+
+    @property
+    @typing.override
+    def provider_name(self) -> str:
+        return "ia"
+
+    @property
+    def db_selector(self) -> str:
+        return self.identifier_key
+
+    @property
+    def solr_key(self) -> str:
+        return "ia"
+
+    def get_identifiers(self, ed_or_solr: Edition | dict) -> list[str]:
+        # Solr work record augmented with availability
+        # Sometimes it's set explicitly to None, for some reason
+        availability = ed_or_solr.get("availability", {}) or {}
+        if availability.get("identifier"):
+            return [ed_or_solr["availability"]["identifier"]]
+
+        # Edition
+        if ed_or_solr.get("ocaid"):
+            return [ed_or_solr["ocaid"]]
+
+        # Solr work record
+        return ed_or_solr.get("ia", [])
+
+    def is_own_ocaid(self, ocaid: str) -> bool:
+        return True
+
+    def render_download_options(self, edition: Edition, extra_args: list | None = None) -> TemplateResult | str:
+        if edition.is_access_restricted():
+            return ""
+
+        formats = {
+            "pdf": edition.get_ia_download_link(".pdf"),
+            "epub": edition.get_ia_download_link(".epub"),
+            "mobi": edition.get_ia_download_link(".mobi"),
+            "txt": edition.get_ia_download_link("_djvu.txt"),
+        }
+
+        if any(formats.values()):
+            return render_template(
+                self.get_template_path("download_options"),
+                formats,
+                edition.url("/daisy"),
+            )
+        else:
+            return ""
+
+    def get_access(self, edition: dict, metadata: IALiteMetadata | None = None) -> EbookAccess:
+        if not metadata:
+            if edition.get("ocaid"):
+                return EbookAccess.UNCLASSIFIED
+            else:
+                return EbookAccess.NO_EBOOK
+
+        collections = metadata.get("collection", set())
+        access_restricted_item = metadata.get("access_restricted_item") == "true"
+
+        if "inlibrary" in collections:
+            return EbookAccess.BORROWABLE
+        elif "printdisabled" in collections:
+            return EbookAccess.PRINTDISABLED
+        elif access_restricted_item or not collections:
+            return EbookAccess.UNCLASSIFIED
+        else:
+            return EbookAccess.PUBLIC
+
+    def get_acquisitions(
+        self,
+        ed_or_solr: Edition | dict,
+        db_edition: Edition | None = None,
+    ) -> list[Acquisition]:
+        access: AcquisitionAccessLiteral | None = None
+
+        if solr_ebook_access := ed_or_solr.get("ebook_access"):
+            access = EbookAccess.from_solr_str(solr_ebook_access).to_acquisition_access_literal()
+
+        if not access:
+            return []
+
+        identifier = self.get_best_identifier(db_edition or ed_or_solr)
+        acquisitions = [
+            Acquisition(
+                access=access,
+                format="web",
+                price=None,
+                url=f"https://archive.org/details/{identifier}?view=theater&wrapper=false",
+                provider_name=self.short_name,
+            ),
+        ]
+
+        # Add direct download links for open-access books
+        if access == "open-access":
+            download_files = self._get_ia_download_files(identifier)
+            for fmt, filename in download_files.items():
+                acquisitions.append(
+                    Acquisition(
+                        access="open-access",
+                        format=fmt,
+                        price=None,
+                        url=f"https://archive.org/download/{identifier}/{filename}",
+                        provider_name=self.short_name,
+                    )
+                )
+
+        return acquisitions
+
+    def _get_ia_download_files(self, identifier: str) -> dict[Literal["pdf", "epub"], str]:
+        """
+        Get default download file names for IA items.
+
+        Assumes standard IA naming convention where files are named
+        {identifier}.pdf and {identifier}.epub. This avoids making
+        individual network requests for each item's metadata.
+
+        Returns a dict mapping format to filename, e.g.:
+        {'pdf': 'mybook.pdf', 'epub': 'mybook.epub'}
+        """
+        return {
+            "pdf": f"{identifier}.pdf",
+            "epub": f"{identifier}.epub",
+        }
+
+
+class LibriVoxProvider(AbstractBookProvider):
+    short_name = "librivox"
+    long_name = "LibriVox"
+    identifier_key = "librivox"
+
+    def render_download_options(self, edition: Edition, extra_args: list | None = None):
+        # The template also needs the ocaid, since some of the files are hosted on IA
+        return super().render_download_options(edition, [edition.get("ocaid")])
+
+    def is_own_ocaid(self, ocaid: str) -> bool:
+        return "librivox" in ocaid
+
+    def get_acquisitions(self, ed_or_solr: Edition | dict) -> list[Acquisition]:
+        return [
+            Acquisition(
+                access="open-access",
+                format="audio",
+                price=None,
+                url=f"https://librivox.org/{self.get_best_identifier(ed_or_solr)}",
+                provider_name=self.short_name,
+            )
+        ]
+
+
+class ProjectGutenbergProvider(AbstractBookProvider):
+    short_name = "gutenberg"
+    long_name = "Project Gutenberg"
+    identifier_key = "project_gutenberg"
+
+    def is_own_ocaid(self, ocaid: str) -> bool:
+        return ocaid.endswith("gut")
+
+    def get_acquisitions(
+        self,
+        ed_or_solr: Edition | dict,
+    ) -> list[Acquisition]:
+        return [
+            Acquisition(
+                access="open-access",
+                format="web",
+                price=None,
+                url=f"https://www.gutenberg.org/ebooks/{self.get_best_identifier(ed_or_solr)}",
+                provider_name=self.short_name,
+            )
+        ]
+
+
+class ProjectRunebergProvider(AbstractBookProvider):
+    short_name = "runeberg"
+    long_name = "Project Runeberg"
+    identifier_key = "project_runeberg"
+
+    def is_own_ocaid(self, ocaid: str) -> bool:
+        """Whether the ocaid (IA item ID) is an archive of content from Project Runeberg."""
+        return "runeberg" in ocaid
+
+    def get_acquisitions(
+        self,
+        ed_or_solr: Edition | dict,
+    ) -> list[Acquisition]:
+        return [
+            Acquisition(
+                access="open-access",
+                format="web",
+                price=None,
+                url=f"https://runeberg.org/{self.get_best_identifier(ed_or_solr)}/",
+                provider_name=self.short_name,
+            )
+        ]
+
+
+class StandardEbooksProvider(AbstractBookProvider):
+    short_name = "standard_ebooks"
+    long_name = "Standard Ebooks"
+    identifier_key = "standard_ebooks"
+
+    def is_own_ocaid(self, ocaid: str) -> bool:
+        # Standard ebooks isn't archived on IA
+        return False
+
+    def get_acquisitions(
+        self,
+        ed_or_solr: Edition | dict,
+    ) -> list[Acquisition]:
+        standard_ebooks_id = self.get_best_identifier(ed_or_solr)
+        base_url = "https://standardebooks.org/ebooks/" + standard_ebooks_id
+        flat_id = standard_ebooks_id.replace("/", "_")
+        return [
+            Acquisition(
+                access="open-access",
+                format="web",
+                price=None,
+                url=f"{base_url}/text/single-page",
+                provider_name=self.short_name,
+            ),
+            Acquisition(
+                access="open-access",
+                format="epub",
+                price=None,
+                url=f"{base_url}/downloads/{flat_id}.epub",
+                provider_name=self.short_name,
+            ),
+        ]
+
+
+class OpenStaxProvider(AbstractBookProvider):
+    short_name = "openstax"
+    long_name = "OpenStax"
+    identifier_key = "openstax"
+
+    def is_own_ocaid(self, ocaid: str) -> bool:
+        return False
+
+    def get_acquisitions(
+        self,
+        ed_or_solr: Edition | dict,
+    ) -> list[Acquisition]:
+        return [
+            Acquisition(
+                access="open-access",
+                format="web",
+                price=None,
+                url=f"https://openstax.org/details/books/{self.get_best_identifier(ed_or_solr)}",
+                provider_name=self.short_name,
+            )
+        ]
+
+
+class CitaPressProvider(AbstractBookProvider):
+    short_name = "cita_press"
+    long_name = "Cita Press"
+    identifier_key = "cita_press"
+
+    def is_own_ocaid(self, ocaid: str) -> bool:
+        return False
+
+    def get_acquisitions(
+        self,
+        ed_or_solr: Edition | dict,
+    ) -> list[Acquisition]:
+        return [
+            Acquisition(
+                access="open-access",
+                format="web",
+                price=None,
+                url=f"https://citapress.org/{self.get_best_identifier(ed_or_solr)}",
+                provider_name=self.short_name,
+            )
+        ]
+
+
+class DirectProvider(AbstractBookProvider):
+    short_name = "direct"
+    long_name = None
+    identifier_key = None
+
+    @property
+    def db_selector(self) -> str:
+        return "providers.url"
+
+    @property
+    def solr_key(self) -> None:
+        # TODO: Not implemented yet
+        return None
+
+    def get_identifiers(self, ed_or_solr: Edition | dict) -> list[str]:
+        """
+        Note: This will only work for solr records if the provider field was fetched
+        in the solr request. (Note: this field is populated from db)
+        """
+        if providers := ed_or_solr.get("providers", []):
+            identifiers = [
+                provider.url for provider in map(Acquisition.from_json_safe, providers) if provider and provider.ebook_access >= EbookAccess.PRINTDISABLED
+            ]
+            to_remove = set()
+            for tbp in PROVIDER_ORDER:
+                # Avoid infinite recursion.
+                if isinstance(tbp, DirectProvider):
+                    continue
+                if not tbp.get_identifiers(ed_or_solr):
+                    continue
+                for acq in tbp.get_acquisitions(ed_or_solr):
+                    to_remove.add(acq.url)
+
+            return [identifier for identifier in identifiers if identifier not in to_remove]
+
+        else:
+            # TODO: Not implemented for search/solr yet
+            return []
+
+    def render_download_options(self, edition: Edition, extra_args: list | None = None):
+        # Return an empty string until #9581 is addressed.
+        return ""
+
+    def get_access(
+        self,
+        edition: dict,
+        metadata: TProviderMetadata | None = None,
+    ) -> EbookAccess:
+        """
+        Return the access level of the edition.
+        """
+        # For now assume 0 is best
+        if acq := Acquisition.from_json_safe(edition["providers"][0]):
+            return EbookAccess.from_acquisition_access(acq.access)
+        return EbookAccess.NO_EBOOK
+
+
+class WikisourceProvider(AbstractBookProvider):
+    short_name = "wikisource"
+    identifier_key = "wikisource"
+
+    @override
+    def get_acquisitions(self, ed_or_solr: Edition | dict) -> list[Acquisition]:
+        return [
+            Acquisition(
+                access="open-access",
+                format="web",
+                price=None,
+                url=f"https://wikisource.org/wiki/{self.get_best_identifier(ed_or_solr)}",
+                provider_name=self.short_name,
+            )
+        ]
+
+
+# How often one process may scan `acquisitions` for Lenny provider names it
+# cannot serve. An hour: the thing being watched for is a library deciding to
+# stand up a node, which happens on a scale of days.
+_LENNY_PROVIDER_SCAN_INTERVAL = 3600.0
+_lenny_provider_scan_deadline = 0.0
+
+
+def _is_lenny_provider_name(provider_name: str) -> bool:
+    """``lenny`` itself, or a per-node ``lenny_<host>``.
+
+    Not a bare ``startswith``, which would also claim a hypothetical
+    ``lennylibrary`` -- a different provider that merely sorts next to this
+    one, and whose rows are not evidence of anything.
+    """
+    prefix = LennyProvider.short_name
+    return provider_name == prefix or provider_name.startswith(f"{prefix}_")
+
+
+def _warn_about_unservable_lenny_rows() -> None:
+    """Log harvested Lenny rows that no name this code reads can serve.
+
+    Lenny is built for many nodes, each harvested under its own
+    ``provider_name``: ``lenny``, then ``lenny_<host>`` for every node after
+    the first (Lenny's own ``_provider_name()``, shipped in 0.2.22). Open
+    Library reads exactly one of those names. So on the day a second library
+    registers, its books lose their borrow button and nothing anywhere records
+    it -- the row is harvested, the lookup misses, and ``get_acquisitions``
+    returns an empty list indistinguishable from a book nobody lends.
+
+    This does not fix that, and the button still vanishes. It makes the
+    vanishing audible, because the trigger is a third party deciding to run a
+    node and there is nobody here who can watch for that.
+
+    Deliberately NOT gated on the calling read having come up empty. The
+    editions that break never reach ``_harvested_lenny_entries`` at all: they
+    carry ``identifiers.lenny_<host>``, and ``get_book_providers`` only yields
+    a provider whose ``get_identifiers`` is non-empty, which reads
+    ``identifiers["lenny"]``. Every call that does arrive here is therefore a
+    healthy one, and gating on this call having failed would keep this silent
+    in precisely the case it exists for. A healthy call is the only trigger
+    available.
+
+    Silent while one node is registered, which is today: production holds 94
+    works and every one is plain ``lenny`` (``search.json?q=id_lenny:*`` -> 94,
+    ``q=id_lenny_lennyforlibraries_org:*`` -> 0). That figure is the one this
+    module already records for 2026-09-20 and was not re-measured here;
+    re-derive it with those two queries rather than trusting this line.
+    """
+    global _lenny_provider_scan_deadline
+    now = time.monotonic()
+    if now < _lenny_provider_scan_deadline:
+        return
+    # Moved BEFORE the query, not after: this runs once per Lenny edition per
+    # page render and a search page lists many, so a slow or failing scan must
+    # not be retried by every remaining edition on the page. Two threads can
+    # still race past the check and scan twice; the cost of that is one extra
+    # query an hour, so it does not buy a lock.
+    #
+    # This is a throttle, not the memo that `_harvested_lenny_entries` forbids
+    # below. What that ban protects against is per-edition data outliving its
+    # request, so that an edition with no row starts answering with another
+    # edition's. The only thing kept here is when this process last looked at
+    # the table, which is the same fact for every edition and cannot be
+    # attributed to the wrong one. Per process, so N web workers say it N
+    # times an hour -- bounded, and a warning emitted once a day is one that
+    # nobody is awake for.
+    _lenny_provider_scan_deadline = now + _LENNY_PROVIDER_SCAN_INTERVAL
+    try:
+        from openlibrary.core.acquisitions import Acquisition as StoredAcquisition
+
+        harvested = StoredAcquisition.distinct_provider_names()
+    except Exception:
+        # Inherits the caller's contract: this is a log line, and there is no
+        # outcome it is allowed to change. `debug`, not `exception`, because
+        # the read that got us here already succeeded -- anything failing now
+        # is this scan's own problem and must not look like a lending fault.
+        logger.debug("could not check for unservable Lenny provider names", exc_info=True)
+        return
+    # Derived from what the lookup actually asks for, never a literal, so that
+    # widening the lookup silences this by itself instead of leaving behind a
+    # warning that outlived the defect it described.
+    servable = {LennyProvider.short_name}
+    unservable = sorted(name for name in harvested if _is_lenny_provider_name(name) and name not in servable)
+    if unservable:
+        logger.warning(
+            "acquisitions harvested under Lenny provider name(s) %s, which Open Library cannot "
+            "read back -- it serves only %s. Editions from those nodes render no borrow button. "
+            "See #13686.",
+            ", ".join(unservable),
+            ", ".join(sorted(servable)),
+        )
+
+
+def _harvested_lenny_entries(local_id: str) -> list[dict]:
+    """The acquisition entries the harvester stored for one Lenny id.
+
+    Read from the Trusted Book Provider ``acquisitions`` table, not from the
+    edition's ``providers`` field. The two are different stores that share a
+    class name, and the import pipeline writes only the first --
+    ``add_book._save_acquisitions`` calls ``Acquisition.upsert`` and nothing in
+    ``catalog/add_book`` or ``bookworm`` assigns ``providers`` at all. So on a
+    Lenny edition ``providers`` holds whatever a patron typed into the
+    edit-book form, or nothing: of the 50 Lenny editions in the live feed,
+    checked on production 2026-09-20, exactly one had the field and it pointed
+    at a GitHub URL unrelated to Lenny.
+
+    One indexed single-row read per call. Do not memoize this on ``web.ctx``:
+    only web.py clears it per request (``web/application.py:427``), so under
+    FastAPI, in a script, or in the test suite the entry outlives its request
+    and an edition with no row starts answering with another edition's -- a
+    stale access kind puts a patron on ``/read`` for a book they must borrow.
+    Batching belongs at the call site, where
+    ``WorkSearchScheme.add_non_solr_fields`` already holds every row for the
+    page; that needs a channel ``get_acquisitions`` does not have. Until then
+    the cost is bounded by how many editions carry ``identifiers.lenny`` at
+    all -- 94 works on production, 2026-09-20.
+
+    Returns ``[]`` on any database failure, because both callers are places an
+    exception cannot go: page rendering, where it would 500 a book page, and
+    the Solr indexer, which need not have this database configured at all.
+    """
+    entries: list[dict] = []
+    database_answered = True
+    try:
+        from openlibrary.core.acquisitions import Acquisition as StoredAcquisition
+
+        row = StoredAcquisition.find_many(LennyProvider.short_name, [local_id]).get(local_id)
+    except Exception:
+        logger.exception("failed to read Lenny acquisitions for %s; rendering none", local_id)
+        row = None
+        database_answered = False
+    if database_answered:
+        # Only when the database answered. Where it does not -- the Solr
+        # indexer need not have this database configured at all -- there is
+        # nothing to scan, and the sole effect would be one failing query an
+        # hour forever.
+        _warn_about_unservable_lenny_rows()
+    if row is not None:
+        # `data` is jsonb written from an external feed: its top level can be
+        # any JSON type, and `_from_row` leaves an unparsable blob as a string.
+        data = row.data if isinstance(row.data, dict) else {}
+        stored = data.get("acquisitions")
+        if isinstance(stored, list):
+            entries = [entry for entry in stored if isinstance(entry, dict)]
+    return entries
+
+
+class LennyProvider(AbstractBookProvider):
+    """A Lenny node -- a library running its own lending server.
+
+    Alone among the providers here, the access kind varies from book to book:
+    25 of the 50 publications in https://lennyforlibraries.org/v1/api/opds are
+    ``open-access`` and 25 are ``borrow`` (counted 2026-09-20). ``identifiers.lenny``
+    cannot tell the two apart, which is why this reads the harvested row rather
+    than synthesizing a URL from the identifier the way its neighbours do.
+
+    The distinction is not cosmetic, because the endpoints are not
+    interchangeable. Against the live node on 2026-09-20:
+
+    - ``/v1/api/items/46539165/read`` (borrowable) -> ``401`` with an OPDS
+      Authentication Document, for ``Accept: text/html`` as well as ``*/*``.
+      A "Read" link on a borrowable title is a dead end in a browser.
+    - ``/v1/api/items/46539165/borrow`` -> ``303`` to the node's own sign-in
+      for ``Accept: text/html``, which is what a browser sends. So the borrow
+      CTA works with nothing built on this side; the OAuth handshake that
+      keeps the patron on Open Library is #13688.
+    """
+
+    short_name = "lenny"
+    long_name = "Lenny"
+    identifier_key = "lenny"
+
+    @override
+    def is_own_ocaid(self, ocaid: str) -> bool:
+        # A node holds its own files; none of its content is archived under an
+        # IA identifier.
+        return False
+
+    @override
+    def get_acquisitions(self, ed_or_solr: Edition | dict) -> list[Acquisition]:
+        acquisitions = []
+        for entry in _harvested_lenny_entries(self.get_best_identifier(ed_or_solr)):
+            access = entry.get("access")
+            url = entry.get("url")
+            if access not in typing.get_args(AcquisitionAccessLiteral):
+                continue
+            if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
+                # The feed authored this and a template renders it as an href.
+                continue
+            acquisitions.append(
+                Acquisition(
+                    access=cast(AcquisitionAccessLiteral, access),
+                    # Always `web`, not the stored mimetype: both Lenny URLs are
+                    # the node's HTML entry points -- `/read` redirects into its
+                    # reader, `/borrow` into its sign-in. The epub behind a
+                    # borrow link is fulfilled inside Lenny, after the loan, and
+                    # is not what this URL points at.
+                    format="web",
+                    price=None,
+                    url=url,
+                    provider_name=self.short_name,
+                )
+            )
+        return acquisitions
+
+    @override
+    def get_access(self, edition: dict, metadata: TProviderMetadata | None = None) -> EbookAccess:
+        # Not the base class's unconditional PUBLIC: half this catalogue needs a
+        # loan, and this value becomes Solr's `ebook_access`, which drives
+        # `public_scan_b` and `has_fulltext`. NO_EBOOK when nothing is stored --
+        # including when the database read above failed -- so an unknown reads
+        # as a claim not made rather than as a free book.
+        return max((acquisition.ebook_access for acquisition in self.get_acquisitions(edition)), default=EbookAccess.NO_EBOOK)
+
+
+class BetterWorldBooksProvider(AbstractBookProvider):
+    short_name = "betterworldbooks"
+    long_name = "Better World Books"
+    identifier_key = "betterworldbooks"
+
+    def is_own_ocaid(self, ocaid: str) -> bool:
+        return False
+
+    def get_identifiers(self, ed_or_solr: Edition | dict) -> list[str]:
+        # basically just check if it has an isbn?
+        isbn = ed_or_solr.get("isbn") or ed_or_solr.get("isbn_10") or ed_or_solr.get("isbn_13") or []
+        if ed_or_solr.get("key") in self.bwb_acquisitions and isbn:
+            return isbn
+        return []
+
+    @functools.cached_property
+    def bwb_acquisitions(self) -> dict[str, Acquisition]:
+        from infogami import config
+
+        results = {key: Acquisition.from_json(acq) for key, acq in getattr(config, "bwb_test_holdings", {}).items()}
+
+        for acq in results.values():
+            acq.provider_name = "Better World Books"
+
+        return results
+
+    def get_acquisitions(
+        self,
+        ed_or_solr: Edition | dict,
+    ) -> list[Acquisition]:
+        key = cast(str, ed_or_solr["key"])
+
+        if acq := self.bwb_acquisitions.get(key):
+            return [acq]
+
+        return []
+
+
+PROVIDER_ORDER: list[AbstractBookProvider] = [
+    # These providers act essentially as their own publishers, so link to the first when
+    # we're on an edition page
+    DirectProvider(),
+    LibriVoxProvider(),
+    ProjectGutenbergProvider(),
+    ProjectRunebergProvider(),
+    StandardEbooksProvider(),
+    OpenStaxProvider(),
+    CitaPressProvider(),
+    WikisourceProvider(),
+    # Then link to IA
+    InternetArchiveProvider(),
+    # Then to a library lending node. Below IA deliberately: an edition that
+    # already renders an IA button keeps rendering it, so adding this provider
+    # changes no button that exists today and only fills in where nothing else
+    # offers the book.
+    LennyProvider(),
+    # Then link to purchase options
+    BetterWorldBooksProvider(),
+]
+
+
+def get_cover_url(ed_or_solr: Edition | dict) -> str | None:
+    """
+    Get the cover url most appropriate for this edition or solr work search result
+    """
+    size = "M"
+
+    # Editions
+    if isinstance(ed_or_solr, Edition):
+        cover = ed_or_solr.get_cover()
+        return cover.url(size) if cover else None
+
+    # Solr edition
+    elif ed_or_solr["key"].startswith("/books/") and ed_or_solr.get("cover_i"):
+        return get_coverstore_public_url() + f"/b/id/{ed_or_solr['cover_i']}-{size}.jpg"
+
+    # Solr document augmented with availability
+    availability = ed_or_solr.get("availability", {}) or {}
+
+    if availability.get("openlibrary_edition"):
+        olid = availability.get("openlibrary_edition")
+        return f"{get_coverstore_public_url()}/b/olid/{olid}-{size}.jpg"
+    if availability.get("identifier"):
+        ocaid = ed_or_solr["availability"]["identifier"]
+        return f"https://archive.org/download/{ocaid}/page/cover_w180_h360.jpg"
+
+    # Plain solr - we don't know which edition is which here, so this is most
+    # preferable
+    if ed_or_solr.get("cover_i"):
+        cover_i = ed_or_solr["cover_i"]
+        return f"{get_coverstore_public_url()}/b/id/{cover_i}-{size}.jpg"
+    if ed_or_solr.get("cover_edition_key"):
+        olid = ed_or_solr["cover_edition_key"]
+        return f"{get_coverstore_public_url()}/b/olid/{olid}-{size}.jpg"
+    if ed_or_solr.get("ocaid"):
+        return f"//archive.org/services/img/{ed_or_solr.get('ocaid')}"
+
+    # No luck
+    return None
+
+
+def is_non_ia_ocaid(ocaid: str) -> bool:
+    """
+    Check if the ocaid "looks like" it's from another provider
+    """
+    providers = (provider for provider in PROVIDER_ORDER if provider.short_name != "ia")
+    return any(provider.is_own_ocaid(ocaid) for provider in providers)
+
+
+def get_book_provider_by_name(name: str) -> AbstractBookProvider | None:
+    """
+    :param name: Either the provider's short_name (legacy) or its provider_name
+    """
+    return next(
+        (p for p in PROVIDER_ORDER if name in (p.provider_name, p.short_name)),
+        None,
+    )
+
+
+ia_provider = cast(InternetArchiveProvider, get_book_provider_by_name("ia"))
+prefer_ia_provider_order = uniq([ia_provider, *PROVIDER_ORDER])
+
+
+def get_provider_order(prefer_ia: bool = False) -> list[AbstractBookProvider]:
+    default_order = prefer_ia_provider_order if prefer_ia else PROVIDER_ORDER
+
+    provider_order = default_order
+    if provider_pref := get_provider_pref():
+        new_order: list[AbstractBookProvider] = []
+        for name in provider_pref.split(","):
+            if name == "*":
+                new_order += default_order
+            else:
+                provider = get_book_provider_by_name(name)
+                if not provider:
+                    # TODO: Show the user a warning somehow
+                    continue
+                new_order.append(provider)
+        new_order = uniq(new_order + default_order)
+        if new_order:
+            provider_order = new_order
+
+    return provider_order
+
+
+def get_book_providers(ed_or_solr: Edition | dict) -> Iterator[AbstractBookProvider]:
+    # On search results which don't have an edition selected, we want to display
+    # IA copies first.
+    # Issue is that an edition can be provided by multiple providers; we can easily
+    # choose the correct copy when on an edition, but on a solr work record, with all
+    # copies of all editions aggregated, it's more difficult.
+    # So we do some ugly ocaid sniffing to try to guess :/ Idea being that we ignore
+    # OCAIDs that look like they're from other providers.
+    has_edition = isinstance(ed_or_solr, Edition) or ed_or_solr["key"].startswith("/books/")
+    prefer_ia = not has_edition
+    if prefer_ia:
+        ia_ocaids = [
+            ocaid
+            # Subjects/publisher pages have ia set to a specific value :/
+            for ocaid in uniq(ia_provider.get_identifiers(ed_or_solr) or [])
+            if not is_non_ia_ocaid(ocaid)
+        ]
+        prefer_ia = bool(ia_ocaids)
+
+    provider_order = get_provider_order(prefer_ia)
+    for provider in provider_order:
+        if provider.get_identifiers(ed_or_solr):
+            yield provider
+
+
+def get_book_provider(ed_or_solr: Edition | dict) -> AbstractBookProvider | None:
+    return next(get_book_providers(ed_or_solr), None)
+
+
+def get_acquisitions(solr_edition: dict, edition: Edition) -> list[Acquisition]:
+    acquisitions: list[Acquisition] = []
+    for provider in get_book_providers(edition):
+        if isinstance(provider, InternetArchiveProvider):
+            provider_acquisitions = provider.get_acquisitions(solr_edition, db_edition=edition)
+        else:
+            provider_acquisitions = provider.get_acquisitions(edition)
+        # Stamped here rather than inside each provider's `get_acquisitions`:
+        # the name belongs to the provider, not to one acquisition, and this
+        # is the only place that holds both. An acquisition that already
+        # carries a name keeps it -- `DirectProvider` reads `Edition.providers`,
+        # where the name came from the record rather than from a provider class.
+        for acquisition in provider_acquisitions:
+            if acquisition.feed_name is None:
+                acquisition.feed_name = provider.long_name
+        acquisitions.extend(provider_acquisitions)
+    return acquisitions
+
+
+def get_best_edition(
+    editions: list[Edition],
+) -> tuple[Edition | None, AbstractBookProvider | None]:
+    provider_order = get_provider_order(True)
+
+    # Map provider name to position/ranking
+    provider_rank_lookup: dict[AbstractBookProvider | None, int] = {provider: i for i, provider in enumerate(provider_order)}
+
+    # Here, we prefer the ia editions
+    augmented_editions = [(edition, get_book_provider(edition)) for edition in editions]
+
+    best = multisort_best(
+        augmented_editions,
+        [
+            # Prefer the providers closest to the top of the list
+            ("min", lambda rec: provider_rank_lookup.get(rec[1], float("inf"))),
+            # Prefer the editions with the most fields
+            ("max", lambda rec: len(dict(rec[0]))),
+            # TODO: Language would go in this queue somewhere
+        ],
+    )
+
+    return best or (None, None)
+
+
+def get_solr_keys() -> list[str]:
+    return [p.solr_key for p in PROVIDER_ORDER if p.solr_key]
+
+
+setattr(get_book_provider, "ia", get_book_provider_by_name("ia"))  # noqa: B010

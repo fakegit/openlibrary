@@ -1,11 +1,13 @@
-import web
 import time
+
+import web
 
 from ..processors import RateLimitProcessor
 
+
 class TestRateLimitProcessor:
-    """py.test testcase for testing RateLimitProcessor.
-    """
+    """py.test testcase for testing RateLimitProcessor."""
+
     def setup_method(self, method):
         web.ctx.ip = "127.0.0.1"
 
@@ -14,8 +16,8 @@ class TestRateLimitProcessor:
         p = RateLimitProcessor(10)
 
         for i in range(10):
-            assert p.check_rate() == True
-        assert p.check_rate() == False
+            assert p.check_rate() is True
+        assert p.check_rate() is False
 
     def test_get_window(self, monkeypatch):
         p = RateLimitProcessor(10, window_size=10)
@@ -25,10 +27,10 @@ class TestRateLimitProcessor:
 
         # window should continue to be the same from time 1 to 9.
         w = p.get_window()
-        w['foo'] = 'bar'
+        w["foo"] = "bar"
 
         d.time = 9
-        assert p.get_window() == {'foo': 'bar'}
+        assert p.get_window() == {"foo": "bar"}
 
         # and the window should get cleared when time becomes 10.
         d.time = 10

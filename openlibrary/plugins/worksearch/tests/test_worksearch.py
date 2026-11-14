@@ -1,176 +1,332 @@
-from __future__ import print_function
+import asyncio
+from unittest.mock import patch
+
 import pytest
-from openlibrary.plugins.worksearch.code import read_facets, sorted_work_editions, parse_query_fields, escape_bracket, run_solr_query, get_doc, build_q_list, escape_colon, parse_search_response
-from lxml import etree
-from infogami import config
+import web
 
-def test_escape_bracket():
-    assert escape_bracket('foo') == 'foo'
-    assert escape_bracket('foo[') == 'foo\\['
-    assert escape_bracket('[ 10 TO 1000]') == '[ 10 TO 1000]'
-
-def test_escape_colon():
-    vf = ['key', 'name', 'type', 'count']
-    assert escape_colon('test key:test http://test/', vf) == 'test key:test http\\://test/'
-
-def test_read_facet():
-    xml = '''<response>
-        <lst name="facet_counts">
-            <lst name="facet_fields">
-                <lst name="has_fulltext">
-                    <int name="false">46</int>
-                    <int name="true">2</int>
-                </lst>
-            </lst>
-        </lst>
-    </response>'''
-
-    expect = {'has_fulltext': [('true', 'yes', '2'), ('false', 'no', '46')]}
-    assert read_facets(etree.fromstring(xml)) == expect
-
-def test_sorted_work_editions():
-    json_data = '''{
-"responseHeader":{
-"status":0,
-"QTime":1,
-"params":{
-"fl":"edition_key",
-"indent":"on",
-"wt":"json",
-"q":"key:OL100000W"}},
-"response":{"numFound":1,"start":0,"docs":[
-{
- "edition_key":["OL7536692M","OL7825368M","OL3026366M"]}]
-}}'''
-    expect = ["OL7536692M","OL7825368M","OL3026366M"]
-    assert sorted_work_editions('OL100000W', json_data=json_data) == expect
+from openlibrary.plugins.worksearch import code
+from openlibrary.plugins.worksearch.code import (
+    SearchResponse,
+    _prepare_solr_query_params,
+    get_doc,
+    process_facet,
+)
+from openlibrary.plugins.worksearch.schemes.works import WorkSearchScheme
+from openlibrary.utils.request_context import RequestContextVars, req_context
 
 
-# {'Test name': ('query', fields[])}
-QUERY_PARSER_TESTS = {
-    'No fields': ('query here', [
-        {'field': 'text', 'value': 'query here'}
-    ]),
-    'Author field': ('title:food rules author:pollan', [
-        {'field': 'title', 'value': 'food rules'},
-        {'field': 'author_name', 'value': 'pollan'},
-    ]),
-    'Field aliases': ('title:food rules by:pollan', [
-        {'field': 'title', 'value': 'food rules'},
-        {'field': 'author_name', 'value': 'pollan'},
-    ]),
-    'Fields are case-insensitive aliases': ('title:food rules By:pollan', [
-        {'field': 'title', 'value': 'food rules'},
-        {'field': 'author_name', 'value': 'pollan'},
-    ]),
-    'Quotes': ('title:"food rules" author:pollan', [
-        {'field': 'title', 'value': '"food rules"'},
-        {'field': 'author_name', 'value': 'pollan'},
-    ]),
-    'Leading text': ('query here title:food rules author:pollan', [
-        {'field': 'text', 'value': 'query here'},
-        {'field': 'title', 'value': 'food rules'},
-        {'field': 'author_name', 'value': 'pollan'},
-    ]),
-    'Colons in query': ('flatland:a romance of many dimensions', [
-        {'field': 'text', 'value': r'flatland\:a romance of many dimensions'},
-    ]),
-    'Colons in field': ('title:flatland:a romance of many dimensions', [
-        {'field': 'title', 'value': r'flatland\:a romance of many dimensions'},
-    ]),
-    'Operators': ('authors:Kim Harrison OR authors:Lynsay Sands', [
-        {'field': 'author_name', 'value': 'Kim Harrison'},
-        {'op': 'OR'},
-        {'field': 'author_name', 'value': 'Lynsay Sands'},
-    ]),
+def test_process_facet():
+    facets = [("false", 46), ("true", 2)]
+    assert list(process_facet("has_fulltext", facets)) == [
+        ("true", "yes", 2),
+        ("false", "no", 46),
+    ]
 
-    # LCCs
-    'LCC: quotes added if space present': ('lcc:NC760 .B2813 2004', [
-        {'field': 'lcc', 'value': '"NC-0760.00000000.B2813 2004"'},
-    ]),
-    'LCC: star added if no space': ('lcc:NC760 .B2813', [
-        {'field': 'lcc', 'value': 'NC-0760.00000000.B2813*'},
-    ]),
-    'LCC: Noise left as is': ('lcc:good evening', [
-        {'field': 'lcc', 'value': 'good evening'},
-    ]),
-    'LCC: range': ('lcc:[NC1 TO NC1000]', [
-        {'field': 'lcc', 'value': '[NC-0001.00000000 TO NC-1000.00000000]'},
-    ]),
-    'LCC: prefix': ('lcc:NC76.B2813*', [
-        {'field': 'lcc', 'value': 'NC-0076.00000000.B2813*'},
-    ]),
-    'LCC: suffix': ('lcc:*B2813', [
-        {'field': 'lcc', 'value': '*B2813'},
-    ]),
-    'LCC: multi-star without prefix': ('lcc:*B2813*', [
-        {'field': 'lcc', 'value': '*B2813*'},
-    ]),
-    'LCC: multi-star with prefix': ('lcc:NC76*B2813*', [
-        {'field': 'lcc', 'value': 'NC-0076*B2813*'},
-    ]),
-    'LCC: quotes preserved': ('lcc:"NC760 .B2813"', [
-        {'field': 'lcc', 'value': '"NC-0760.00000000.B2813"'},
-    ]),
-
-    # TODO Add tests for DDC
-}
-
-
-@pytest.mark.parametrize("query,parsed_query", QUERY_PARSER_TESTS.values(),
-                         ids=QUERY_PARSER_TESTS.keys())
-def test_query_parser_fields(query, parsed_query):
-    assert list(parse_query_fields(query)) == parsed_query
-
-
-#     def test_public_scan(lf):
-#         param = {'subject_facet': ['Lending library']}
-#         (reply, solr_select, q_list) = run_solr_query(param, rows = 10, spellcheck_count = 3)
-#         print solr_select
-#         print q_list
-#         print reply
-#         root = etree.XML(reply)
-#         docs = root.find('result')
-#         for doc in docs:
-#             assert get_doc(doc).public_scan == False
 
 def test_get_doc():
-    sample_doc = etree.fromstring('''<doc>
-<arr name="author_key"><str>OL218224A</str></arr>
-<arr name="author_name"><str>Alan Freedman</str></arr>
-<str name="cover_edition_key">OL1111795M</str>
-<int name="edition_count">14</int>
-<int name="first_publish_year">1981</int>
-<bool name="has_fulltext">true</bool>
-<arr name="ia"><str>computerglossary00free</str></arr>
-<str name="key">OL1820355W</str>
-<str name="lending_edition_s">OL1111795M</str>
-<bool name="public_scan_b">false</bool>
-<str name="title">The computer glossary</str>
-</doc>''')
+    doc = get_doc(
+        {
+            "author_key": ["OL218224A"],
+            "author_name": ["Alan Freedman"],
+            "cover_edition_key": "OL1111795M",
+            "cover_i": 6426606,
+            "cover_width": 301,
+            "cover_height": 500,
+            "edition_count": 14,
+            "first_publish_year": 1981,
+            "has_fulltext": True,
+            "ia": ["computerglossary00free"],
+            "key": "/works/OL1820355W",
+            "lending_edition_s": "OL1111795M",
+            "public_scan_b": False,
+            "title": "The computer glossary",
+            "ratings_average": None,
+            "ratings_count": None,
+            "want_to_read_count": None,
+        }
+    )
+    assert doc == web.storage(
+        {
+            "key": "/works/OL1820355W",
+            "title": "The computer glossary",
+            "url": "/works/OL1820355W/The_computer_glossary",
+            "edition_count": 14,
+            "ia": ["computerglossary00free"],
+            "collections": [],
+            "has_fulltext": True,
+            "public_scan": False,
+            "lending_edition": "OL1111795M",
+            "lending_identifier": None,
+            "authors": [
+                web.storage(
+                    {
+                        "key": "OL218224A",
+                        "name": "Alan Freedman",
+                        "url": "/authors/OL218224A/Alan_Freedman",
+                        "birth_date": None,
+                        "death_date": None,
+                    }
+                )
+            ],
+            "first_publish_year": 1981,
+            "first_edition": None,
+            "subtitle": None,
+            "cover_edition_key": "OL1111795M",
+            "cover_i": 6426606,
+            "cover_width": 301,
+            "cover_height": 500,
+            "languages": [],
+            "id_project_gutenberg": [],
+            "id_project_runeberg": [],
+            "id_librivox": [],
+            "id_standard_ebooks": [],
+            "id_openstax": [],
+            "id_cita_press": [],
+            "id_wikisource": [],
+            "editions": [],
+            "ratings_average": None,
+            "ratings_count": None,
+            "want_to_read_count": None,
+            "series": [],
+        }
+    )
 
-    doc = get_doc(sample_doc)
-    assert doc.public_scan == False
 
-def test_build_q_list():
-    param = {'q': 'test'}
-    expect = (['test'], True)
-    assert build_q_list(param) == expect
+def test_prepare_solr_query_params_first_publish_year_string():
+    """Test to check that when we have a facet value as a string it is converted to a list properly"""
+    scheme = WorkSearchScheme()
+    param = {"first_publish_year": "1997"}
+    params, fields = _prepare_solr_query_params(scheme, param)
 
-    param = {'q': 'title:(Holidays are Hell) authors:(Kim Harrison) OR authors:(Lynsay Sands)'}
-    expect = (['title:((Holidays are Hell))', 'author_name:((Kim Harrison))', 'OR', 'author_name:((Lynsay Sands))'], False)
-    query_fields = [
-        {'field': 'title', 'value': '(Holidays are Hell)'},
-        {'field': 'author_name', 'value': '(Kim Harrison)'},
-        {'op': 'OR'},
-        {'field': 'author_name', 'value': '(Lynsay Sands)'}
-    ]
-    assert list(parse_query_fields(param['q'])) == query_fields
-    assert build_q_list(param) == expect
+    param2 = {"first_publish_year": ["1997"]}
+    params2, fields2 = _prepare_solr_query_params(scheme, param2)
+    assert params == params2
+    assert fields == fields2
+    # Check that the fq param for first_publish_year is correctly added
+    fq_params = [p for p in params if p[0] == "fq"]
+    assert ("fq", 'first_publish_year:"1997"') in fq_params
 
-def test_parse_search_response():
-    test_input = '<pre>org.apache.lucene.queryParser.ParseException: This is an error</pre>'
-    expect = {'error': 'This is an error'}
-    assert parse_search_response(test_input) == expect
-    assert parse_search_response('{"aaa": "bbb"}') == {'aaa': 'bbb'}
 
+def _editions_fq_for(param: dict) -> list[str]:
+    """Run a Solr-editions query for `param` and return its editions.fq clauses.
+
+    Sets req_context because the has_fulltext facet_rewrite resolves
+    get_fulltext_min() off it; requesting the `editions` field opts the query
+    into the block-join path that builds editions.fq. convert_iso_to_marc is
+    stubbed since it reaches for the `site` ContextVar (irrelevant here)."""
+    token = req_context.set(
+        RequestContextVars(
+            x_forwarded_for=None,
+            user_agent=None,
+            lang="en",
+            solr_editions=True,
+            print_disabled=False,
+        )
+    )
+    try:
+        scheme = WorkSearchScheme(solr_editions=True)
+        with patch(
+            "openlibrary.plugins.worksearch.schemes.works.convert_iso_to_marc",
+            return_value="eng",
+        ):
+            params, _ = _prepare_solr_query_params(scheme, param, fields="key,editions")
+    finally:
+        req_context.reset(token)
+    return [v for k, v in params if k == "editions.fq"]
+
+
+def test_prepare_solr_query_params_borrowable_editions_fq_anchors_negation():
+    """ "Borrowable Only" maps to has_fulltext=true + public_scan=false, the
+    latter rewriting to a negated `-ebook_access:public`. A bare pure-negative
+    clause matches nothing inside the block-join `filters=$editions.fq` local
+    param (no top-level `*:*` fixup), which made the filter return zero results.
+    It must be anchored as `(*:* -ebook_access:public)`."""
+    editions_fq = _editions_fq_for({"q": "harry potter", "has_fulltext": "true", "public_scan": "false"})
+    assert "(*:* -ebook_access:public)" in editions_fq
+    # The unanchored form (the bug) must never be emitted.
+    assert "-ebook_access:public" not in editions_fq
+
+
+def test_prepare_solr_query_params_open_access_editions_fq_positive_unwrapped():
+    """A positive availability clause ("Free to read now" → public_scan=true →
+    ebook_access:public) must pass through to editions.fq unwrapped — the
+    negation guard should only touch negated clauses."""
+    editions_fq = _editions_fq_for({"q": "harry potter", "public_scan": "true"})
+    assert "ebook_access:public" in editions_fq
+    assert "(*:* -ebook_access:public)" not in editions_fq
+
+
+def test_prepare_solr_query_params_multiple_languages_or_into_single_fq():
+    """Multiple selected languages are additive: a work in *any* of them should
+    match, so they must be OR-ed into one fq. Emitting one fq per value AND-s
+    them (Solr ANDs separate fqs), which would require a work to be in every
+    selected language at once."""
+    scheme = WorkSearchScheme()
+    params, _ = _prepare_solr_query_params(scheme, {"q": "1984", "language": ["eng", "spa"]})
+    fqs = [v for k, v in params if k == "fq"]
+    assert 'language:("eng" OR "spa")' in fqs
+    # Never emitted as two separate (AND-ed) clauses.
+    assert 'language:"eng"' not in fqs
+    assert 'language:"spa"' not in fqs
+
+
+def test_prepare_solr_query_params_language_mirrored_into_editions_fq():
+    """The language constraint must reach editions.fq so a work matches only
+    when the *same edition* is in a selected language. Without this, "English"
+    + "Borrowable" could match a work through a Chinese borrowable edition —
+    the cross-edition leak this filtering fixes. The OR-clause keeps the field
+    name first so the editions.fq `split(":", 1)` still resolves `language`."""
+    editions_fq = _editions_fq_for({"q": "1984", "language": ["eng", "spa"]})
+    assert 'language:("eng" OR "spa")' in editions_fq
+
+
+def _with_req_context(fn):
+    """Run `fn` with a req_context set (the readable-count query reads
+    solr_editions off it)."""
+    token = req_context.set(
+        RequestContextVars(
+            x_forwarded_for=None,
+            user_agent=None,
+            lang="en",
+            solr_editions=True,
+            print_disabled=False,
+        )
+    )
+    try:
+        return fn()
+    finally:
+        req_context.reset(token)
+
+
+class TestRunWorkSearch:
+    """_run_work_search_async: the readable count's Solr query runs alongside
+    the main search, and the count matches what the old sequential code gave."""
+
+    @staticmethod
+    def _fake_solr(num_found: int, readable_num_found: int, calls: list):
+        both_started = asyncio.Event()
+
+        async def fake_run_solr_query_async(scheme, param, **kwargs):
+            calls.append((param, kwargs))
+            if len(calls) == 2:
+                both_started.set()
+            # Each query waits for the other to start: this only finishes if they run concurrently.
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+            if kwargs["rows"] == 0:
+                return SearchResponse(facet_counts=None, sort="", docs=[], num_found=readable_num_found, solr_select="")
+            return SearchResponse(facet_counts=None, sort="", docs=[], num_found=num_found, solr_select="")
+
+        return fake_run_solr_query_async
+
+    @staticmethod
+    async def _run(param: dict, fake_solr):
+        token = req_context.set(RequestContextVars(x_forwarded_for=None, user_agent=None, lang="en", solr_editions=True, print_disabled=False))
+        try:
+            with (
+                patch.object(code, "run_solr_query_async", side_effect=fake_solr),
+                patch.object(code, "add_availability_async", side_effect=lambda items: items),
+            ):
+                return await code._run_work_search_async(param, rows=20, page=1, sort=None, solr_internals_params=None)
+        finally:
+            req_context.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_counts_readable_alongside_main_query(self):
+        calls: list = []
+        resp, works, readable_count = await self._run({"q": "harry potter", "public_scan": "true"}, self._fake_solr(100, 42, calls))
+        assert (resp.num_found, works, readable_count) == (100, [], 42)
+        assert len(calls) == 2
+        readable_param, readable_kwargs = next(c for c in calls if c[1]["rows"] == 0)
+        assert readable_param == {"q": "harry potter", "has_fulltext": "true"}
+        assert readable_kwargs["request_label"] == "BOOK_SEARCH_READABLE_COUNT"
+
+    @pytest.mark.asyncio
+    async def test_reuses_main_count_when_already_readable(self):
+        calls: list = []
+
+        async def fake_solr(scheme, param, **kwargs):
+            calls.append((param, kwargs))
+            return SearchResponse(facet_counts=None, sort="", docs=[], num_found=123, solr_select="")
+
+        _, _, readable_count = await self._run({"q": "harry potter", "has_fulltext": "true"}, fake_solr)
+        assert readable_count == 123
+        assert len(calls) == 1  # no separate count query
+
+    @pytest.mark.asyncio
+    async def test_no_readable_count_when_no_results(self):
+        _, _, readable_count = await self._run({"q": "zzzz"}, self._fake_solr(0, 0, []))
+        assert readable_count is None
+
+
+def _stub_search_web_input(monkeypatch):
+    """search.GET() makes two web.input() calls: one just for q/q2, then the
+    real one with a q="hello" query and no other params set."""
+
+    def fake_input(**defaults):
+        if "q2" in defaults:
+            return web.storage(q="", q2="")
+        values = dict(defaults)
+        values["q"] = "hello"
+        return web.storage(**values)
+
+    monkeypatch.setattr(code.web, "input", fake_input)
+
+
+class TestSearchAvailabilityPreparedInPython:
+    """Regression coverage for openlibrary#13419 subtask 5: work_search.html
+    used to call add_availability() itself, mid-render, for every search
+    results page -- an outbound network call from template rendering (the
+    same class of bug the LoanStatus groundtruth fallback removal fixes for
+    /works and /books). search.GET() must batch-augment availability in
+    Python before the template renders, and hand the template an
+    already-prepared `works` list instead of the raw `get_doc` function."""
+
+    def test_add_availability_runs_in_python_before_render_with_prepared_works(self, monkeypatch):
+        _stub_search_web_input(monkeypatch)
+        solr_doc = {
+            "key": "/works/OL1W",
+            "title": "Test Book",
+            "edition_count": 1,
+            "ia": ["testbook"],
+        }
+        search_response = SearchResponse(facet_counts={}, sort="", docs=[solr_doc], num_found=0, solr_select="")
+
+        call_order = []
+        render_calls = []
+
+        def fake_add_availability(items):
+            call_order.append("add_availability")
+            return items
+
+        def fake_render_work_search(*a, **kw):
+            call_order.append("render")
+            render_calls.append(a)
+            return "rendered"
+
+        def run():
+            with (
+                patch.object(code, "run_solr_query_async", return_value=search_response),
+                patch.object(code, "add_availability_async", side_effect=fake_add_availability) as mock_add_availability,
+            ):
+                monkeypatch.setattr(code.render, "work_search", fake_render_work_search, raising=False)
+                return code.search().GET(), mock_add_availability
+
+        result, mock_add_availability = _with_req_context(run)
+
+        assert result == "rendered"
+        # add_availability ran exactly once, before render.work_search --
+        # not per-item inside the template's own render pass.
+        assert call_order == ["add_availability", "render"]
+        mock_add_availability.assert_called_once()
+
+        (availability_items,) = mock_add_availability.call_args[0]
+        assert len(availability_items) == 1
+        assert availability_items[0]["key"] == "/works/OL1W"
+
+        # work_search.html no longer takes the raw `get_doc` function as its
+        # 3rd positional arg -- it takes the already-get_doc()-mapped,
+        # already-availability-augmented `works` list.
+        (render_args,) = render_calls
+        works_arg = render_args[2]
+        assert works_arg == [get_doc(solr_doc)]
+        assert works_arg is not get_doc

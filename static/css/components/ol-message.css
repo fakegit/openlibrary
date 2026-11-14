@@ -1,0 +1,35 @@
+.ol-message {
+  font-size: var(--font-size-body-medium);
+  border-radius: 8px;
+  padding: 8px;
+  border: 1px solid;
+}
+.ol-message,
+.ol-message--info {
+  background-color: var(--color-info-bg);
+  color: var(--color-info-fg);
+  border-color: var(--color-info-border);
+}
+.ol-message--warning {
+  background-color: var(--color-warning-bg);
+  color: var(--color-warning-fg);
+  border-color: var(--color-warning-border);
+}
+.ol-message--success {
+  background-color: var(--color-success-bg);
+  color: var(--color-success-fg);
+  border-color: var(--color-success-border);
+}
+.ol-message--error {
+  background-color: var(--color-error-bg);
+  color: var(--color-error-fg);
+  border-color: var(--color-error-border);
+}
+.ol-message h1,
+.ol-message h2,
+.ol-message h3,
+.ol-message h4,
+.ol-message h5,
+.ol-message h6 {
+  color: inherit;
+}

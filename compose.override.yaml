@@ -1,0 +1,243 @@
+# This file is applied "on top" of compose.yaml when docker compose
+# is used without the -f parameter. It contains local development specific
+# configuration options which we don't want to apply to production/staging
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.oldev
+    ports:
+      # Debugger
+      - 127.0.0.1:${WEB_DEBUG_PORT:-3000}:3000
+    volumes:
+      # Since we have multiple services using these named volumes, this causes a
+      # race condition when the volume is first copied/populated from the image
+      # -- see https://github.com/moby/moby/issues/43068. To fix, all other
+      # services mount these volumes with "nocopy: true" to skip that initial
+      # copy/population and hence rely on web to do it.
+      - ol-vendor:/openlibrary/vendor
+      # Persistent volume mount for generated css and js
+      - ol-build:/openlibrary/static/build
+      # Persistent volume mount for node_modules
+      - ol-nodemodules:/openlibrary/node_modules
+      # The above volume mounts are required so that the local dev bind mount below
+      # does not clobber the data generated inside the image / container
+      - ${OL_MOUNT_DIR:-.}:/openlibrary
+    environment:
+      - LOCAL_DEV=true
+      - OL_EXPOSE_SOLR_INTERNALS_PARAMS=true
+    depends_on:
+      db:
+        condition: service_healthy
+      infobase:
+        condition: service_started
+      mockservices:
+        condition: service_healthy
+
+  fast_web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.oldev
+    ports:
+      - ${FAST_WEB_PORT:-8080}:8080
+      # Debugger
+      - 127.0.0.1:${FAST_WEB_DEBUG_PORT:-3001}:3000
+    volumes:
+      # nocopy to avoid initialization race conditions with other services --
+      # see comment on web.volumes
+      - type: volume
+        source: ol-vendor
+        target: /openlibrary/vendor
+        volume:
+          nocopy: true
+      # Persistent volume mount for generated css and js
+      - type: volume
+        source: ol-build
+        target: /openlibrary/static/build
+        volume:
+          nocopy: true
+      - ${OL_MOUNT_DIR:-.}:/openlibrary
+    environment:
+      - LOCAL_DEV=true
+      - OL_EXPOSE_SOLR_INTERNALS_PARAMS=true
+
+  solr:
+    environment:
+      # See compose.yaml for docs
+      # For dev, autoSoftCommit is 1s, meaning edits will show up in search after 1s
+      # Keep SOLR_OPTS in sync with other instances of solr in compose files
+      - SOLR_OPTS=
+        -Dsolr.autoSoftCommit.maxTime=1000
+        -Dsolr.autoCommit.maxTime=120000
+        -Dsolr.max.booleanClauses=30000
+        -Dsolr.environment=dev
+      - LOCAL_DEV=true
+      # Local dev's index is tiny compared to prod; shrink the default 512m heap.
+      - SOLR_HEAP=128m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8983/solr/openlibrary/admin/ping"]
+      interval: 30s
+      start_interval: 1s
+      start_period: 60s
+      timeout: 5s
+      retries: 24
+    volumes:
+      - ./docker/ol-local-solr-start.sh:/docker/ol-solr-start.sh:ro
+    ports:
+      - ${SOLR_PORT:-8983}:8983
+    # Run the wrapper script which handles schema migrations in dev mode
+    command: /docker/ol-solr-start.sh
+
+  solr-updater:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.oldev
+    environment:
+      - OL_SOLR_NEXT=true
+      - LOCAL_DEV=true
+    depends_on:
+      solr:
+        condition: service_healthy
+    volumes:
+      # nocopy to avoid initialization race conditions with other services --
+      # see comment on web.volumes
+      - type: volume
+        source: ol-vendor
+        target: /openlibrary/vendor
+        volume:
+          nocopy: true
+      - ${OL_MOUNT_DIR:-.}:/openlibrary
+
+  db:
+    image: postgres:${POSTGRES_VERSION:-18.7}
+    networks:
+      - dbnet
+    environment:
+      # This is okay for dev, but may need to be explored for prod
+      # This allows postgres access for psql user w/o password required
+      - POSTGRES_HOST_AUTH_METHOD=trust
+    volumes:
+      - ${OL_MOUNT_DIR:-.}:/openlibrary
+      # Any files inside /docker-entrypoint-initdb.d/ will get run by postgres
+      # if the db is empty (ie during first run).
+      - ./docker/ol-db-init.sh:/docker-entrypoint-initdb.d/ol-db-init.sh
+      - ol-postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      start_interval: 1s
+      start_period: 20s
+      timeout: 1s
+      retries: 24
+
+  covers:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.oldev
+    ports:
+      - ${COVERS_PORT:-7075}:7075
+    volumes:
+      # nocopy to avoid initialization race conditions with other services --
+      # see comment on web.volumes
+      - type: volume
+        source: ol-vendor
+        target: /openlibrary/vendor
+        volume:
+          nocopy: true
+      - ${OL_MOUNT_DIR:-.}:/openlibrary
+    environment:
+      - LOCAL_DEV=true
+
+  infobase:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.oldev
+    # Commented out because not needed for most dev work, and 7000 conflicts
+    # with OS port on Mac. Uncomment if you need to test infobase directly.
+    # Mac users can do eg "7070:7000" to change the port used on the host
+    # machine to avoid conflicts.
+    # See https://github.com/internetarchive/openlibrary/issues/6315
+    # ports:
+    #  - 7000:7000
+    volumes:
+      # nocopy to avoid initialization race conditions with other services --
+      # see comment on web.volumes
+      - type: volume
+        source: ol-vendor
+        target: /openlibrary/vendor
+        volume:
+          nocopy: true
+      - ${OL_MOUNT_DIR:-.}:/openlibrary
+    depends_on:
+      db:
+        condition: service_healthy
+
+  home:
+    image: "${OLIMAGE:-oldev:latest}"
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.oldev
+    init: true # this is needed for docker sigints to work without modifying the many scripts within
+    command: docker/ol-home-start.sh
+    environment:
+      - LOCAL_DEV=true
+    networks:
+      - webnet
+      - dbnet
+    logging:
+      options:
+        max-size: "512m"
+        max-file: "4"
+    volumes:
+      # nocopy to avoid initialization race conditions with other services --
+      # see comment on web.volumes
+      - type: volume
+        source: ol-vendor
+        target: /openlibrary/vendor
+        volume:
+          nocopy: true
+      - type: volume
+        source: ol-build
+        target: /openlibrary/static/build
+        volume:
+          nocopy: true
+      - type: volume
+        source: ol-nodemodules
+        target: /openlibrary/node_modules
+        volume:
+          nocopy: true
+      - ${OL_MOUNT_DIR:-.}:/openlibrary
+      # For OSP download persistence across restarts
+      - solr-updater-data:/solr-updater-data
+    depends_on:
+      solr:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+
+  mockservices:
+    build:
+      context: .
+      dockerfile: docker/mockservices/Dockerfile
+    networks:
+      - webnet
+    volumes:
+      - ./docker/mockservices:/app
+    ports:
+      # mailpit web UI — browse captured email at http://localhost:8025
+      - ${MOCKSERVICES_PORT:-8025}:8025
+    healthcheck:
+      # wget is purged from the image after installing mailpit (see Dockerfile);
+      # use python, which is always present in the python:3.14-slim base, instead.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=2)"]
+      interval: 10s
+      start_period: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  ol-vendor:
+  ol-build:
+  ol-nodemodules:
+  ol-postgres:

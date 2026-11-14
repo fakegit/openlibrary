@@ -1,0 +1,11 @@
+/* Edits and Members charts on /stats (openlibrary/templates/admin/index.html).
+   The chart fills the panel edge to edge, with the baseline along its bottom. */
+div.chartHolder {
+  padding-top: var(--spacing-inset-sm);
+  background-color: var(--color-surface-sunken);
+}
+
+div.chartDisplay {
+  height: 50px;
+  border-bottom: var(--border-width-divider) solid var(--color-text);
+}

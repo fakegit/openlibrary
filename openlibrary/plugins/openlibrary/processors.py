@@ -1,39 +1,57 @@
-"""web.py application processors for Open Library.
-"""
+"""web.py application processors for Open Library."""
+
+import re
+from typing import cast
+from urllib.parse import quote
+
 import web
 
-from openlibrary.core.processors import ReadableUrlProcessor
-import six
-
+from infogami import config
+from infogami.utils.context import context
+from openlibrary.accounts import get_current_user
 from openlibrary.core import helpers as h
+from openlibrary.core.experiments import evaluate_experiments_for_request
+from openlibrary.core.processors import (
+    ReadableUrlProcessor,  # noqa: F401 side effects may be needed
+)
 
 urlsafe = h.urlsafe
 _safepath = h.urlsafe
 
+
 class ProfileProcessor:
-    """Processor to profile the webpage when ?_profile=true is added to the url.
-    """
+    """Processor to profile the webpage when ?_profile=true is added to the url."""
+
     def __call__(self, handler):
         i = web.input(_method="GET", _profile="")
         if i._profile.lower() == "true":
             out, result = web.profile(handler)()
             if isinstance(out, web.template.TemplateResult):
-                out.__body__ = out.get('__body__', '') + '<pre class="profile">' + web.websafe(result) + '</pre>'
+                out.__body__ = out.get("__body__", "") + '<pre class="profile">' + web.websafe(result) + "</pre>"
                 return out
-            elif isinstance(out, six.string_types):
-                return out + '<br/>' + '<pre class="profile">' + web.websafe(result) + '</pre>'
+            elif isinstance(out, str):
+                return out + "<br/>" + '<pre class="profile">' + web.websafe(result) + "</pre>"
             else:
                 # don't know how to handle this.
                 return out
         else:
             return handler()
 
+
 class CORSProcessor:
     """Processor to handle OPTIONS method to support
-    Cross Origin Resurce Sharing.
+    Cross Origin Resource Sharing.
     """
-    def __init__(self, cors_prefixes = None):
-        self.cors_prefixes = cors_prefixes
+
+    def __init__(
+        self,
+        cors_paths: set[str] | None = None,
+        cors_prefixes: set[str] | None = None,
+        cors_everything: bool = False,
+    ):
+        self.cors_paths = cors_paths or set()
+        self.cors_prefixes = cors_prefixes or set()
+        self.cors_everything = cors_everything
 
     def __call__(self, handler):
         if self.is_cors_path():
@@ -44,12 +62,13 @@ class CORSProcessor:
             return handler()
 
     def is_cors_path(self):
-        if self.cors_prefixes is None or web.ctx.path.endswith(".json"):
-            return True
-        for path_segment in self.cors_prefixes:
-            if web.ctx.path.startswith(path_segment):
-                return True
-        return False
+        path = cast(str, web.ctx.path)
+        return (
+            self.cors_everything
+            or path.endswith(".json")
+            or path in self.cors_paths
+            or any(web.ctx.path.startswith(path_segment) for path_segment in self.cors_prefixes)
+        )
 
     def add_cors_headers(self):
         # Allow anyone to access GET and OPTIONS requests
@@ -59,10 +78,105 @@ class CORSProcessor:
             if web.ctx.path.startswith(p):
                 allowed = "OPTIONS"
 
-        web.header("Access-Control-Allow-Origin", "*")
+        if web.ctx.path == "/account/login.json" and web.input(auth_provider="").auth_provider == "archive":
+            allowed += ", POST"
+            web.header("Access-Control-Allow-Credentials", "true")
+            web.header("Access-Control-Allow-Origin", "https://archive.org")
+        else:
+            web.header("Access-Control-Allow-Origin", "*")
+
         web.header("Access-Control-Allow-Method", allowed)
-        web.header("Access-Control-Max-Age", 3600*24) # one day
+        web.header("Access-Control-Max-Age", 3600 * 24)  # one day
+
+
+class PreferenceProcessor:
+    """Processor to handle unauthorized patron preference reads"""
+
+    def __init__(self):
+        self.pref_pattern = re.compile(r"^\/people\/([^/]+)\/preferences(.json|.yml)?$")
+
+    def __call__(self, handler):
+        if self.pref_pattern.match(web.ctx.path):
+            user = get_current_user()
+            if not user:
+                # Must be logged in to see preferences
+                raise web.Unauthorized
+
+            username = web.ctx.path.split("/")[2]
+            if username != user.get_username() and not user.is_admin():
+                # Can only view preferences if page owner or admin
+                raise web.Forbidden
+
+        return handler()
+
+
+class CookieValidationProcessor:
+    """Processor: enforce human verification based on nginx signals and cookie integrity.
+
+    Checks cookie integrity before allowing requests through. Skipped on the
+    verification endpoint itself. Trigger conditions (evaluated in order):
+    1. Valid vf cookie — pass through immediately.
+    2. Valid session cookie — pass through immediately.
+    3. Spoofed vf or session cookie — purge the cookie, return 403 + X-Abuse header.
+    4. nginx sets X-OL-Verify-Human — redirect to /verify_human with next= URL.
+    """
+
+    @staticmethod
+    def _reject_spoofed_cookie(name: str) -> None:
+        """Purge a forged cookie and raise 403 with an abuse signal header."""
+        web.setcookie(name, "", expires=-1, secure=True, httponly=True)
+        web.header("X-Abuse", "spoofed-cookie")
+        raise web.HTTPError("403 Forbidden")
+
+    def __call__(self, handler):
+        # Shared with FastAPI's SitePageRoute.
+        from openlibrary.accounts.model import HUMAN_CHECK_EXEMPT_PATHS, check_human_cookies
+        from openlibrary.plugins.openlibrary.code import is_recognized_bot
+
+        # We don't want to bounce identified crawlers that index us
+        if web.ctx.path not in HUMAN_CHECK_EXEMPT_PATHS and not is_recognized_bot():
+            check = check_human_cookies(web.cookies())
+            if check.verified:
+                return handler()
+            if check.spoofed:
+                self._reject_spoofed_cookie(check.spoofed)
+
+            if web.ctx.env.get("HTTP_X_OL_VERIFY_HUMAN") == "1":
+                next_url = web.ctx.env.get("REQUEST_URI") or web.ctx.env.get("HTTP_X_REQUEST_URI") or web.ctx.path
+                raise web.seeother("/verify_human?next=" + quote(next_url))
+
+        return handler()
+
+
+class ExperimentsProcessor:
+    """Processor to evaluate A/B testing feature flags and inject them
+    into the global web.ctx so they are available to macros and templates.
+    """
+
+    def __call__(self, handler):
+        session_value = web.cookies().get(config.get("login_cookie_name", "session"))
+        forwarded_for = web.ctx.env.get("HTTP_X_FORWARDED_FOR")
+        client_ip = web.ctx.ip
+
+        try:
+            query_params = dict(web.input(_method="GET"))
+        except AttributeError, KeyError, ValueError:
+            query_params = {}
+
+        experiments = evaluate_experiments_for_request(
+            session_value=session_value,
+            forwarded_for=forwarded_for,
+            client_ip=client_ip,
+            query_params=query_params,
+        )
+
+        web.ctx["experiments"] = experiments
+        context["experiments"] = experiments
+
+        return handler()
+
 
 if __name__ == "__main__":
     import doctest
+
     doctest.testmod()

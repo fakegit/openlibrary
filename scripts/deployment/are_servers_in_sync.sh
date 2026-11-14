@@ -1,16 +1,25 @@
 #!/bin/bash
 
-REPO_DIRS="/opt/olsystem /opt/openlibrary /opt/openlibrary/vendor/infogami /opt/booklending_utils"
+SERVER_SUFFIX=${SERVER_SUFFIX:-""}
+SERVER_NAMES=${SERVERS:-"ol-home0 ol-covers1 ol-web0 ol-web2 ol-web3 ol-www1"}
+SERVERS=$(echo $SERVER_NAMES | sed "s/ /$SERVER_SUFFIX /g")$SERVER_SUFFIX
+
+POLICY_SERVER_NAMES="ol-home0 ol-web0 ol-web2 ol-web3"
+POLICY_SERVERS=$(echo $POLICY_SERVER_NAMES | sed "s/ /$SERVER_SUFFIX /g")$SERVER_SUFFIX
+
+REPO_DIRS="/opt/olsystem"
+
 for REPO_DIR in $REPO_DIRS; do
     echo $REPO_DIR
-    SERVERS="ol-home0 ol-covers0 ol-web1 ol-web2"
+
     for SERVER in $SERVERS; do
-	#ssh $SERVER "cd $REPO_DIR; hostname ; sudo git checkout master ; sudo git pull ; git rev-parse HEAD"
-	ssh $SERVER "cd $REPO_DIR; hostname ; git rev-parse HEAD"
+        echo -ne $(printf "%-10s" $(echo $SERVER | cut -f1 -d '.'))"\t"
+        ssh $SERVER "cd $REPO_DIR; sudo git rev-parse HEAD"
     done
     echo "---"
 done
 
 for SERVER in $SERVERS; do
-    ssh $SERVER "hostname | docker image ls | grep oldev | grep latest"
+    echo -ne $(printf "%-10s" $(echo $SERVER | cut -f1 -d '.'))"\t"
+    ssh $SERVER 'docker image ls | grep olbase | grep latest'
 done

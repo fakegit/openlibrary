@@ -1,0 +1,124 @@
+/**
+ * Spacing Primitives
+ * ======================
+ * A curated set of spacing values based on a 4px grid.
+ * Rarely used directly in components — use semantic tokens instead.
+ */
+/* Keep these columns aligned (lookup table). */
+/* prettier-ignore */
+:root {
+  --spacing-0: 0;
+  --spacing-3xs: 2px;       /*  2px – hairline gaps (px intentional) */
+  --spacing-2xs: 0.25rem;   /*  4px */
+  --spacing-xs: 0.375rem;   /*  6px */
+  --spacing-sm: 0.5rem;     /*  8px */
+  --spacing-md: 0.75rem;    /* 12px */
+  --spacing-lg: 1rem;       /* 16px */
+  --spacing-xl: 1.25rem;    /* 20px */
+  --spacing-2xl: 1.5rem;    /* 24px */
+  --spacing-3xl: 2rem;      /* 32px */
+  --spacing-4xl: 2.5rem;    /* 40px */
+  --spacing-5xl: 3rem;      /* 48px */
+  --spacing-6xl: 4rem;      /* 64px */
+  --spacing-7xl: 5rem;      /* 80px */
+}
+
+/**
+ * Spacing Semantic Tokens
+ * ====================
+ * Reference these throughout the app for consistent spacing.
+ *
+ * Categories:
+ *   - Inline:  horizontal space between sibling elements
+ *   - Stack:   vertical space between sibling elements
+ *   - Inset:   internal padding of containers
+ *   - Layout:  large-scale page/section spacing
+ */
+/* Keep these columns aligned (lookup table). */
+/* prettier-ignore */
+:root {
+  /* ---- Inline: horizontal gaps between sibling elements ----
+   *
+   *   ┌───┐ ↔ ┌───┐ ↔ ┌───┐
+   *   │ A │   │ B │   │ C │
+   *   └───┘   └───┘   └───┘
+   *
+   *   Use for: row gaps, icon-to-label, toolbar items,
+   *   pagination buttons, breadcrumb separators
+   */
+  --spacing-inline-xs: var(--spacing-3xs);   /*  2px – hairline glyph-to-text (e.g. pagination arrows) */
+  --spacing-inline-sm: var(--spacing-2xs);   /*  4px – related controls (e.g. search bar elements) */
+  --spacing-inline-md: var(--spacing-sm);    /*  8px – default inline gap (e.g. toolbar actions) */
+  --spacing-inline-lg: var(--spacing-md);    /* 12px – between cards (e.g. carousel book covers) */
+  --spacing-inline-xl: var(--spacing-lg);    /* 16px – between content groups (e.g. nav sections) */
+  --spacing-carousel-gap: var(--spacing-xl); /* 20px – between carousel cards, and before the first */
+  --spacing-carousel-band: var(--spacing-md); /* 12px – above and below the cards in a banded row */
+
+  /* One gap between an icon and the label it sits beside, so a button, a
+     menu row and a split button all read as the same control family. */
+  --spacing-icon-gap: var(--spacing-sm);     /*  8px – icon-to-label (e.g. buttons, menu rows) */
+
+  /* ---- Stack: vertical gaps between sibling elements ----
+   *
+   *   ┌─────────┐
+   *   │    A    │
+   *   └─────────┘
+   *        ↕
+   *   ┌─────────┐
+   *   │    B    │
+   *   └─────────┘
+   *
+   *   Use for: column gaps, heading-to-body, form fields,
+   *   stacked lists, book detail sections
+   */
+  --spacing-stack-xs: var(--spacing-2xs);    /*  4px – tight text runs (e.g. title + subtitle) */
+  --spacing-stack-sm: var(--spacing-sm);     /*  8px – related elements (e.g. form label to input) */
+  --spacing-stack-md: var(--spacing-lg);     /* 16px – default stack gap (e.g. book detail fields) */
+  --spacing-stack-lg: var(--spacing-2xl);    /* 24px – between content blocks (e.g. edition groups) */
+  --spacing-stack-xl: var(--spacing-3xl);    /* 32px – between major sections (e.g. work tabs) */
+  --spacing-stack-2xl: var(--spacing-5xl);   /* 48px – editorial air (e.g. above a section heading in long-form prose) */
+
+  /* ---- Inset: padding inside a container ----
+   *
+   *   ┌─────────────────┐
+   *   │ ↑               │
+   *   │ ← [ content ] → │
+   *   │ ↓               │
+   *   └─────────────────┘
+   *
+   *   Use for: padding on cards, dialogs, buttons, tags,
+   *   read-more panels, search result items
+   */
+  --spacing-inset-xs: var(--spacing-2xs);    /*  4px – badges, tags (e.g. subject pills) */
+  --spacing-inset-sm: var(--spacing-sm);     /*  8px – buttons, small cards (e.g. pagination links) */
+  --spacing-inset-md: var(--spacing-lg);     /* 16px – cards, dialogs (e.g. read-more panel) */
+  --spacing-inset-lg: var(--spacing-2xl);    /* 24px – panels, sections (e.g. book overview card) */
+  --spacing-inset-xl: var(--spacing-3xl);    /* 32px – hero areas, modals (e.g. welcome banner) */
+
+  /* Pairs with --border-card and --border-radius-card, so cards side by side share one padding. */
+  --spacing-inset-card: var(--spacing-inset-lg); /* 24px – content cards (e.g. home library row) */
+
+  /* ---- Layout: page-level spacing ----
+   *
+   *   │←gutter→┌──────────┐←gutter→│
+   *   │        │ section  │        │
+   *   │        └──────────┘        │
+   *   │             ↕ section-gap  │
+   *   │        ┌──────────┐        │
+   *   │        │ section  │        │
+   *   │        └──────────┘        │
+   *
+   *   Use for: page edge margins, gaps between top-level
+   *   page sections (e.g. header → carousel → lists)
+   */
+  --spacing-page-gutter: var(--spacing-xl);           /* 20px – page edge (#contentBody); 12px on phones, below */
+  --spacing-section-gap: var(--spacing-3xl);          /* 32px – between page sections */
+  --spacing-section-gap-desktop: var(--spacing-5xl);  /* 48px – between page sections on desktop */
+}
+
+/* --width-breakpoint-tablet */
+@media (max-width: 767px) {
+  :root {
+    --spacing-page-gutter: var(--spacing-md); /* 12px */
+  }
+}

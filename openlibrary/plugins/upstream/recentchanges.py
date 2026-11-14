@@ -2,37 +2,44 @@
 
 This should go into infogami.
 """
-import web
+
 import json
+import logging
+import math
+
+import web
 import yaml
 
+from infogami.infobase import client
 from infogami.utils import delegate
-from infogami.utils.view import public, render, render_template, safeint
-from infogami.utils.view import add_flash_message  # TODO: unused import?
-from infogami.utils import features
-
-from openlibrary.utils import dateutil
+from infogami.utils.view import (
+    add_flash_message,
+    public,
+    render,
+    render_template,
+    safeint,
+)  # TODO: unused import?
+from openlibrary.accounts import get_current_user
+from openlibrary.i18n import gettext as _
 from openlibrary.plugins.upstream.utils import get_changes
+from openlibrary.utils import dateutil
+from openlibrary.utils.request_context import site
 
 
 @public
 def recentchanges(query):
-    return web.ctx.site.recentchanges(query)
+    return site.get().recentchanges(query)
+
 
 class index2(delegate.page):
     path = "/recentchanges"
 
     def GET(self):
-        if features.is_enabled("recentchanges_v2"):
-            return index().render()
-        else:
-            return render.recentchanges()
+        return index().render()
+
 
 class index(delegate.page):
     path = "/recentchanges(/[^/0-9][^/]*)"
-
-    def is_enabled(self):
-        return features.is_enabled("recentchanges_v2")
 
     def GET(self, kind):
         return self.render(kind=kind)
@@ -42,11 +49,11 @@ class index(delegate.page):
 
         if date:
             begin_date, end_date = dateutil.parse_daterange(date)
-            query['begin_date'] = begin_date.isoformat()
-            query['end_date'] = end_date.isoformat()
+            query["begin_date"] = begin_date.isoformat()
+            query["end_date"] = end_date.isoformat()
 
         if kind:
-            query['kind'] = kind and kind.strip("/")
+            query["kind"] = kind and kind.strip("/")
 
         if web.ctx.encoding in ["json", "yml"]:
             return self.handle_encoding(query, web.ctx.encoding)
@@ -54,14 +61,18 @@ class index(delegate.page):
         return render_template("recentchanges/index", query)
 
     def handle_encoding(self, query, encoding):
-        i = web.input(bot="", limit=100, offset=0, text="false")
+        i = web.input(bot="", limit=100, offset=0, text="false", author="")
 
         # The bot stuff is handled in the template for the regular path.
         # We need to handle it here for api.
         if i.bot.lower() == "true":
-            query['bot'] = True
-        elif i.bot.lower()  == "false":
-            query['bot'] = False
+            query["bot"] = True
+        elif i.bot.lower() == "false":
+            query["bot"] = False
+
+        # Handle author query parameter
+        if i.author:
+            query["author"] = i.author
 
         # and limit and offset business too
         limit = safeint(i.limit, 100)
@@ -79,10 +90,10 @@ class index(delegate.page):
         limit = constrain(limit, 0, 1000)
         offset = constrain(offset, 0, 10000)
 
-        query['limit'] = limit
-        query['offset'] = offset
+        query["limit"] = limit
+        query["offset"] = offset
 
-        result = [c.dict() for c in web.ctx.site.recentchanges(query)]
+        result = [c.dict() for c in site.get().recentchanges(query)]
 
         if encoding == "json":
             response = json.dumps(result)
@@ -95,62 +106,66 @@ class index(delegate.page):
             content_type = "text/plain"
 
         if i.text.lower() == "true":
-            web.header('Content-Type', 'text/plain')
+            web.header("Content-Type", "text/plain")
         else:
-            web.header('Content-Type', content_type)
+            web.header("Content-Type", content_type)
 
         return delegate.RawText(response)
 
     def yaml_dump(self, d):
         return yaml.safe_dump(d, indent=4, allow_unicode=True, default_flow_style=False)
 
+
 class index_with_date(index):
-    path = "/recentchanges/(\d\d\d\d(?:/\d\d)?(?:/\d\d)?)(/[^/]*)?"
+    path = r"/recentchanges/(\d\d\d\d(?:/\d\d)?(?:/\d\d)?)(/[^/]*)?"
 
     def GET(self, date, kind):
         date = date.replace("/", "-")
         return self.render(kind=kind, date=date)
 
-class recentchanges_redirect(delegate.page):
-    path = "/recentchanges/goto/(\d+)"
 
-    def is_enabled(self):
-        return features.is_enabled("recentchanges_v2")
+class recentchanges_redirect(delegate.page):
+    path = r"/recentchanges/goto/(\d+)"
 
     def GET(self, id):
         id = int(id)
-        change = web.ctx.site.get_change(id)
+        change = site.get().get_change(id)
         if not change:
             web.ctx.status = "404 Not Found"
             return render.notfound(web.ctx.path)
 
         raise web.found(change.url())
 
-class recentchanges_view(delegate.page):
-    path = "/recentchanges/\d\d\d\d/\d\d/\d\d/[^/]*/(\d+)"
 
-    def is_enabled(self):
-        return features.is_enabled("recentchanges_v2")
+class recentchanges_view(delegate.page):
+    path = r"/recentchanges/\d\d\d\d/\d\d/\d\d/[^/]*/(\d+)"
 
     def get_change_url(self, change):
         t = change.timestamp
-        return "/recentchanges/%04d/%02d/%02d/%s/%s" % (t.year, t.month, t.day, change.kind, change.id)
+        return "/recentchanges/%04d/%02d/%02d/%s/%s" % (
+            t.year,
+            t.month,
+            t.day,
+            change.kind,
+            change.id,
+        )
 
     def GET(self, id):
         id = int(id)
-        change = web.ctx.site.get_change(id)
+        change = site.get().get_change(id)
         if not change:
             web.ctx.status = "404 Not Found"
             return render.notfound(web.ctx.path)
 
-        if web.ctx.encoding == 'json':
+        if web.ctx.encoding == "json":
             return self.render_json(change)
 
         path = self.get_change_url(change)
         if path != web.ctx.path:
             raise web.redirect(path)
         else:
-            tname = "recentchanges/" + change.kind + "/view"
+            kind = "merge" if change.kind.startswith("merge-") else change.kind
+            tname = "recentchanges/" + kind + "/view"
             if tname in render:
                 return render_template(tname, change)
             else:
@@ -159,22 +174,42 @@ class recentchanges_view(delegate.page):
     def render_json(self, change):
         return delegate.RawText(json.dumps(change.dict()), content_type="application/json")
 
+    # Required for reverting changesets
     def POST(self, id):
-        if not features.is_enabled("undo"):
-            return render_template("permission_denied", web.ctx.path, "Permission denied to undo.")
-
+        if not (user := get_current_user()) or not user.is_super_librarian_or_higher():
+            raise web.unauthorized()
         id = int(id)
-        change = web.ctx.site.get_change(id)
-        change._undo()
+        change = site.get().get_change(id)
+        if not change:
+            web.ctx.status = "404 Not Found"
+            return render.notfound(web.ctx.path)
+        if undo_error := change.get_undo_error():
+            # The undo's save would be rejected by infobase validation, e.g.
+            # because pre-merge records reference authors that have since been
+            # merged into other authors. See internetarchive/openlibrary#5664.
+            add_flash_message("error", undo_error)
+        else:
+            try:
+                change._undo()
+            except client.ClientException as e:
+                # Fallback for failures the pre-check can't anticipate. The
+                # infobase write is atomic, so nothing was partially undone.
+                logging.getLogger("openlibrary").exception("Failed to undo changeset %s: %s", id, e)
+                add_flash_message("error", _("This change could not be undone automatically."))
         raise web.seeother(change.url())
+
 
 class history(delegate.mode):
     def GET(self, path):
-        page = web.ctx.site.get(path)
+        page = site.get().get(path)
         if not page:
             raise web.seeother(path)
-        i = web.input(page=0)
-        offset = 20 * safeint(i.page)
+        i = web.input(page=1)
         limit = 20
-        history = get_changes(dict(key=path, limit=limit, offset=offset))
-        return render.history(page, history)
+        # Clamp so legacy ?page=0 links resolve to the first page instead of a negative offset.
+        page_num = max(1, safeint(i.page))
+        offset = (page_num - 1) * limit
+        history = get_changes({"key": path, "limit": limit, "offset": offset})
+        # page.revision is the total number of saved revisions (infogami bumps it on every save).
+        total_pages = math.ceil(page.revision / limit)
+        return render.history(page, history, page_num, total_pages)

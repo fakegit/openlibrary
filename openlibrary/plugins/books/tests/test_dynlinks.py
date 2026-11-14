@@ -4,121 +4,102 @@ Most of the tests here use 3 sets of data.
 
 data0: This contains OL0A, OL0M and OL0W with each having just name/title.
 data1: This contains OL1A, OL1M, OL1W with each having name/tile and interconnections.
-data9: This contans OL9A, OL9M and OL9W with interconnections and almost all fields.
+data9: This contains OL9A, OL9M and OL9W with interconnections and almost all fields.
 """
 
-import pytest
-import re
 import json
+import re
+from collections.abc import Callable, Iterable
+from typing import cast
+
+import pytest
 import web
 
-from openlibrary.core import ia
 from openlibrary.mocks import mock_infobase
 from openlibrary.plugins.books import dynlinks
+from openlibrary.utils.request_context import site as site_context
+from openlibrary.utils.solr import Solr
 
-@pytest.fixture
-def data0(request):
+
+def build_data0():
     return {
-        "/books/OL0M": {
-            "key": "/books/OL0M",
-            "title": "book-0"
-        },
-        "/authors/OL0A": {
-            "key": "/authors/OL0A",
-            "name": "author-0"
-        },
-        "/works/OL0W": {
-            "key": "/works/OL0W",
-            "title": "work-0"
-        },
+        "/books/OL0M": {"key": "/books/OL0M", "title": "book-0"},
+        "/authors/OL0A": {"key": "/authors/OL0A", "name": "author-0"},
+        "/works/OL0W": {"key": "/works/OL0W", "title": "work-0"},
         "result": {
             "data": {
                 "url": "https://openlibrary.org/books/OL0M/book-0",
                 "key": "/books/OL0M",
                 "title": "book-0",
-                "identifiers": {
-                    "openlibrary": ["OL0M"]
-                }
+                "identifiers": {"openlibrary": ["OL0M"]},
             }
-        }
+        },
     }
 
-@pytest.fixture
-def data1(request):
+
+def build_data1():
     return {
         "/books/OL1M": {
             "key": "/books/OL1M",
             "title": "foo",
-            "works": [{"key": "/works/OL1W"}]
+            "works": [{"key": "/works/OL1W"}],
         },
-        "/authors/OL1A": {
-            "key": "/authors/OL1A",
-            "name": "Mark Twain"
-        },
+        "/authors/OL1A": {"key": "/authors/OL1A", "name": "Mark Twain"},
         "/works/OL1W": {
             "key": "/works/OL1W",
             "title": "Foo",
-            "authors": [{
-                "author": {"key": "/authors/OL1A"}
-            }]
-        }
+            "authors": [{"author": {"key": "/authors/OL1A"}}],
+        },
     }
 
-@pytest.fixture
-def data9(request):
+
+def build_data9():
     return {
-        "/authors/OL9A": {
-            "key": "/authors/OL9A",
-            "name": "Mark Twain"
-        },
+        "/authors/OL9A": {"key": "/authors/OL9A", "name": "Mark Twain"},
         "/works/OL9W": {
             "key": "/works/OL9W",
             "title": "Foo",
-            "authors": [{
-                "author": {"key": "/authors/OL9A"}
-            }],
-            "links": [{
-                "title": "wikipedia article",
-                "url": "http://en.wikipedia.org/wiki/foo"
-            }],
+            "authors": [{"author": {"key": "/authors/OL9A"}}],
+            "links": [
+                {
+                    "title": "wikipedia article",
+                    "url": "http://en.wikipedia.org/wiki/foo",
+                }
+            ],
             "subjects": ["Test Subject"],
             "subject_people": ["Test Person"],
             "subject_places": ["Test Place"],
             "subject_times": ["Test Time"],
-            "excerpts": [{
-                "excerpt": {
-                    "type": "/type/text",
-                    "value": "This is an excerpt."
+            "excerpts": [
+                {
+                    "excerpt": {"type": "/type/text", "value": "This is an excerpt."},
+                    "comment": "foo",
                 },
-                "comment": "foo"
-            }, {
-                # sometimes excerpt was plain string instead of /type/text.
-                "excerpt": "This is another excerpt.",
-                "comment": "bar"
-            }]
+                {
+                    # sometimes excerpt was plain string instead of /type/text.
+                    "excerpt": "This is another excerpt.",
+                    "comment": "bar",
+                },
+            ],
         },
         "/books/OL9M": {
             "key": "/books/OL9M",
             "title": "foo",
             "subtitle": "bar",
-            "by_statement":  "Mark Twain",
+            "by_statement": "Mark Twain",
             "works": [{"key": "/works/OL9W"}],
             "publishers": ["Dover Publications"],
             "publish_places": ["New York"],
-            "identifiers": {
-                "goodreads": ["12345"]
-            },
+            "identifiers": {"goodreads": ["12345"]},
             "isbn_10": ["1234567890"],
             "lccn": ["lccn-1"],
             "oclc_numbers": ["oclc-1"],
-            "classifications": {
-                "indcat": ["12345"]
-            },
+            "classifications": {"indcat": ["12345"]},
             "lc_classifications": ["LC1234"],
             "covers": [42, 53],
             "ocaid": "foo12bar",
             "number_of_pages": "100",
-            "pagination": "100 p."
+            "pagination": "100 p.",
         },
         "result": {
             "viewapi": {
@@ -133,80 +114,85 @@ def data9(request):
                 "title": "foo",
                 "subtitle": "bar",
                 "by_statement": "Mark Twain",
-                "authors": [{
-                    "url": "https://openlibrary.org/authors/OL9A/Mark_Twain",
-                    "name": "Mark Twain"
-                }],
+                "authors": [
+                    {
+                        "url": "https://openlibrary.org/authors/OL9A/Mark_Twain",
+                        "name": "Mark Twain",
+                    }
+                ],
                 "identifiers": {
                     "isbn_10": ["1234567890"],
                     "lccn": ["lccn-1"],
                     "oclc": ["oclc-1"],
                     "goodreads": ["12345"],
-                    "openlibrary": ["OL9M"]
+                    "openlibrary": ["OL9M"],
                 },
                 "classifications": {
                     "lc_classifications": ["LC1234"],
-                    "indcat": ["12345"]
+                    "indcat": ["12345"],
                 },
-                "publishers": [{
-                    "name": "Dover Publications"
-                }],
-                "publish_places": [{
-                    "name": "New York"
-                }],
-                "links": [{
-                    "title": "wikipedia article",
-                    "url": "http://en.wikipedia.org/wiki/foo"
-                }],
-                'subjects': [{
-                    'url': 'https://openlibrary.org/subjects/test_subject',
-                    'name': 'Test Subject'
-                }],
-                'subject_places': [{
-                    'url': 'https://openlibrary.org/subjects/place:test_place',
-                    'name': 'Test Place'
-                }],
-                'subject_people': [{
-                    'url': 'https://openlibrary.org/subjects/person:test_person',
-                    'name': 'Test Person'
-                }],
-                'subject_times': [{
-                    'url': 'https://openlibrary.org/subjects/time:test_time',
-                    'name': 'Test Time'
-                }],
+                "publishers": [{"name": "Dover Publications"}],
+                "publish_places": [{"name": "New York"}],
+                "links": [
+                    {
+                        "title": "wikipedia article",
+                        "url": "http://en.wikipedia.org/wiki/foo",
+                    }
+                ],
+                "subjects": [
+                    {
+                        "url": "https://openlibrary.org/subjects/test_subject",
+                        "name": "Test Subject",
+                    }
+                ],
+                "subject_places": [
+                    {
+                        "url": "https://openlibrary.org/subjects/place:test_place",
+                        "name": "Test Place",
+                    }
+                ],
+                "subject_people": [
+                    {
+                        "url": "https://openlibrary.org/subjects/person:test_person",
+                        "name": "Test Person",
+                    }
+                ],
+                "subject_times": [
+                    {
+                        "url": "https://openlibrary.org/subjects/time:test_time",
+                        "name": "Test Time",
+                    }
+                ],
                 "cover": {
                     "small": "https://covers.openlibrary.org/b/id/42-S.jpg",
                     "medium": "https://covers.openlibrary.org/b/id/42-M.jpg",
                     "large": "https://covers.openlibrary.org/b/id/42-L.jpg",
                 },
-                "excerpts": [{
-                    "text": "This is an excerpt.",
-                    "comment": "foo",
-                }, {
-                    "text": "This is another excerpt.",
-                    "comment": "bar"
-                }],
-                "ebooks": [{
-                    "preview_url": "https://archive.org/details/foo12bar",
-                    "read_url": "https://archive.org/stream/foo12bar",
-                    "availability": "full",
-                    "formats": {
-                        "pdf": {
-                            "url": "https://archive.org/download/foo12bar/foo12bar.pdf"
+                "excerpts": [
+                    {
+                        "text": "This is an excerpt.",
+                        "comment": "foo",
+                    },
+                    {"text": "This is another excerpt.", "comment": "bar"},
+                ],
+                "ebooks": [
+                    {
+                        "preview_url": "https://archive.org/details/foo12bar",
+                        "read_url": "https://archive.org/stream/foo12bar",
+                        "availability": "full",
+                        "formats": {
+                            "pdf": {"url": "https://archive.org/download/foo12bar/foo12bar.pdf"},
+                            "epub": {"url": "https://archive.org/download/foo12bar/foo12bar.epub"},
+                            "text": {"url": "https://archive.org/download/foo12bar/foo12bar_djvu.txt"},
                         },
-                        "epub": {
-                            "url": "https://archive.org/download/foo12bar/foo12bar.epub"
-                        },
-                        "text": {
-                            "url": "https://archive.org/download/foo12bar/foo12bar_djvu.txt"
-                        }
                     }
-                }],
+                ],
                 "number_of_pages": "100",
-                "pagination": "100 p."
-            }
-        }
+                "pagination": "100 p.",
+            },
+        },
     }
+
 
 class Mock:
     def __init__(self):
@@ -224,68 +210,139 @@ class Mock:
         call = a, kw, _return
         self.calls.append(call)
 
-def monkeypatch_ol(monkeypatch):
+
+def monkeypatch_ol(monkeypatch, solr_overrides: list[dict] | None = None):
     mock = Mock()
     mock.setup_call("isbn_", "1234567890", _return="/books/OL1M")
     mock.setup_call("key", "/books/OL2M", _return="/books/OL2M")
-    monkeypatch.setattr(dynlinks, "ol_query", mock)
+    mock.setup_call("ocaid", "ia-bar", _return="/books/OL2M")
+    ol_query = mock
+
+    async def async_ol_query(name, value):
+        return ol_query(name, value)
+
+    monkeypatch.setattr(dynlinks, "ol_query", async_ol_query)
 
     mock = Mock()
     mock.setup_call(["/books/OL1M"], _return=[{"key": "/books/OL1M", "title": "foo"}])
-    mock.setup_call(["/books/OL2M"], _return=[{"key": "/books/OL2M", "title": "bar", "ocaid": "ia-bar"}])
+    mock.setup_call(
+        ["/books/OL2M"],
+        _return=[{"key": "/books/OL2M", "title": "bar", "ocaid": "ia-bar"}],
+    )
     mock.default = []
     monkeypatch.setattr(dynlinks, "ol_get_many", mock)
 
-    monkeypatch.setattr(ia, "get_metadata", lambda itemid: web.storage())
+    monkeypatch_solr(monkeypatch, solr_overrides)
 
-def test_query_keys(monkeypatch):
+
+def monkeypatch_solr(monkeypatch, solr_overrides: list[dict] | None = None):
+    class FakeSolr(Solr):
+        async def get_many_async[T](  # type: ignore[override]
+            self,
+            keys: Iterable[str],
+            fields: Iterable[str] | None = None,
+            doc_wrapper: Callable[[dict], T] = web.storage,
+        ) -> list[T]:
+            keys = set(keys)
+            return [doc for doc in (solr_overrides or []) if doc["key"] in keys]  # type: ignore
+
+    mock_solr = FakeSolr("http://fake-solr:8983/solr/ol")
+    monkeypatch.setattr(dynlinks, "get_solr", lambda: mock_solr)
+
+
+@pytest.mark.asyncio
+async def test_query_keys(monkeypatch):
     monkeypatch_ol(monkeypatch)
-    assert dynlinks.query_keys(["isbn:1234567890"]) == {"isbn:1234567890": "/books/OL1M"}
-    assert dynlinks.query_keys(["isbn:9876543210"]) == {}
-    assert dynlinks.query_keys(["isbn:1234567890", "isbn:9876543210"]) == {"isbn:1234567890": "/books/OL1M"}
+    assert await dynlinks.query_keys(["isbn:1234567890"]) == {"isbn:1234567890": "/books/OL1M"}
+    assert await dynlinks.query_keys(["isbn:9876543210"]) == {}
+    assert await dynlinks.query_keys(["isbn:1234567890", "isbn:9876543210"]) == {"isbn:1234567890": "/books/OL1M"}
 
-def test_query_docs(monkeypatch):
+
+@pytest.mark.asyncio
+async def test_query_docs(monkeypatch):
     monkeypatch_ol(monkeypatch)
 
-    assert dynlinks.query_docs(["isbn:1234567890"]) == {"isbn:1234567890": {"key": "/books/OL1M", "title": "foo"}}
-    assert dynlinks.query_docs(["isbn:9876543210"]) == {}
-    assert dynlinks.query_docs(["isbn:1234567890", "isbn:9876543210"]) == {"isbn:1234567890": {"key": "/books/OL1M", "title": "foo"}}
+    assert await dynlinks.query_docs(["isbn:1234567890"]) == {"isbn:1234567890": {"key": "/books/OL1M", "title": "foo"}}
+    assert await dynlinks.query_docs(["isbn:9876543210"]) == {}
+    assert await dynlinks.query_docs(["isbn:1234567890", "isbn:9876543210"]) == {"isbn:1234567890": {"key": "/books/OL1M", "title": "foo"}}
+
 
 def test_process_doc_for_view_api(monkeypatch):
     monkeypatch_ol(monkeypatch)
 
     bib_key = "isbn:1234567890"
-    doc = {"key": "/books/OL1M", "title": "foo"}
+    doc: dynlinks.OpenLibraryEditionWithPreview = {
+        "key": "/books/OL1M",
+        "title": "foo",
+        "preview": "noview",
+    }
     expected_result = {
         "bib_key": "isbn:1234567890",
         "info_url": "https://openlibrary.org/books/OL1M/foo",
         "preview": "noview",
-        "preview_url": "https://openlibrary.org/books/OL1M/foo"
+        "preview_url": "https://openlibrary.org/books/OL1M/foo",
     }
     assert dynlinks.process_doc_for_viewapi(bib_key, doc) == expected_result
 
-    doc['ocaid'] = "ia-foo"
-    expected_result["preview"] = "full"
+    doc["ocaid"] = "ia-foo"
+    expected_result["preview"] = "noview"
     expected_result["preview_url"] = "https://archive.org/details/ia-foo"
     assert dynlinks.process_doc_for_viewapi(bib_key, doc) == expected_result
 
-    doc['covers'] = [42, 53]
+    doc["covers"] = [42, 53]
     expected_result["thumbnail_url"] = "https://covers.openlibrary.org/b/id/42-S.jpg"
     assert dynlinks.process_doc_for_viewapi(bib_key, doc) == expected_result
 
+
+def test_get_url_respects_base_url(monkeypatch):
+    monkeypatch_ol(monkeypatch)
+
+    doc = {"key": "/books/OL1M", "title": "foo"}
+    assert dynlinks.get_url(doc, base_url="http://example.com") == "http://example.com/books/OL1M/foo"
+
+
+def test_process_doc_for_view_api_with_base_url(monkeypatch):
+    monkeypatch_ol(monkeypatch)
+
+    bib_key = "isbn:1234567890"
+    doc: dynlinks.OpenLibraryEditionWithPreview = {
+        "key": "/books/OL1M",
+        "title": "foo",
+        "preview": "noview",
+    }
+    assert dynlinks.process_doc_for_viewapi(bib_key, doc, base_url="http://example.com") == {
+        "bib_key": "isbn:1234567890",
+        "info_url": "http://example.com/books/OL1M/foo",
+        "preview": "noview",
+        "preview_url": "http://example.com/books/OL1M/foo",
+    }
+
+
+def test_process_result_for_details_with_base_url(monkeypatch):
+    assert dynlinks.process_result_for_details(
+        {"isbn:1234567890": {"key": "/books/OL1M", "title": "foo", "preview": "noview"}},
+        base_url="http://example.com",
+    ) == {
+        "isbn:1234567890": {
+            "bib_key": "isbn:1234567890",
+            "info_url": "http://example.com/books/OL1M/foo",
+            "preview": "noview",
+            "preview_url": "http://example.com/books/OL1M/foo",
+            "details": {"key": "/books/OL1M", "title": "foo"},
+        }
+    }
+
+
 def test_process_result_for_details(monkeypatch):
-    assert dynlinks.process_result_for_details({
-        "isbn:1234567890": {"key": "/books/OL1M", "title": "foo"}}) == {
-            "isbn:1234567890": {
-                    "bib_key": "isbn:1234567890",
-                    "info_url": "https://openlibrary.org/books/OL1M/foo",
-                    "preview": "noview",
-                    "preview_url": "https://openlibrary.org/books/OL1M/foo",
-                    "details": {
-                        "key": "/books/OL1M",
-                        "title": "foo"
-                    }
-            }}
+    assert dynlinks.process_result_for_details({"isbn:1234567890": {"key": "/books/OL1M", "title": "foo", "preview": "noview"}}) == {
+        "isbn:1234567890": {
+            "bib_key": "isbn:1234567890",
+            "info_url": "https://openlibrary.org/books/OL1M/foo",
+            "preview": "noview",
+            "preview_url": "https://openlibrary.org/books/OL1M/foo",
+            "details": {"key": "/books/OL1M", "title": "foo"},
+        }
+    }
 
     OL1A = {
         "key": "/authors/OL1A",
@@ -296,11 +353,12 @@ def test_process_result_for_details(monkeypatch):
     mock.setup_call(["/authors/OL1A"], _return=[OL1A])
     monkeypatch.setattr(dynlinks, "ol_get_many", mock)
 
-    result = {
+    result: dict[str, dynlinks.OpenLibraryEditionWithPreview] = {
         "isbn:1234567890": {
             "key": "/books/OL1M",
             "title": "foo",
-            "authors": [{"key": "/authors/OL1A"}]
+            "authors": [{"key": "/authors/OL1A"}],
+            "preview": "noview",
         }
     }
 
@@ -313,17 +371,16 @@ def test_process_result_for_details(monkeypatch):
             "details": {
                 "key": "/books/OL1M",
                 "title": "foo",
-                "authors": [{
-                    "key": "/authors/OL1A",
-                    "name": "Mark Twain"
-                }]
-            }
+                "authors": [{"key": "/authors/OL1A", "name": "Mark Twain"}],
+            },
         }
     }
 
     assert dynlinks.process_result_for_details(result) == expected_result
 
-def test_dynlinks(monkeypatch):
+
+@pytest.mark.asyncio
+async def test_dynlinks(monkeypatch):
     monkeypatch_ol(monkeypatch)
 
     expected_result = {
@@ -331,88 +388,166 @@ def test_dynlinks(monkeypatch):
             "bib_key": "isbn:1234567890",
             "info_url": "https://openlibrary.org/books/OL1M/foo",
             "preview": "noview",
-            "preview_url": "https://openlibrary.org/books/OL1M/foo"
+            "preview_url": "https://openlibrary.org/books/OL1M/foo",
         }
     }
 
-    js = dynlinks.dynlinks(["isbn:1234567890"], {})
-    match = re.match('^var _OLBookInfo = ({.*});$', js)
+    js = await dynlinks.dynlinks(["isbn:1234567890"], {})
+    match = re.match("^var _OLBookInfo = ({.*});$", js)
     assert match is not None
     assert json.loads(match.group(1)) == expected_result
 
-    js = dynlinks.dynlinks(["isbn:1234567890"], {"callback": "func"})
-    match = re.match('^({.*})$', js)
+    js = await dynlinks.dynlinks(["isbn:1234567890"], {"callback": "func"})
+    match = re.match("^({.*})$", js)
     assert match is not None
     assert json.loads(match.group(1)) == expected_result
 
-    js = dynlinks.dynlinks(["isbn:1234567890"], {"format": "json"})
+    js = await dynlinks.dynlinks(["isbn:1234567890"], {"format": "json"})
     assert json.loads(js) == expected_result
 
-def test_isbnx(monkeypatch):
-    site = mock_infobase.MockSite()
-    site.save({
-        "key": "/books/OL1M",
-        "type": {"key": "/type/edition"},
-        "isbn_10": ["123456789X"]
-    })
 
-    monkeypatch.setattr(web.ctx, "site", site, raising=False)
-    json_data = dynlinks.dynlinks(["isbn:123456789X"], {"format": "json"})
-    d = json.loads(json_data)
-    assert list(d) == ["isbn:123456789X"]
-
-def test_dynlinks_ia(monkeypatch):
+@pytest.mark.asyncio
+async def test_dynlinks_with_base_url(monkeypatch):
     monkeypatch_ol(monkeypatch)
 
-    expected_result = {
-        "OL2M": {
-            "bib_key": "OL2M",
-            "info_url": "https://openlibrary.org/books/OL2M/bar",
-            "preview": "full",
-            "preview_url": "https://archive.org/details/ia-bar"
-        }
-    }
-    json_data = dynlinks.dynlinks(["OL2M"], {"format": "json"})
-    assert json.loads(json_data) == expected_result
+    js = await dynlinks.dynlinks(["isbn:1234567890"], {"format": "json"}, base_url="http://example.com")
+    assert json.loads(js)["isbn:1234567890"]["info_url"] == "http://example.com/books/OL1M/foo"
 
-def test_dynlinks_details(monkeypatch):
-    monkeypatch_ol(monkeypatch)
+
+@pytest.mark.asyncio
+async def test_dynlinks_public(monkeypatch):
+    monkeypatch_ol(
+        monkeypatch,
+        solr_overrides=[
+            {
+                "key": "/books/OL2M",
+                "ebook_access": "public",
+            },
+        ],
+    )
 
     expected_result = {
-        "OL2M": {
-            "bib_key": "OL2M",
+        "OCAID:ia-bar": {
+            "bib_key": "OCAID:ia-bar",
             "info_url": "https://openlibrary.org/books/OL2M/bar",
             "preview": "full",
             "preview_url": "https://archive.org/details/ia-bar",
-            "details": {
-                "key": "/books/OL2M",
-                "title": "bar",
-                "ocaid": "ia-bar"
-            }
-        },
+        }
     }
-    json_data = dynlinks.dynlinks(["OL2M"], {"format": "json", "details": "true"})
+
+    js = await dynlinks.dynlinks(["OCAID:ia-bar"], {})
+    match = re.match("^var _OLBookInfo = ({.*});$", js)
+    assert match is not None
+    assert json.loads(match.group(1)) == expected_result
+
+    js = await dynlinks.dynlinks(["OCAID:ia-bar"], {"callback": "func"})
+    match = re.match("^({.*})$", js)
+    assert match is not None
+    assert json.loads(match.group(1)) == expected_result
+
+    js = await dynlinks.dynlinks(["OCAID:ia-bar"], {"format": "json"})
+    assert json.loads(js) == expected_result
+
+
+@pytest.mark.asyncio
+async def test_isbnx(monkeypatch):
+    monkeypatch_solr(monkeypatch)
+    site = mock_infobase.MockSite()
+    site.save(
+        {
+            "key": "/books/OL1M",
+            "type": {"key": "/type/edition"},
+            "isbn_10": ["123456789X"],
+        }
+    )
+
+    monkeypatch.setattr(web.ctx, "site", site, raising=False)
+    site_context.set(web.ctx.site)
+
+    async def things(query):
+        # infobase_async reads Postgres; serve the lookup from the mock site instead.
+        return site.things(query)
+
+    monkeypatch.setattr(dynlinks.infobase_async, "things", things)
+    json_data = await dynlinks.dynlinks(["isbn:123456789X"], {"format": "json"})
+    d = json.loads(json_data)
+    assert list(d) == ["isbn:123456789X"]
+
+
+@pytest.mark.asyncio
+async def test_dynlinks_ia(monkeypatch):
+    monkeypatch_ol(monkeypatch)
+
+    expected_result = {
+        "OL2M": {
+            "bib_key": "OL2M",
+            "info_url": "https://openlibrary.org/books/OL2M/bar",
+            "preview": "noview",
+            "preview_url": "https://archive.org/details/ia-bar",
+        }
+    }
+    json_data = await dynlinks.dynlinks(["OL2M"], {"format": "json"})
     assert json.loads(json_data) == expected_result
 
+
+@pytest.mark.asyncio
+async def test_dynlinks_details(monkeypatch):
+    monkeypatch_ol(monkeypatch)
+
+    expected_result = {
+        "OL2M": {
+            "bib_key": "OL2M",
+            "info_url": "https://openlibrary.org/books/OL2M/bar",
+            "preview": "noview",
+            "preview_url": "https://archive.org/details/ia-bar",
+            "details": {"key": "/books/OL2M", "title": "bar", "ocaid": "ia-bar"},
+        },
+    }
+    json_data = await dynlinks.dynlinks(["OL2M"], {"format": "json", "details": "true"})
+    assert json.loads(json_data) == expected_result
+
+
 class TestDataProcessor:
-    def test_get_authors0(self, data0):
+    @pytest.mark.asyncio
+    async def test_get_authors0(self):
+        data0 = build_data0()
         p = dynlinks.DataProcessor()
         p.authors = data0
-        assert p.get_authors(data0['/books/OL0M']) == []
+        assert p.get_authors(data0["/books/OL0M"]) == []
 
-    def test_get_authors1(self, data1):
+    def test_get_authors1(self):
+        data1 = build_data1()
         p = dynlinks.DataProcessor()
         p.authors = data1
-        assert p.get_authors(data1['/works/OL1W']) == [{"url": "https://openlibrary.org/authors/OL1A/Mark_Twain", "name": "Mark Twain"}]
+        assert p.get_authors(data1["/works/OL1W"]) == [
+            {
+                "url": "https://openlibrary.org/authors/OL1A/Mark_Twain",
+                "name": "Mark Twain",
+            }
+        ]
 
-    def test_process_doc0(self, data0):
+    def test_process_doc0(self):
+        data0 = build_data0()
         p = dynlinks.DataProcessor()
-        assert p.process_doc(data0['/books/OL0M']) == data0['result']['data']
+        assert p.process_doc(data0["/books/OL0M"]) == data0["result"]["data"]
 
-    def test_process_doc9(self, monkeypatch, data9):
+    def test_process_doc9(self, monkeypatch):
+        data9 = build_data9()
         monkeypatch_ol(monkeypatch)
 
         p = dynlinks.DataProcessor()
         p.authors = data9
         p.works = data9
-        assert p.process_doc(data9['/books/OL9M']) == data9['result']['data']
+
+        # Expected to be augmented with the preview field.
+        doc = cast(dynlinks.OpenLibraryEditionWithPreview, data9["/books/OL9M"])
+        doc["preview"] = "full"
+
+        assert p.process_doc(doc) == data9["result"]["data"]
+
+
+@pytest.fixture(autouse=True)
+def restore_site_context():
+    token = site_context.set(site_context.get(None))
+    yield
+    site_context.reset(token)

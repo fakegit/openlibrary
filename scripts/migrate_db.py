@@ -1,7 +1,5 @@
-#! /usr/bin/env python
-"""Script to migrate the OL database to latest schema.
-"""
-from __future__ import print_function
+#!/usr/bin/env python
+"""Script to migrate the OL database to latest schema."""
 
 import itertools
 import json
@@ -20,6 +18,7 @@ changelog = """\
 
 LATEST_VERSION = 14
 
+
 class Upgrader:
     def upgrade(self, db):
         v = self.get_database_version(db)
@@ -30,8 +29,8 @@ class Upgrader:
         t = db.transaction()
         try:
             for i in range(v, LATEST_VERSION):
-                print("upgrading to", i+1)
-                f = getattr(self, "upgrade_%03d" % (i+1))
+                print("upgrading to", i + 1)
+                f = getattr(self, "upgrade_%03d" % (i + 1))
                 f(db)
         except:
             print()
@@ -61,14 +60,18 @@ class Upgrader:
         db.query("ALTER TABLE transaction ADD COLUMN changes text")
 
         # populate changes
-        rows = db.query("SELECT thing.key, version.revision, version.transaction_id"
-            + " FROM  thing, version"
-            + " WHERE thing.id=version.thing_id"
-            + " ORDER BY version.transaction_id")
+        rows = db.query(
+            "SELECT thing.key, version.revision, version.transaction_id FROM  thing, version WHERE thing.id=version.thing_id ORDER BY version.transaction_id"
+        )
 
         for tx_id, changes in itertools.groupby(rows, lambda row: row.transaction_id):
             changes = [{"key": row.key, "revision": row.revision} for row in changes]
-            db.update("transaction", where="id=$tx_id", changes=json.dumps(changes), vars=locals())
+            db.update(
+                "transaction",
+                where="id=$tx_id",
+                changes=json.dumps(changes),
+                vars=locals(),
+            )
 
     def upgrade_014(self, db):
         """Add transaction_index table."""
@@ -87,21 +90,19 @@ class Upgrader:
     def get_database_version(self, db):
         schema = self.read_schema(db)
 
-        if 'seq' not in schema:
+        if "seq" not in schema:
             return 10
-        elif 'data' not in schema['transaction']:
+        elif "data" not in schema["transaction"]:
             return 11
-        elif 'changes' not in schema['transaction']:
+        elif "changes" not in schema["transaction"]:
             return 12
-        elif 'transaction_index' not in schema:
+        elif "transaction_index" not in schema:
             return 13
         else:
             return LATEST_VERSION
 
     def read_schema(self, db):
-        rows = db.query("SELECT table_name, column_name,  data_type "
-            + " FROM information_schema.columns"
-            + " WHERE table_schema = 'public'")
+        rows = db.query("SELECT table_name, column_name,  data_type  FROM information_schema.columns WHERE table_schema = 'public'")
 
         schema = web.storage()
         for row in rows:
@@ -109,10 +110,12 @@ class Upgrader:
             t[row.column_name] = row
         return schema
 
+
 def usage():
     print(file=sys.stderr)
     print("USAGE: %s dbname" % sys.argv[0], file=sys.stderr)
     print(file=sys.stderr)
+
 
 def main():
     if len(sys.argv) != 2:
@@ -122,8 +125,9 @@ def main():
         usage()
     else:
         dbname = sys.argv[1]
-        db = web.database(dbn='postgres', db=dbname, user=os.getenv('USER'), pw='')
+        db = web.database(dbn="postgres", db=dbname, user=os.getenv("USER"), pw="")
         Upgrader().upgrade(db)
+
 
 if __name__ == "__main__":
     main()

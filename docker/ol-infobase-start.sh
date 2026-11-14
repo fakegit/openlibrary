@@ -1,4 +1,5 @@
 #!/bin/bash
 
 python --version
-scripts/infobase-server "$INFOBASE_CONFIG" $INFOBASE_OPTS 7000
+source docker/ol-install-missing-deps.sh
+exec scripts/infobase-server "$INFOBASE_CONFIG" $INFOBASE_OPTS 7000

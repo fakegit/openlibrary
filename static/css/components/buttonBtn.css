@@ -1,0 +1,48 @@
+/* Chips. The `.btn` rules this file was named for are gone — nothing emitted
+   that class — so everything below wants to move to its own chip.css. */
+.chip {
+  padding: var(--spacing-inset-xs) var(--spacing-inset-md);
+  border: 1px solid var(--mid-grey);
+  border-radius: 16px;
+  user-select: none;
+  width: fit-content;
+}
+
+.chip a {
+  text-decoration: none;
+}
+
+.chip--selectable {
+  cursor: pointer;
+}
+
+.chip--selectable:hover {
+  background-color: var(--grey-e7e7e7);
+}
+
+.chip--selected {
+  border-color: var(--color-primary);
+  color: var(--primary-blue);
+  background-color: var(--grey-e7e7e7);
+}
+
+.chip--selected:hover {
+  background-color: var(--white);
+}
+
+.chip-group {
+  display: flex;
+  flex-flow: wrap;
+}
+
+.category-chip {
+  margin-right: 1em;
+  margin-bottom: 0.5em;
+}
+
+/* @width-breakpoint-tablet */
+@media only screen and (min-width: 768px) {
+  .chip-group {
+    flex-direction: row;
+  }
+}

@@ -1,4 +1,158 @@
+from unittest.mock import Mock, PropertyMock, patch
+
+import pytest
+import web
+
 from openlibrary.core import models
+from openlibrary.mocks import mock_infobase
+from openlibrary.utils.request_context import Visitor, visitor
+from openlibrary.utils.request_context import site as site_var
+
+
+class _FakeGroup:
+    def __init__(self, key: str):
+        self.key = key
+
+
+class TestUserGroupMembership:
+    @pytest.mark.parametrize(
+        ("group_keys", "check_groups", "expected"),
+        [
+            ([], ["/usergroup/librarians"], False),
+            ([], ["/usergroup/librarians", "/usergroup/admin"], False),
+            (["/usergroup/librarians"], ["/usergroup/librarians"], True),
+            (["/usergroup/librarians"], ["/usergroup/admin"], False),
+            (["/usergroup/librarians", "/usergroup/admin"], ["/usergroup/librarians"], True),
+            (["/usergroup/admin"], ["/usergroup/librarians", "/usergroup/admin"], True),
+            (["/usergroup/admin"], ["/usergroup/librarians", "/usergroup/super-librarians"], False),
+            ([], [], False),
+        ],
+    )
+    def test_is_member_of_any(self, monkeypatch, group_keys, check_groups, expected):
+        groups = [_FakeGroup(k) for k in group_keys]
+        user = models.User(MockSite(), "/people/test", data={})
+        monkeypatch.setattr(
+            models.User,
+            "usergroups",
+            PropertyMock(return_value=groups),
+        )
+        assert user.is_member_of_any(check_groups) == expected
+
+    @pytest.mark.parametrize(
+        ("group_keys", "check_group", "expected"),
+        [
+            ([], "librarians", False),
+            ([], "/usergroup/librarians", False),
+            (["/usergroup/librarians"], "librarians", True),
+            (["/usergroup/librarians"], "/usergroup/librarians", True),
+            (["/usergroup/librarians"], "admin", False),
+            (["/usergroup/librarians"], "/usergroup/admin", False),
+            (["/usergroup/admin"], "librarians", False),
+            (["/usergroup/super-librarians"], "super-librarians", True),
+        ],
+    )
+    def test_is_usergroup_member(self, monkeypatch, group_keys, check_group, expected):
+        groups = [_FakeGroup(k) for k in group_keys]
+        user = models.User(MockSite(), "/people/test", data={})
+        monkeypatch.setattr(
+            models.User,
+            "usergroups",
+            PropertyMock(return_value=groups),
+        )
+        assert user.is_usergroup_member(check_group) == expected
+
+    def test_is_librarian_or_higher(self, monkeypatch):
+        user = models.User(MockSite(), "/people/test", data={})
+
+        monkeypatch.setattr(
+            models.User,
+            "usergroups",
+            PropertyMock(return_value=[_FakeGroup("/usergroup/librarians")]),
+        )
+        assert user.is_librarian_or_higher() is True
+
+        monkeypatch.setattr(
+            models.User,
+            "usergroups",
+            PropertyMock(return_value=[_FakeGroup("/usergroup/admin")]),
+        )
+        assert user.is_librarian_or_higher() is True
+
+        monkeypatch.setattr(
+            models.User,
+            "usergroups",
+            PropertyMock(return_value=[_FakeGroup("/usergroup/super-librarians")]),
+        )
+        assert user.is_librarian_or_higher() is True
+
+        monkeypatch.setattr(
+            models.User,
+            "usergroups",
+            PropertyMock(return_value=[]),
+        )
+        assert user.is_librarian_or_higher() is False
+
+    def test_is_librarian_or_higher_marks_the_visitor(self, monkeypatch):
+        monkeypatch.setattr(models.User, "usergroups", PropertyMock(return_value=[_FakeGroup("/usergroup/librarians")]))
+        token = visitor.set(me := Visitor(user_key="/people/test"))
+        try:
+            models.User(MockSite(), "/people/someone-else", data={}).is_librarian_or_higher()
+            assert me.is_librarian is False
+            models.User(MockSite(), "/people/test", data={}).is_librarian_or_higher()
+            assert me.is_librarian is True
+        finally:
+            visitor.reset(token)
+
+    def test_is_super_librarian_or_higher(self, monkeypatch):
+        user = models.User(MockSite(), "/people/test", data={})
+
+        monkeypatch.setattr(
+            models.User,
+            "usergroups",
+            PropertyMock(return_value=[_FakeGroup("/usergroup/super-librarians")]),
+        )
+        assert user.is_super_librarian_or_higher() is True
+
+        monkeypatch.setattr(
+            models.User,
+            "usergroups",
+            PropertyMock(return_value=[_FakeGroup("/usergroup/admin")]),
+        )
+        assert user.is_super_librarian_or_higher() is True
+
+        monkeypatch.setattr(
+            models.User,
+            "usergroups",
+            PropertyMock(return_value=[_FakeGroup("/usergroup/librarians")]),
+        )
+        assert user.is_super_librarian_or_higher() is False
+
+        monkeypatch.setattr(
+            models.User,
+            "usergroups",
+            PropertyMock(return_value=[]),
+        )
+        assert user.is_super_librarian_or_higher() is False
+
+
+class TestUserIsPrintDisabled:
+    """``User.is_printdisabled()`` must read the unified request context, not
+    ``web.cookies()``: FastAPI has no ``web.ctx``, so reading the ``pd``
+    cookie there always returned nothing and print-disabled patrons lost
+    Special Access on FastAPI-rendered carousels and partials.
+    """
+
+    def test_true_from_request_context(self, request_context_fixture, monkeypatch):
+        # Simulate FastAPI: no web.py request exists, so web.cookies() raises.
+        monkeypatch.setattr(web, "cookies", Mock(side_effect=RuntimeError("no web.py request")))
+        request_context_fixture(print_disabled=True)
+        user = models.User(MockSite(), "/people/test", data={})
+        assert user.is_printdisabled() is True
+
+    def test_false_from_request_context(self, request_context_fixture, monkeypatch):
+        monkeypatch.setattr(web, "cookies", Mock(side_effect=RuntimeError("no web.py request")))
+        user = models.User(MockSite(), "/people/test", data={})
+        assert user.is_printdisabled() is False
 
 
 class MockSite:
@@ -8,22 +162,20 @@ class MockSite:
     def _get_backreferences(self, thing):
         return {}
 
+
 class MockLendableEdition(models.Edition):
     def get_ia_collections(self):
-        return ['lendinglibrary']
+        return ["inlibrary"]
+
 
 class MockPrivateEdition(models.Edition):
     def get_ia_collections(self):
-        return ['lendinglibrary', 'georgetown-university-law-library-rr']
+        return ["inlibrary", "georgetown-university-law-library-rr"]
 
 
 class TestEdition:
     def mock_edition(self, edition_class):
-        data = {
-            "key": "/books/OL1M",
-            "type": {"key": "/type/edition"},
-            "title": "foo"
-        }
+        data = {"key": "/books/OL1M", "type": {"key": "/type/edition"}, "title": "foo"}
         return edition_class(MockSite(), "/books/OL1M", data=data)
 
     def test_url(self):
@@ -59,14 +211,60 @@ class TestEdition:
         e = self.mock_edition(MockPrivateEdition)
         assert not e.in_borrowable_collection()
 
+    @pytest.mark.parametrize(
+        ("isbn_or_asin", "expected"),
+        [
+            ("1111111111", ("1111111111", "")),  # ISBN 10
+            ("9780747532699", ("9780747532699", "")),  # ISBN 13
+            ("B06XYHVXVJ", ("", "B06XYHVXVJ")),  # ASIN
+            ("b06xyhvxvj", ("", "B06XYHVXVJ")),  # Lower case ASIN
+            ("", ("", "")),  # Nothing at all.
+        ],
+    )
+    def test_get_isbn_or_asin(self, isbn_or_asin, expected) -> None:
+        e: models.Edition = self.mock_edition(MockPrivateEdition)
+        got = e.get_isbn_or_asin(isbn_or_asin)
+        assert got == expected
+
+    @pytest.mark.parametrize(
+        ("isbn", "asin", "expected"),
+        [
+            ("1111111111", "", True),  # ISBN 10
+            ("", "B06XYHVXVJ", True),  # ASIN
+            ("9780747532699", "", True),  # ISBN 13
+            ("0", "", False),  # Invalid ISBN length
+            ("", "0", False),  # Invalid ASIN length
+            ("", "", False),  # Nothing at all.
+        ],
+    )
+    def test_is_valid_identifier(self, isbn, asin, expected) -> None:
+        e: models.Edition = self.mock_edition(MockPrivateEdition)
+        got = e.is_valid_identifier(isbn=isbn, asin=asin)
+        assert got == expected
+
+    @pytest.mark.parametrize(
+        ("isbn", "asin", "expected"),
+        [
+            ("1111111111", "", ["1111111111", "9781111111113"]),
+            ("9780747532699", "", ["0747532699", "9780747532699"]),
+            ("", "B06XYHVXVJ", ["B06XYHVXVJ"]),
+            (
+                "9780747532699",
+                "B06XYHVXVJ",
+                ["0747532699", "9780747532699", "B06XYHVXVJ"],
+            ),
+            ("", "", []),
+        ],
+    )
+    def test_get_identifier_forms(self, isbn: str, asin: str, expected: list[str]) -> None:
+        e: models.Edition = self.mock_edition(MockPrivateEdition)
+        got = e.get_identifier_forms(isbn=isbn, asin=asin)
+        assert got == expected
+
 
 class TestAuthor:
     def test_url(self):
-        data = {
-            "key": "/authors/OL1A",
-            "type": {"key": "/type/author"},
-            "name": "foo"
-        }
+        data = {"key": "/authors/OL1A", "type": {"key": "/type/author"}, "name": "foo"}
 
         e = models.Author(MockSite(), "/authors/OL1A", data=data)
 
@@ -84,39 +282,53 @@ class TestAuthor:
 
 class TestSubject:
     def test_url(self):
-        subject = models.Subject({
-            "key": "/subjects/love"
-        })
+        subject = models.Subject({"key": "/subjects/love"})
         assert subject.url() == "/subjects/love"
         assert subject.url("/lists") == "/subjects/love/lists"
 
 
-class TestList:
-    def test_owner(self):
-        models.register_models()
-        self._test_list_owner("/people/anand")
-        self._test_list_owner("/people/anand-test")
-        self._test_list_owner("/people/anand_test")
+class TestWork:
+    def test_resolve_redirect_chain(self, monkeypatch):
+        # e.g. https://openlibrary.org/works/OL2163721W.json
 
-    def _test_list_owner(self, user_key):
-        from openlibrary.mocks.mock_infobase import MockSite
-        site = MockSite()
-        list_key = user_key + "/lists/OL1L"
+        # Chain:
+        type_redir = {"key": "/type/redirect"}
+        type_work = {"key": "/type/work"}
+        work1_key = "/works/OL123W"
+        work2_key = "/works/OL234W"
+        work3_key = "/works/OL345W"
+        work4_key = "/works/OL456W"
+        work1 = {"key": work1_key, "location": work2_key, "type": type_redir}
+        work2 = {"key": work2_key, "location": work3_key, "type": type_redir}
+        work3 = {"key": work3_key, "location": work4_key, "type": type_redir}
+        work4 = {"key": work4_key, "type": type_work}
 
-        self.save_doc(site, "/type/user", user_key)
-        self.save_doc(site, "/type/list", list_key)
+        mock_site = mock_infobase.MockSite()
+        mock_site.save(web.storage(work1))
+        mock_site.save(web.storage(work2))
+        mock_site.save(web.storage(work3))
+        mock_site.save(web.storage(work4))
+        monkeypatch.setattr(web.ctx, "site", mock_site, raising=False)
+        token = site_var.set(mock_site)
 
-        list =  site.get(list_key)
-        assert list is not None
-        assert isinstance(list, models.List)
+        try:
+            work_key = "/works/OL123W"
+            redirect_chain = models.Work.get_redirect_chain(work_key)
+            assert redirect_chain
+            resolved_work = redirect_chain[-1]
+            assert str(resolved_work.type) == type_work["key"], f"{resolved_work} of type {resolved_work.type} should be {type_work['key']}"
+            assert resolved_work.key == work4_key, f"Should be work4.key: {resolved_work}"
+        finally:
+            site_var.reset(token)
 
-        assert list.get_owner() is not None
-        assert list.get_owner().key == user_key
 
-    def save_doc(self, site, type, key, **fields):
-        d = {
-            "key": key,
-            "type": {"key": type}
-        }
-        d.update(fields)
-        site.save(d)
+class TestLoggedBooksDataLoadRatings:
+    def test_load_ratings_batches_and_keeps_doc_order(self):
+        docs = [web.storage(key=key) for key in ("/works/OL3W", "/works/OL1W", "/works/OL2W")]
+        data = models.LoggedBooksData(username="alice", page_size=25, total_results=3, shelf_totals={}, docs=docs)
+
+        with patch.object(models.Ratings, "get_users_ratings_of_works_sync", return_value={1: 5, 3: 2}) as get_ratings:
+            data.load_ratings()
+
+        get_ratings.assert_called_once_with("alice", [3, 1, 2])
+        assert data.ratings == [2, 5, 0]

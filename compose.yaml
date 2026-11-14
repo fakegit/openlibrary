@@ -1,0 +1,123 @@
+services:
+  web:
+    image: "${OLIMAGE:-oldev:latest}"
+    environment:
+      - OL_CONFIG=${OL_CONFIG:-/openlibrary/conf/openlibrary.yml}
+      - GUNICORN_OPTS=${GUNICORN_OPTS:- --reload --workers 1 --timeout 180}
+      - OL_COVERSTORE_PUBLIC_URL=${OL_COVERSTORE_PUBLIC_URL:-}
+    command: docker/ol-web-start.sh
+    networks:
+      - webnet
+      - dbnet
+    logging:
+      options:
+        max-size: "512m"
+        max-file: "4"
+
+  fast_web:
+    image: "${OLIMAGE:-oldev:latest}"
+    environment:
+      - OL_CONFIG=${OL_CONFIG:-/openlibrary/conf/openlibrary.yml}
+      - GUNICORN_OPTS=${GUNICORN_OPTS:- --reload --workers 1 --timeout 180 --max-requests 500}
+      - OL_COVERSTORE_PUBLIC_URL=${OL_COVERSTORE_PUBLIC_URL:-}
+    command: docker/ol-web-fastapi-start.sh
+    networks:
+      - webnet
+      - dbnet
+    logging:
+      options:
+        max-size: "512m"
+        max-file: "4"
+
+  solr:
+    image: solr:10.0.0
+    expose:
+      - 8983
+    environment:
+      # - autoSoftCommit.maxTime: Soft commit frequently to make sure changes are visible in search
+      # - autoCommit.maxTime: Hard commit less frequently to avoid performance impact, but avoid
+      #   having very large transaction log
+      #   https://solr.apache.org/guide/solr/latest/configuration-guide/commits-transaction-logs.html
+      # - max.booleanClauses: Enlarge the max boolean clauses; some queries build a
+      #   large OR clause per seed/key (e.g. list seed facet fetching in
+      #   openlibrary/solr/updater/list.py), which can exceed Solr's default of 1024.
+      # - environment: Setting to dev/test/prod/stage adds a tag to the admin interface.
+      #   Useful to distinguish between different solr instances.
+      #
+      # Keep SOLR_OPTS in sync with other instances of solr in compose files
+      - SOLR_OPTS=
+        -Dsolr.autoSoftCommit.maxTime=60000
+        -Dsolr.autoCommit.maxTime=120000
+        -Dsolr.max.booleanClauses=30000
+        -Dsolr.environment=dev
+      - SOLR_MODULES=analysis-extras
+    volumes:
+      - solr-data:/var/solr
+      - ./conf/solr:/opt/solr/server/solr/configsets/olconfig:ro
+    networks:
+      - webnet
+    logging:
+      options:
+        max-size: "512m"
+        max-file: "4"
+    command: solr-precreate openlibrary /opt/solr/server/solr/configsets/olconfig
+
+  solr-updater:
+    image: "${OLIMAGE:-oldev:latest}"
+    command: docker/ol-solr-updater-start.sh
+    hostname: "$HOSTNAME"
+    init: true
+    environment:
+      - OL_CONFIG=conf/openlibrary.yml
+      - OL_URL=http://web:8080/
+      - STATE_FILE=solr-update.offset
+      - TRENDING_OFFSET_FILE=trending-update.offset
+    volumes:
+      - solr-updater-data:/solr-updater-data
+    networks:
+      - webnet
+      - dbnet
+
+  memcached:
+    image: memcached
+    networks:
+      - webnet
+
+  covers:
+    image: "${OLIMAGE:-oldev:latest}"
+    environment:
+      - COVERSTORE_CONFIG=${COVERSTORE_CONFIG:-/openlibrary/conf/coverstore.yml}
+      - GUNICORN_OPTS=${GUNICORN_OPTS:- --reload --workers 1 --max-requests 250}
+    command: docker/ol-covers-start.sh
+    expose:
+      - 7075
+    networks:
+      - webnet
+      - dbnet
+    logging:
+      options:
+        max-size: "512m"
+        max-file: "4"
+
+  infobase:
+    image: "${OLIMAGE:-oldev:latest}"
+    environment:
+      - INFOBASE_CONFIG=${INFOBASE_CONFIG:-/openlibrary/conf/infobase.yml}
+      - INFOBASE_OPTS=${INFOBASE_OPTS:-}
+    command: docker/ol-infobase-start.sh
+    expose:
+      - 7000
+    networks:
+      - webnet
+      - dbnet
+    logging:
+      options:
+        max-size: "512m"
+        max-file: "4"
+
+networks:
+  webnet:
+  dbnet:
+volumes:
+  solr-data:
+  solr-updater-data:

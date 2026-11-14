@@ -1,0 +1,16 @@
+$def with(link, analytics_attr)
+
+$if link:
+  <div class="cta-button-group">
+    <a
+      class="cta-btn"
+      href="$link"
+      $:analytics_attr('NotInLibrary')
+    >$_('Not in Library')</a>
+  </div>
+$else:
+  $# Nothing to act on, so this reads as a status line rather than a button,
+  $# like the waitlist notes under the book page CTAs.
+  <div class="cta-button-group">
+    <p class="waitinglist-message"><span>$_('Not in Library')</span></p>
+  </div>

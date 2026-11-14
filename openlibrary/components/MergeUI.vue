@@ -1,0 +1,228 @@
+<template>
+    <div id="app">
+        <div v-if="!olids.length">No records to merge. Specify some records in the url like so: <code>?records=OL123W,OL234W</code></div>
+        <template v-else>
+            <MergeTable ref="mergeTable" :olids="olids" :show-diffs="showDiffs" :primary="primary" />
+            <div class="action-bar">
+                <div class="comment-input">
+                    <label for="comment">Comment: </label>
+                    <input v-model="comment" name="comment" type="text" />
+                </div>
+                <div class="btn-group">
+                    <button class="merge-btn" :disabled="isDisabled" @click="doMerge">
+                        {{ mergeStatus }}
+                    </button>
+                    <button v-if="showRejectButton" class="reject-btn" @click="rejectMerge">Reject Merge</button>
+                </div>
+                <div id="diffs-toggle">
+                    <label>
+                        <input v-model="showDiffs" type="checkbox" title="Show textual differences" />
+                        Show text diffs
+                    </label>
+                </div>
+            </div>
+            <pre v-if="mergeOutput">{{ mergeOutput }}</pre>
+        </template>
+    </div>
+</template>
+
+<script>
+import MergeTable from './MergeUI/MergeTable.vue';
+import { do_merge, update_merge_request, createMergeRequest, DEFAULT_EDITION_LIMIT } from './MergeUI/utils.js';
+
+const DO_MERGE = 'Do Merge';
+const REQUEST_MERGE = 'Request Merge';
+const LOADING = 'Loading...';
+const SAVING = 'Saving...';
+
+export default {
+    name: 'App',
+    components: {
+        MergeTable
+    },
+    props: {
+        mrid: {
+            type: [Number, String],
+            required: false,
+            default: ''
+        },
+        primary: {
+            type: String,
+            required: false,
+            default: ''
+        },
+        canmerge: {
+            type: String,
+            required: false,
+            default: 'true'
+        }
+    },
+    data() {
+        return {
+            url: new URL(location.toString()),
+            mergeStatus: LOADING,
+            mergeOutput: null,
+            showDiffs: false,
+            comment: ''
+        };
+    },
+    computed: {
+        olids() {
+            const olidsString = this.url.searchParams.get('records');
+            if (!olidsString) return [];
+            return (
+                olidsString
+                    .split(',')
+                    // Ignore trailing commas
+                    .filter(Boolean)
+            );
+        },
+
+        isSuperLibrarian() {
+            return this.canmerge === 'true';
+        },
+
+        isDisabled() {
+            return this.mergeStatus !== DO_MERGE && this.mergeStatus !== REQUEST_MERGE;
+        },
+
+        showRejectButton() {
+            return this.mrid && this.isSuperLibrarian;
+        }
+    },
+    mounted() {
+        const readyCta = this.isSuperLibrarian ? DO_MERGE : REQUEST_MERGE;
+        this.$watch('$refs.mergeTable.merge', new_value => {
+            if (new_value !== undefined && this.mergeStatus === LOADING) this.mergeStatus = readyCta;
+        });
+    },
+    methods: {
+        async doMerge() {
+            if (!this.$refs.mergeTable.merge) return;
+            const { record: master, dupes, editions_to_move, unmergeable_works } = this.$refs.mergeTable.merge;
+
+            // A merge writes `works` pointing at the master and copies work-shaped fields
+            // onto it, so the target must be a work (see #13390).
+            if (master.type.key !== '/type/work') {
+                this.mergeOutput = 'The primary record must be a work — editions can be included in a merge, but not chosen as the primary.';
+                return;
+            }
+
+            this.mergeStatus = SAVING;
+            if (this.isSuperLibrarian) {
+                // Perform the merge and create new/update existing merge request
+                try {
+                    if (unmergeable_works.length) {
+                        throw new Error(`Could not merge: ${unmergeable_works.join(', ')} has more than ${DEFAULT_EDITION_LIMIT} editions.`);
+                    }
+                    const r = await do_merge(master, dupes, editions_to_move, this.mrid);
+                    if (r.status === 403) {
+                        throw new Error('Merge failed, your account may be missing the /usergroup/api permission.');
+                    }
+                    if (!r.ok) {
+                        // Don't report success or record the merge request when the save failed
+                        throw new Error(`Merge failed (HTTP ${r.status}): ${await r.text()}`);
+                    }
+                    this.mergeOutput = await r.json();
+                    if (this.mrid) {
+                        await update_merge_request(this.mrid, 'approve', this.comment);
+                    } else {
+                        const workIds = [master.key].concat(Array.from(dupes, item => item.key));
+                        await createMergeRequest(workIds);
+                    }
+                } catch (e) {
+                    this.mergeOutput = e.message;
+                    this.mergeStatus = this.isSuperLibrarian ? DO_MERGE : REQUEST_MERGE;
+                    throw e;
+                }
+            } else {
+                // Create a new merge request with "pending" status
+                const workIds = [master.key].concat(Array.from(dupes, item => item.key));
+                const splitKey = master.key.split('/');
+                const primaryRecord = splitKey[splitKey.length - 1];
+                await createMergeRequest(workIds, primaryRecord, 'create-pending', this.comment)
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.status === 'ok') {
+                            // Redirect to merge table on success:
+                            window.location.replace(`/merges#mrid-${data.id}`);
+                        }
+                    });
+            }
+            this.mergeStatus = 'Done';
+        },
+
+        async rejectMerge() {
+            try {
+                await update_merge_request(this.mrid, 'decline', this.comment);
+                this.mergeOutput = 'Merge request closed';
+            } catch (e) {
+                this.mergeOutput = e.message;
+                throw e;
+            }
+            this.mergeStatus = 'Reject Merge';
+        }
+    }
+};
+</script>
+
+<style>
+#app {
+    font-family: monospace;
+}
+
+#app div#diffs-toggle {
+    float: right;
+    padding: 4px 8px 0 0;
+}
+
+.btn-group {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 5px;
+    padding: 5px;
+}
+
+.btn-group > button {
+    font-size: 1.3em;
+    padding: 10px;
+    margin: 5px;
+    border: none;
+    border-radius: 5px;
+    color: white;
+}
+
+.btn-group .merge-btn {
+    background-color: rgb(76, 118, 76);
+}
+.btn-group .merge-btn:hover {
+    background-color: rgb(100, 156, 100);
+}
+
+.btn-group .merge-btn[disabled] {
+    background-color: rgb(117, 117, 117);
+}
+.btn-group .merge-btn[disabled]:hover {
+    background-color: rgb(117, 117, 117);
+}
+.btn-group .reject-btn {
+    background-color: rgb(125, 43, 43);
+}
+.btn-group .reject-btn:hover {
+    background-color: rgb(161, 56, 56);
+}
+
+.comment-input {
+    display: flex;
+    flex-direction: column;
+    padding: 0 5px 5px 10px;
+}
+
+.comment-input input {
+    width: 90%;
+}
+
+.action-bar {
+    margin: 5px;
+}
+</style>

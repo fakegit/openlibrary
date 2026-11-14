@@ -12,15 +12,17 @@ http://www.archive.org/download/ol-sitemaps/sitindex-authors.xml.gz
 http://www.archive.org/download/ol-sitemaps/sitindex-works.xml.gz
 http://www.archive.org/download/ol-sitemaps/sitindex-subjects.xml.gz
 """
-from __future__ import print_function
 
-import sys
+import datetime as dt
 import os
-import web
-import datetime
+import sys
 from gzip import open as gzopen
 
-from openlibrary.plugins.openlibrary.processors import urlsafe
+import web
+
+from openlibrary.plugins.openlibrary.processors import (
+    urlsafe,  # noqa: F401 side effects may be needed
+)
 
 t = web.template.Template
 
@@ -70,12 +72,12 @@ $for path, title in docs:
 
 
 def gzwrite(path, data):
-    f = gzopen(path, 'w')
-    f.write(data)
-    f.close()
+    with gzopen(path, "w") as file:
+        file.write(data)
+
 
 def write_sitemaps(data, outdir, prefix):
-    timestamp = datetime.datetime.utcnow().isoformat() + 'Z'
+    timestamp = dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat() + "Z"
 
     # maximum permitted entries in one sitemap is 50K.
     for i, rows in enumerate(web.group(data, 50000)):
@@ -87,6 +89,7 @@ def write_sitemaps(data, outdir, prefix):
         path = os.path.join(outdir, filename)
         gzwrite(path, sitemap)
         yield filename, timestamp
+
 
 def write_siteindex(data, outdir, prefix):
     rows = write_sitemaps(data, outdir, prefix)
@@ -100,26 +103,31 @@ def write_siteindex(data, outdir, prefix):
 
     gzwrite(path, siteindex)
 
+
 def parse_index_file(index_file):
-    data = (line.strip().split("\t") for line in open(index_file))
-    data = ([t[0], " ".join(t[1:-2]), t[-2], t[-1]] for t in data)
+    with open(index_file) as file:
+        data = (line.strip().split("\t") for line in file)
+        data = ([t[0], " ".join(t[1:-2]), t[-2], t[-1]] for t in data)
     return data
+
 
 def generate_sitemaps(index_file, outdir, prefix):
     data = parse_index_file(index_file)
     write_siteindex(data, outdir, prefix)
 
+
 def mkdir_p(dir):
     if not os.path.exists(dir):
         os.makedirs(dir)
+
 
 def write(path, data):
     print("writing", path)
     mkdir_p(os.path.dirname(path))
 
-    f = open(path, "w")
-    f.write(data)
-    f.close()
+    with open(path, "w") as file:
+        file.write(data)
+
 
 def dirindex(dir, back=".."):
     data = [(f, f) for f in sorted(os.listdir(dir))]
@@ -127,6 +135,7 @@ def dirindex(dir, back=".."):
 
     path = dir + "/index.html"
     write(path, web.safestr(index))
+
 
 def generate_html_index(index_file, outdir):
     data = parse_index_file(index_file)
@@ -136,7 +145,7 @@ def generate_html_index(index_file, outdir):
         back = ".."
         index = t_html_layout(t_html_sitemap(back, chunk))
 
-        path = outdir + "/%02d/%05d.html" % (i/1000, i)
+        path = outdir + "/%02d/%05d.html" % (i / 1000, i)
         write(path, web.safestr(index))
 
     for f in os.listdir(outdir):

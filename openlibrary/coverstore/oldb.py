@@ -1,5 +1,6 @@
-"""Library to talk directly to OL database to avoid expensive API calls.
-"""
+"""Library to talk directly to OL database to avoid expensive API calls."""
+
+import functools
 import json
 
 import web
@@ -7,28 +8,34 @@ import web
 from openlibrary.coverstore import config
 from openlibrary.utils import olmemcache
 
-__all__ = [
-    "query", "get"
-]
+__all__ = ["get", "query"]
+
 
 def is_supported():
     return bool(config.get("ol_db_parameters"))
 
+
 _db = None
+
+
 def get_db():
     global _db
     if _db is None and config.get("ol_db_parameters"):
         _db = web.database(**config.ol_db_parameters)
     return _db
 
+
 _memcache = None
+
+
 def get_memcache():
     global _memcache
     if _memcache is None and config.get("ol_memcache_servers"):
         _memcache = olmemcache.Client(config.ol_memcache_servers)
     return _memcache
 
-@web.memoize
+
+@functools.cache
 def get_property_id(name):
     db = get_db()
     try:
@@ -38,23 +45,21 @@ def get_property_id(name):
     except IndexError:
         return None
 
+
 def query(key, value):
     key_id = get_property_id(key)
 
     db = get_db()
-    rows = db.query("SELECT thing.key" +
-        " FROM thing, edition_str" +
-        " WHERE thing.id=edition_str.thing_id" +
-            " AND key_id=$key_id" +
-            " AND value=$value" +
-        " ORDER BY thing.last_modified LIMIT 10",
-        vars=locals())
+    rows = db.query(
+        "SELECT thing.key FROM thing, edition_str WHERE thing.id=edition_str.thing_id AND key_id=$key_id AND value=$value ORDER BY thing.last_modified LIMIT 10",
+        vars=locals(),
+    )
     return [row.key for row in rows]
+
 
 def get(key):
     # try memcache
-    memcache = get_memcache()
-    if memcache:
+    if memcache := get_memcache():
         json_data = memcache.get(key)
         if json_data:
             return json.loads(json_data)
@@ -63,7 +68,10 @@ def get(key):
     db = get_db()
     try:
         thing = db.query("SELECT * FROM thing WHERE key=$key", vars=locals())[0]
-        data = db.query("SELECT * FROM data WHERE data.thing_id=$thing.id AND data.revision=$thing.latest_revision", vars=locals())[0]
+        data = db.query(
+            "SELECT * FROM data WHERE data.thing_id=$thing.id AND data.revision=$thing.latest_revision",
+            vars=locals(),
+        )[0]
         return json.loads(data.data)
     except IndexError:
         return None

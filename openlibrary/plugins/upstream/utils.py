@@ -1,78 +1,135 @@
-import web
+import datetime as dt
+import functools
+import itertools
 import json
+import logging
+import os
+import re
+import unicodedata
+import urllib
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+from collections.abc import Callable, Generator, Iterable, Iterator, MutableMapping
+from html import unescape
+from html.parser import HTMLParser
+from typing import TYPE_CHECKING, Any, Literal, Protocol
+from urllib.parse import (
+    parse_qs,
+    quote,
+    quote_plus,
+    urlparse,
+    urlunparse,
+)
+from urllib.parse import urlencode as og_urlencode
+from urllib.parse import (
+    urlencode as parse_urlencode,
+)
+
 import babel
 import babel.core
 import babel.dates
-from collections import defaultdict
-import re
-import random
-import xml.etree.ElementTree as etree
-import datetime
-import logging
-
 import requests
-
-import six
-from six.moves import urllib
-from six.moves.collections_abc import MutableMapping
-from six.moves.urllib.parse import parse_qs, urlencode as parse_urlencode, urlparse, urlunparse
+import web
+import yaml
+from babel.lists import format_list
+from web.template import TemplateResult
+from web.utils import Storage
 
 from infogami import config
-from infogami.utils import view, delegate, stats
-from infogami.utils.view import render, get_template, public, query_param
+from infogami.infobase import client
+from infogami.infobase.client import Changeset, Nothing, Thing, storify
+from infogami.infobase.common import parse_query
+from infogami.utils import delegate, stats, view
+from infogami.utils.context import InfogamiContext, context
 from infogami.utils.macro import macro
-from infogami.utils.context import context
-from infogami.infobase.client import Thing, Changeset, storify
-
-from openlibrary.core.helpers import commify, parse_datetime
+from infogami.utils.view import (
+    get_template,
+    public,
+    render,
+)
+from openlibrary.core import cache
+from openlibrary.core.helpers import commify, parse_datetime, truncate
 from openlibrary.core.middleware import GZipMiddleware
-from openlibrary.core import cache, ab
+from openlibrary.utils import normalize_subject_name, request_context
+
+if TYPE_CHECKING:
+    from openlibrary.plugins.upstream.models import (
+        Author,
+        Edition,
+        Work,
+    )
+
+
+STRIP_CHARS = ",'\" "
+REPLACE_CHARS = "]["
+
+logger = logging.getLogger("openlibrary")
+
+
+class LanguageMultipleMatchError(Exception):
+    """Exception raised when more than one possible language match is found."""
+
+    def __init__(self, language_name):
+        self.language_name = language_name
+
+
+class LanguageNoMatchError(Exception):
+    """Exception raised when no matching languages are found."""
+
+    def __init__(self, language_name):
+        self.language_name = language_name
+
 
 class MultiDict(MutableMapping):
     """Ordered Dictionary that can store multiple values.
 
-        >>> d = MultiDict()
-        >>> d['x'] = 1
-        >>> d['x'] = 2
-        >>> d['y'] = 3
-        >>> d['x']
-        2
-        >>> d['y']
-        3
-        >>> d['z']
-        Traceback (most recent call last):
-            ...
-        KeyError: 'z'
-        >>> list(d)
-        ['x', 'x', 'y']
-        >>> list(d.items())
-        [('x', 1), ('x', 2), ('y', 3)]
-        >>> list(d.multi_items())
-        [('x', [1, 2]), ('y', [3])]
+    Must be initialized without an `items` parameter, or `items` must be an
+    iterable of two-value sequences. E.g., items=(('a', 1), ('b', 2))
+
+    >>> d = MultiDict()
+    >>> d['x'] = 1
+    >>> d['x'] = 2
+    >>> d['y'] = 3
+    >>> d['x']
+    2
+    >>> d['y']
+    3
+    >>> d['z']
+    Traceback (most recent call last):
+        ...
+    KeyError: 'z'
+    >>> list(d)
+    ['x', 'x', 'y']
+    >>> list(d.items())
+    [('x', 1), ('x', 2), ('y', 3)]
+    >>> list(d.multi_items())
+    [('x', [1, 2]), ('y', [3])]
+    >>> d1 = MultiDict(items=(('a', 1), ('b', 2)), a=('x', 10, 11, 12))
+    >>> list(d1.multi_items())
+    [('a', [1, ('x', 10, 11, 12)]), ('b', [2])]
     """
-    def __init__(self, items=(), **kw):
-        self._items = []
+
+    def __init__(self, items: Iterable[tuple[Any, Any]] = (), **kw) -> None:
+        self._items: list = []
 
         for k, v in items:
             self[k] = v
         self.update(kw)
 
     def __getitem__(self, key):
-        values = self.getall(key)
-        if values:
+        if values := self.getall(key):
             return values[-1]
         else:
             raise KeyError(key)
 
-    def __setitem__(self, key, value):
+    def __setitem__(self, key: str, value: Any) -> None:
         self._items.append((key, value))
 
     def __delitem__(self, key):
         self._items = [(k, v) for k, v in self._items if k != key]
 
     def __iter__(self):
-        for key in self.keys():
-            yield key
+        yield from self.keys()
 
     def __len__(self):
         return len(list(self.keys()))
@@ -81,18 +138,21 @@ class MultiDict(MutableMapping):
         return [v for k, v in self._items if k == key]
 
     def keys(self):
-        return [k for k, v in self._items]
+        return [k for k, _ in self._items]
 
-    def values(self):
-        return [v for k, v in self._items]
+    # Subclasses of MutableMapping should return a dictionary view object for
+    # the values() method, but this implementation returns a list.
+    # https://docs.python.org/3/library/stdtypes.html#dict-views
+    def values(self) -> list[Any]:  # type: ignore[override]
+        return [v for _, v in self._items]
 
     def items(self):
         return self._items[:]
 
-    def multi_items(self):
-        """Returns items as tuple of key and a list of values."""
+    def multi_items(self) -> list[tuple[str, list]]:
+        """Returns items as list of tuples of key and a list of values."""
         items = []
-        d = {}
+        d: dict = {}
 
         for k, v in self._items:
             if k not in d:
@@ -101,15 +161,16 @@ class MultiDict(MutableMapping):
             d[k].append(v)
         return items
 
+
 @macro
 @public
-def render_template(name, *a, **kw):
+def render_template(name: str, *a, **kw) -> TemplateResult:
     if "." in name:
         name = name.rsplit(".", 1)[0]
     return render[name](*a, **kw)
 
 
-def kebab_case(upper_camel_case):
+def kebab_case(upper_camel_case: str) -> str:
     """
     :param str upper_camel_case: Text in upper camel case (e.g. "HelloWorld")
     :return: text in kebab case (e.g. 'hello-world')
@@ -117,14 +178,22 @@ def kebab_case(upper_camel_case):
     >>> kebab_case('HelloWorld')
     'hello-world'
     >>> kebab_case("MergeUI")
-    'merge-u-i'
+    'merge-ui'
     """
-    parts = re.findall(r'[A-Z][^A-Z]*', upper_camel_case)
-    return '-'.join(parts).lower()
+    # Match positions where a lowercase letter is followed by an uppercase letter,
+    # or an uppercase letter is followed by another uppercase followed by a lowercase letter.
+    kebab = re.sub(r"([a-z])([A-Z])", r"\1-\2", upper_camel_case)  # Handle camel case boundaries
+    kebab = re.sub(r"([A-Z])([A-Z][a-z])", r"\1-\2", kebab)  # Handle acronyms
+    return kebab.lower()
 
 
 @public
-def render_component(name, attrs=None, json_encode=True):
+def render_component(
+    name: str,
+    attrs: dict | None = None,
+    json_encode: bool = True,
+    asyncDefer=False,
+) -> str:
     """
     :param str name: Name of the component (excluding extension)
     :param dict attrs: attributes to add to the component element
@@ -132,42 +201,56 @@ def render_component(name, attrs=None, json_encode=True):
     from openlibrary.plugins.upstream.code import static_url
 
     attrs = attrs or {}
-    attrs_str = ''
-    for (key, val) in attrs.items():
-        if json_encode and isinstance(val, dict) or isinstance(val, list):
+    attrs_str = ""
+    for key, val in attrs.items():
+        if (json_encode and isinstance(val, dict)) or isinstance(val, list):
             val = json.dumps(val)
-        attrs_str += ' %s="%s"' % (key, val.replace('"', "'"))
+            # On the Vue side use decodeURIComponent to decode
+            val = urllib.parse.quote(val)
+        attrs_str += f' {key}="{val}"'
+    html = ""
 
-    html = ''
-    included = web.ctx.setdefault("included-components", [])
-
-    if len(included) == 0:
-        # Need to include Vue
-        html += '<script src="%s"></script>' % static_url('build/vue.js')
-
-    if name not in included:
-        url = static_url('build/components/production/ol-%s.min.js' % name)
-        html += '<script src="%s"></script>' % url
+    if name not in (included := web.ctx.setdefault("included-components", [])):
+        url = static_url("build/components/production/ol-%s.js" % name)
+        script_attrs = "" if not asyncDefer else "async defer"
+        html += f'<script type="module" {script_attrs} src="{url}"></script>'
         included.append(name)
 
-    html += '<ol-%(name)s %(attrs)s></ol-%(name)s>' % {
-        'name': kebab_case(name),
-        'attrs': attrs_str,
-    }
+    html += f"<ol-{kebab_case(name)} {attrs_str}></ol-{kebab_case(name)}>"
     return html
 
 
 @public
-def get_error(name, *args):
-    """Return error with the given name from errors.tmpl template."""
-    return get_message_from_template("errors", name, args)
+def icon_sprite_url() -> str:
+    """Return the content-hashed URL of the icon sprite asset.
 
-@public
-def get_message(name, *args):
+    Used by the ``$:macros.icon()`` macro; client JS reads the same URL off the
+    ``<meta name="ol-icon-sprite">`` tag in shell/head.html.jinja instead. ``static_url``
+    hashes once per process, so a rebuild needs a web restart.
+
+    The sprite is generated, so a checkout that never ran ``make icons`` has no
+    file to hash. Fall back to the unhashed path: every icon draws blank, which
+    is obvious and cheap to fix, rather than 500ing every page that has one.
+    """
+    from openlibrary.plugins.upstream.code import static_url
+
+    try:
+        return static_url("icons/sprite.svg")
+    except OSError:
+        logger.warning("Icon sprite not found at static/icons/sprite.svg; run `make icons`")
+        return "/static/icons/sprite.svg"
+
+
+def render_macro(name, args, **kwargs):
+    return dict(web.template.Template.globals["macros"][name](*args, **kwargs))
+
+
+def get_message(name: str, *args) -> str:
     """Return message with given name from messages.tmpl template"""
     return get_message_from_template("messages", name, args)
 
-def get_message_from_template(template_name, name, args):
+
+def get_message_from_template(template_name: str, name: str, args: tuple[(Any, ...)]) -> str:
     d = render_template(template_name).get("messages", {})
     msg = d.get(name) or name.lower().replace("_", " ")
 
@@ -176,47 +259,54 @@ def get_message_from_template(template_name, name, args):
     else:
         return msg
 
-@public
-def list_recent_pages(path, limit=100, offset=0):
-    """Lists all pages with name path/* in the order of last_modified."""
-    q = {}
-
-    q['key~' ] = path + '/*'
-    # don't show /type/delete and /type/redirect
-    q['a:type!='] = '/type/delete'
-    q['b:type!='] = '/type/redirect'
-
-    q['sort'] = 'key'
-    q['limit'] = limit
-    q['offset'] = offset
-    q['sort'] = '-last_modified'
-    # queries are very slow with != conditions
-    # q['type'] != '/type/delete'
-    return web.ctx.site.get_many(web.ctx.site.things(q))
 
 @public
-def json_encode(d):
-    return json.dumps(d)
+def commify_list(items: Iterable[Any]) -> str:
+    # Not sure why lang is sometimes ''
 
-def unflatten(d, seperator="--"):
+    lang = request_context.req_context.get().lang or "en"
+
+    # If the list item is a template/html element, we strip it
+    # so that there is no space before the comma.
+    try:
+        commified_list = format_list([str(x).strip() for x in items], locale=lang)
+    except babel.UnknownLocaleError as e:
+        logger.warning(f"unknown language for commify_list: {lang}. {e}")
+        commified_list = format_list([str(x).strip() for x in items], locale="en")
+
+    return commified_list
+
+
+@public
+def json_encode(d, indent: int | str | None = None, sort_keys: bool = False) -> str:
+    if isinstance(d, Nothing):
+        d = []
+
+    # Escape < and > so the output is safe inside <script> tags with unescaped $: output.
+    # </> are valid JSON unicode escapes; all parsers decode them correctly.
+    return json.dumps(d, indent=indent, sort_keys=sort_keys).replace("<", "\\u003c").replace(">", "\\u003e")
+
+
+def unflatten(d: dict, separator: str = "--") -> Storage | list[Any]:
     """Convert flattened data into nested form.
 
-        >>> unflatten({"a": 1, "b--x": 2, "b--y": 3, "c--0": 4, "c--1": 5})
-        {'a': 1, 'c': [4, 5], 'b': {'y': 3, 'x': 2}}
-        >>> unflatten({"a--0--x": 1, "a--0--y": 2, "a--1--x": 3, "a--1--y": 4})
-        {'a': [{'x': 1, 'y': 2}, {'x': 3, 'y': 4}]}
+    >>> unflatten({"a": 1, "b--x": 2, "b--y": 3, "c--0": 4, "c--1": 5})
+    <Storage {'a': 1, 'b': <Storage {'x': 2, 'y': 3}>, 'c': [4, 5]}>
+    >>> unflatten({"a--0--x": 1, "a--0--y": 2, "a--1--x": 3, "a--1--y": 4})
+    <Storage {'a': [<Storage {'x': 1, 'y': 2}>, <Storage {'x': 3, 'y': 4}>]}>
 
     """
-    def isint(k):
+
+    def isint(k: Any) -> bool:
         try:
             int(k)
             return True
         except ValueError:
             return False
 
-    def setvalue(data, k, v):
-        if '--' in k:
-            k, k2 = k.split(seperator, 1)
+    def setvalue(data: dict, k, v) -> None:
+        if "--" in k:
+            k, k2 = k.split(separator, 1)
             setvalue(data.setdefault(k, {}), k2, v)
         else:
             data[k] = v
@@ -227,11 +317,11 @@ def unflatten(d, seperator="--"):
             if all(isint(k) for k in d):
                 return [makelist(d[k]) for k in sorted(d, key=int)]
             else:
-                return web.storage((k, makelist(v)) for k, v in d.items())
+                return Storage((k, makelist(v)) for k, v in d.items())
         else:
             return d
 
-    d2 = {}
+    d2: dict = {}
     for k, v in d.items():
         setvalue(d2, k, v)
     return makelist(d2)
@@ -247,7 +337,7 @@ def fuzzy_find(value, options, stopwords=None):
     if not options:
         return value
 
-    rx = web.re_compile(r"[-_\.&, ]+")
+    rx = re.compile(r"[-_\.&, ]+")
 
     # build word frequency
     d = defaultdict(list)
@@ -266,75 +356,80 @@ def fuzzy_find(value, options, stopwords=None):
     # take the option with maximum score
     return max(options, key=score.__getitem__)
 
+
 @public
-def radio_input(checked=False, **params):
-    params['type'] = 'radio'
+def radio_input(checked=False, **params) -> str:
+    params["type"] = "radio"
     if checked:
-        params['checked'] = "checked"
-    return "<input %s />" % " ".join(['%s="%s"' % (k, web.websafe(v)) for k, v in params.items()])
+        params["checked"] = "checked"
+    return "<input %s />" % " ".join([f'{k}="{web.websafe(v)}"' for k, v in params.items()])
+
+
+def get_coverstore_url() -> str:
+    return config.get("coverstore_url", "https://covers.openlibrary.org").rstrip("/")
+
 
 @public
-def radio_list(name, args, value):
-    html = []
-    for arg in args:
-        if isinstance(arg, tuple):
-            arg, label = arg
-        else:
-            label = arg
-        html.append(radio_input())
-
-@public
-def get_coverstore_url():
-    return config.get('coverstore_url', 'https://covers.openlibrary.org').rstrip('/')
+def get_coverstore_public_url() -> str:
+    if OL_COVERSTORE_PUBLIC_URL := os.environ.get("OL_COVERSTORE_PUBLIC_URL"):
+        return OL_COVERSTORE_PUBLIC_URL.rstrip("/")
+    else:
+        return config.get("coverstore_public_url", get_coverstore_url()).rstrip("/")
 
 
-def _get_changes_v1_raw(query, revision=None):
+def _get_changes_v1_raw(query: dict[str, str | int], revision: int | None = None) -> list[Storage]:
     """Returns the raw versions response.
 
     Revision is taken as argument to make sure a new cache entry is used when a new revision of the page is created.
     """
-    if 'env' not in web.ctx:
+    if "env" not in web.ctx:
         delegate.fakeload()
+        request_context.set_context_from_legacy_web_py()
 
-    versions = web.ctx.site.versions(query)
+    versions = request_context.site.get().versions(query)
 
     for v in versions:
         v.created = v.created.isoformat()
         v.author = v.author and v.author.key
 
         # XXX-Anand: hack to avoid too big data to be stored in memcache.
-        # v.changes is not used and it contrinutes to memcache bloat in a big way.
-        v.changes = '[]'
+        # v.changes is not used and it contributes to memcache bloat in a big way.
+        v.changes = "[]"
 
     return versions
 
-def get_changes_v1(query, revision=None):
+
+def get_changes_v1(query: dict[str, str | int], revision: int | None = None) -> list[Storage]:
     # uses the cached function _get_changes_v1_raw to get the raw data
     # and processes to before returning.
     def process(v):
-        v = web.storage(v)
+        v = Storage(v)
         v.created = parse_datetime(v.created)
-        v.author = v.author and web.ctx.site.get(v.author, lazy=True)
+        v.author = v.author and request_context.site.get().get(v.author, lazy=True)
         return v
 
     return [process(v) for v in _get_changes_v1_raw(query, revision)]
 
-def _get_changes_v2_raw(query, revision=None):
+
+def _get_changes_v2_raw(query: dict[str, str | int], revision: int | None = None) -> list[dict]:
     """Returns the raw recentchanges response.
 
     Revision is taken as argument to make sure a new cache entry is used when a new revision of the page is created.
     """
-    if 'env' not in web.ctx:
+    if "env" not in web.ctx:
         delegate.fakeload()
+        request_context.set_context_from_legacy_web_py()
 
-    changes = web.ctx.site.recentchanges(query)
+    changes = request_context.site.get().recentchanges(query)
     return [c.dict() for c in changes]
 
-# XXX-Anand: disabled temporarily to avoid too much memcache usage.
-#_get_changes_v2_raw = cache.memcache_memoize(_get_changes_v2_raw, key_prefix="upstream._get_changes_v2_raw", timeout=10*60)
 
-def get_changes_v2(query, revision=None):
-    page = web.ctx.site.get(query['key'])
+# XXX-Anand: disabled temporarily to avoid too much memcache usage.
+# _get_changes_v2_raw = cache.memcache_memoize(_get_changes_v2_raw, key_prefix="upstream._get_changes_v2_raw", timeout=10*60)
+
+
+def get_changes_v2(query: dict[str, str | int], revision: int | None = None) -> list[Changeset]:
+    page = request_context.site.get().get(query["key"])
 
     def first(seq, default=None):
         try:
@@ -343,7 +438,7 @@ def get_changes_v2(query, revision=None):
             return default
 
     def process_change(change):
-        change = Changeset.create(web.ctx.site, storify(change))
+        change = Changeset.create(request_context.site.get(), storify(change))
         change.thing = page
         change.key = page.key
         change.revision = first(c.revision for c in change.changes if c.key == page.key)
@@ -359,43 +454,53 @@ def get_changes_v2(query, revision=None):
         t = get_template("recentchanges/" + change.kind + "/comment") or get_template("recentchanges/default/comment")
         return t(change, page)
 
-    query['key'] = page.key
+    query["key"] = page.key
     changes = _get_changes_v2_raw(query, revision=page.revision)
     return [process_change(c) for c in changes]
 
-def get_changes(query, revision=None):
+
+def get_changes(query: dict[str, str | int], revision: int | None = None) -> list[Changeset]:
     return get_changes_v2(query, revision=revision)
 
+
 @public
-def get_history(page):
-    h = web.storage(revision=page.revision, lastest_revision=page.revision, created=page.created)
+def get_history(page: Work | Author | Edition) -> Storage:
+    h = Storage(revision=page.revision, lastest_revision=page.revision, created=page.created)
     if h.revision < 5:
         h.recent = get_changes({"key": page.key, "limit": 5}, revision=page.revision)
         h.initial = h.recent[-1:]
         h.recent = h.recent[:-1]
     else:
-        h.initial = get_changes({"key": page.key, "limit": 1, "offset": h.revision-1}, revision=page.revision)
+        h.initial = get_changes(
+            {"key": page.key, "limit": 1, "offset": h.revision - 1},
+            revision=page.revision,
+        )
         h.recent = get_changes({"key": page.key, "limit": 4}, revision=page.revision)
 
     return h
 
+
 @public
 def get_version(key, revision):
     try:
-        return web.ctx.site.versions({"key": key, "revision": revision, "limit": 1})[0]
+        return request_context.site.get().versions({"key": key, "revision": revision, "limit": 1})[0]
     except IndexError:
         return None
 
+
 @public
-def get_recent_author(doc):
-    versions = get_changes_v1({'key': doc.key, 'limit': 1, "offset": 0}, revision=doc.revision)
+def get_recent_author(doc: Work) -> Thing | None:
+    versions = get_changes_v1({"key": doc.key, "limit": 1, "offset": 0}, revision=doc.revision)
     if versions:
         return versions[0].author
+    return None
+
 
 @public
 def get_recent_accounts(limit=5, offset=0):
-    versions = web.ctx.site.versions({'type': '/type/user', 'revision': 1, 'limit': limit, 'offset': offset})
-    return web.ctx.site.get_many([v.key for v in versions])
+    versions = request_context.site.get().versions({"type": "/type/user", "revision": 1, "limit": limit, "offset": offset})
+    return request_context.site.get().get_many([v.key for v in versions])
+
 
 def get_locale():
     try:
@@ -403,87 +508,92 @@ def get_locale():
     except babel.core.UnknownLocaleError:
         return babel.Locale("en")
 
+
+class HasGetKeyRevision(Protocol):
+    key: str
+    revision: int
+
+    def get(self, item) -> Any: ...
+
+
 @public
-def process_version(v):
+def process_version(v: HasGetKeyRevision) -> HasGetKeyRevision:
     """Looks at the version and adds machine_comment required for showing "View MARC" link."""
     comments = [
         "found a matching marc record",
         "add publisher and source",
     ]
-    if v.key.startswith('/books/') and not v.get('machine_comment'):
-        thing = v.get('thing') or web.ctx.site.get(v.key, v.revision)
-        if thing.source_records and v.revision == 1 or (v.comment and v.comment.lower() in comments):
+
+    if v.key.startswith("/books/") and not v.get("machine_comment"):
+        thing = v.get("thing") or request_context.site.get().get(v.key, v.revision)
+        if (thing.source_records and v.revision == 1) or (
+            v.comment and v.comment.lower() in comments  # type: ignore [attr-defined]
+        ):
             marc = thing.source_records[-1]
-            if marc.startswith('marc:'):
-                v.machine_comment = marc[len("marc:"):]
+            if marc.startswith("marc:"):
+                v.machine_comment = marc[len("marc:") :]  # type: ignore [attr-defined]
             else:
-                v.machine_comment = marc
+                v.machine_comment = marc  # type: ignore [attr-defined]
     return v
 
-@public
-def is_thing(t):
-    return isinstance(t, Thing)
 
 @public
-def putctx(key, value):
+def is_thing(t) -> bool:
+    return isinstance(t, Thing)
+
+
+@public
+def putctx(key: str, value: str | bool) -> str:
     """Save a value in the context."""
     context[key] = value
     return ""
 
+
 class Metatag:
-    def __init__(self, tag="meta", **attrs):
+    def __init__(self, tag: str = "meta", **attrs) -> None:
         self.tag = tag
         self.attrs = attrs
 
-    def __str__(self):
-        attrs = ' '.join(
-            '%s="%s"' % (k, websafe(v))
-            for k, v in self.attrs.items())
-        return '<%s %s />' % (self.tag, attrs)
+    def __str__(self) -> str:
+        attrs = " ".join(f'{k}="{websafe(v)}"' for k, v in self.attrs.items())
+        return f"<{self.tag} {attrs} />"
 
-    def __repr__(self):
-        return 'Metatag(%s)' % str(self)
+    def __repr__(self) -> str:
+        return "Metatag(%s)" % str(self)
+
 
 @public
-def add_metatag(tag="meta", **attrs):
-    context.setdefault('metatags', [])
+def add_metatag(tag: str = "meta", **attrs) -> None:
+    context.setdefault("metatags", [])
     context.metatags.append(Metatag(tag, **attrs))
 
-@public
-def url_quote(text):
-    if isinstance(text, six.text_type):
-        text = text.encode('utf8')
+
+def url_quote(text: str | bytes) -> str:
+    if isinstance(text, str):
+        text = text.encode("utf8")
     return urllib.parse.quote_plus(text)
 
 
 @public
-def urlencode(dict_or_list_of_tuples):
+def urlencode(dict_or_list_of_tuples: dict | list[tuple[str, Any]], plus=True) -> str:
     """
     You probably want to use this, if you're looking to urlencode parameters. This will
     encode things to utf8 that would otherwise cause urlencode to error.
-    :param dict or list dict_or_list_of_tuples:
-    :rtype: basestring
     """
-    from six.moves.urllib.parse import urlencode as og_urlencode
+
     tuples = dict_or_list_of_tuples
     if isinstance(dict_or_list_of_tuples, dict):
-        tuples = dict_or_list_of_tuples.items()
-    params = [
-        (k, v.encode('utf-8') if isinstance(v, six.text_type) else v)
-        for (k, v) in tuples
-    ]
-    return og_urlencode(params)
+        tuples = list(dict_or_list_of_tuples.items())
+    params = [(k, v.encode("utf-8") if isinstance(v, str) else v) for (k, v) in tuples]
+    return og_urlencode(params, quote_via=quote_plus if plus else quote)
+
+
+def entity_decode(text: str) -> str:
+    return unescape(text)
 
 
 @public
-def entity_decode(text):
-    try:
-        return six.moves.html_parser.unescape(text)
-    except AttributeError:
-        return six.moves.html_parser.HTMLParser().unescape(text)
-
-@public
-def set_share_links(url='#', title='', view_context=None):
+def set_share_links(url: str = "#", title: str = "", view_context: InfogamiContext | None = None) -> None:
     """
     Constructs list share links for social platforms and assigns to view context attribute
 
@@ -494,131 +604,670 @@ def set_share_links(url='#', title='', view_context=None):
     """
     encoded_url = url_quote(url)
     text = url_quote("Check this out: " + entity_decode(title))
+    # `track` stays stable across renames so the Share|<track> analytics series doesn't split.
     links = [
-        {'text': 'Facebook', 'url': 'https://www.facebook.com/sharer/sharer.php?u=' + encoded_url},
-        {'text': 'Twitter', 'url': 'https://twitter.com/intent/tweet?url=%s&via=openlibrary&text=%s' % (encoded_url, text)},
-        {'text': 'Pinterest', 'url': 'https://pinterest.com/pin/create/link/?url=%s&description=%s' % (encoded_url, text)}
+        {
+            "text": "Facebook",
+            "url": "https://www.facebook.com/sharer/sharer.php?u=" + encoded_url,
+            "icon": "brand-facebook",
+            "track": "Facebook",
+        },
+        {
+            "text": "X (Twitter)",
+            "url": f"https://x.com/intent/post?url={encoded_url}&via=openlibrary&text={text}",
+            "icon": "brand-x",
+            "track": "Twitter",
+        },
+        {
+            "text": "Pinterest",
+            "url": f"https://pinterest.com/pin/create/link/?url={encoded_url}&description={text}",
+            "icon": "brand-pinterest",
+            "track": "Pinterest",
+        },
     ]
-    view_context.share_links = links
+    if view_context is not None:
+        view_context.share_links = links
 
-def pad(seq, size, e=None):
+
+@public
+def get_preserve_intent_attrs(action: str, title: str, item_type: str = "book", resume_url: str = "") -> str:
     """
-        >>> pad([1, 2], 4, 0)
-        [1, 2, 0, 0]
+    Generates data attributes for login-intent buttons.
+    Used for intent-preservation across login redirects.
     """
-    seq = seq[:]
-    while len(seq) < size:
-        seq.append(e)
-    return seq
+    attr = f'data-action="{web.websafe(action)}" data-title="{web.websafe(title)}" data-type="{web.websafe(item_type)}"'
+    if resume_url:
+        attr += f' data-resumeurl="{web.websafe(resume_url)}"'
+    return attr
 
-def parse_toc_row(line):
-    """Parse one row of table of contents.
 
-        >>> def f(text):
-        ...     d = parse_toc_row(text)
-        ...     return (d['level'], d['label'], d['title'], d['pagenum'])
-        ...
-        >>> f("* chapter 1 | Welcome to the real world! | 2")
-        (1, 'chapter 1', 'Welcome to the real world!', '2')
-        >>> f("Welcome to the real world!")
-        (0, '', 'Welcome to the real world!', '')
-        >>> f("** | Welcome to the real world! | 2")
-        (2, '', 'Welcome to the real world!', '2')
-        >>> f("|Preface | 1")
-        (0, '', 'Preface', '1')
-        >>> f("1.1 | Apple")
-        (0, '1.1', 'Apple', '')
+def safeget[T](func: Callable[[], T], default=None) -> T:
     """
-    RE_LEVEL = web.re_compile(r"(\**)(.*)")
-    level, text = RE_LEVEL.match(line.strip()).groups()
+    TODO: DRY with solrbuilder copy
+    >>> safeget(lambda: {}['foo'])
+    >>> safeget(lambda: {}['foo']['bar'][0])
+    >>> safeget(lambda: {'foo': []}['foo'][0])
+    >>> safeget(lambda: {'foo': {'bar': [42]}}['foo']['bar'][0])
+    42
+    >>> safeget(lambda: {'foo': 'blah'}['foo']['bar'])
+    """
+    try:
+        return func()
+    except KeyError, IndexError, TypeError:
+        return default
 
-    if "|" in text:
-        tokens = text.split("|", 2)
-        label, title, page = pad(tokens, 3, '')
+
+def strip_accents(s: str) -> str:
+    # http://stackoverflow.com/questions/517923/what-is-the-best-way-to-remove-accents-in-a-python-unicode-string
+    try:
+        s.encode("ascii")
+        return s
+    except UnicodeEncodeError:
+        return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+
+
+@functools.cache
+def get_languages(limit: int = 1000) -> dict:
+    site = request_context.site.get()
+    keys = site.things({"type": "/type/language", "limit": limit})
+    return {lang.key: lang for lang in site.get_many(keys) if not lang.deprecated}
+
+
+def word_prefix_match(prefix: str, text: str) -> bool:
+    # Compare to each word of `text` for more accurate matching
+    # Eg. the prefix 'greek' will match with 'ancient greek' as well as 'greek'
+    return any(piece.startswith(prefix) for piece in text.split())
+
+
+def autocomplete_languages(prefix: str) -> Iterator[Storage]:
+    """
+    Given, e.g., "English", this returns an iterator of the following,
+    sorted so that names starting with the prefix appear first (alphabetically),
+    followed by names that contain the prefix elsewhere (also alphabetically):
+        <Storage {'key': '/languages/eng', 'code': 'eng', 'name': 'English'}>
+        <Storage {'key': '/languages/enm', 'code': 'enm', 'name': 'English, Middle (1100-1500)'}>
+        <Storage {'key': '/languages/ang', 'code': 'ang', 'name': 'English, Old (ca. 450-1100)'}>
+        <Storage {'key': '/languages/cpe', 'code': 'cpe', 'name': 'Creoles and Pidgins, English-based (Other)'}>
+    """
+
+    def get_names_to_try(lang: dict) -> Generator[str | None]:
+        # For each language attempt to match based on:
+        # The language's name translated into the current user's chosen language (user_lang)
+        user_lang = request_context.req_context.get().lang or "en"
+        yield safeget(lambda: lang["name_translated"][user_lang][0])
+
+        # The language's name translated into its native name (lang_iso_code)
+        lang_iso_code = safeget(lambda: lang["identifiers"]["iso_639_1"][0])
+        yield safeget(lambda: lang["name_translated"][lang_iso_code][0])
+
+        # The language's name as it was fetched from get_languages() (None)
+        yield lang["name"]
+
+    def normalize_for_search(s: str) -> str:
+        return strip_accents(s).lower()
+
+    prefix = normalize_for_search(prefix)
+    matches = []
+    for lang in get_languages().values():
+        for lang_name in get_names_to_try(lang):
+            if lang_name and word_prefix_match(prefix, normalize_for_search(lang_name)):
+                matches.append(
+                    Storage(
+                        key=lang.key,
+                        code=lang.code,
+                        name=lang_name,
+                    )
+                )
+                break
+    yield from sorted(
+        matches,
+        key=lambda x: (not normalize_for_search(x.name).startswith(prefix), x.name),
+    )
+
+
+def get_abbrev_from_full_lang_name(input_lang_name: str, languages=None) -> str:
+    """
+    Take a language name, in English, such as 'English' or 'French' and return
+    'eng' or 'fre', respectively, if there is one match.
+
+    If there are zero matches, raise LanguageNoMatchError.
+    If there are multiple matches, raise a LanguageMultipleMatchError.
+    """
+    if languages is None:
+        languages = get_languages().values()
+    target_abbrev = ""
+
+    def normalize(s: str) -> str:
+        return strip_accents(s).lower()
+
+    for language in languages:
+        language_names = itertools.chain(
+            (language.name,),
+            (name for key in language.name_translated for name in language.name_translated[key]),
+        )
+
+        for name in language_names:
+            if normalize(name) == normalize(input_lang_name):
+                if target_abbrev:
+                    raise LanguageMultipleMatchError(input_lang_name)
+                target_abbrev = language.code
+                break
+
+    if not target_abbrev:
+        raise LanguageNoMatchError(input_lang_name)
+
+    return target_abbrev
+
+
+def is_safe_redirect(url: str) -> bool:
+    if not url:
+        return False
+    parsed = urlparse(url)
+    if parsed.netloc or parsed.scheme:
+        return False
+    if not url.startswith("/"):
+        return False
+    return not url.startswith(("//", "/\\"))
+
+
+def get_language(lang_or_key: str) -> Thing | Nothing | None:
+    if isinstance(lang_or_key, str):
+        return get_languages().get(lang_or_key)
     else:
-        title = text
-        label = page = ""
+        return lang_or_key
 
-    return web.storage(level=len(level), label=label.strip(), title=title.strip(), pagenum=page.strip())
 
-def parse_toc(text):
-    """Parses each line of toc"""
-    if text is None:
-        return []
-    return [parse_toc_row(line) for line in text.splitlines() if line.strip(" |")]
-
-_languages = None
-
-@public
-def get_languages():
-    global _languages
-    if _languages is None:
-        keys = web.ctx.site.things({"type": "/type/language", "key~": "/languages/*", "limit": 1000})
-        _languages = sorted([web.storage(name=d.name, code=d.code, key=d.key) for d in web.ctx.site.get_many(keys)], key=lambda d: d.name.lower())
-    return _languages
-
-@public
-def get_edition_config():
-    return _get_edition_config()
-
-@web.memoize
-def _get_edition_config():
-    """Returns the edition config.
-
-    The results are cached on the first invocation. Any changes to /config/edition page require restarting the app.
-
-    This is is cached because fetching and creating the Thing object was taking about 20ms of time for each book request.
+def get_marc21_language(language: str) -> str | None:
     """
-    thing = web.ctx.site.get('/config/edition')
-    classifications = [web.storage(t.dict()) for t in thing.classifications if 'name' in t]
-    identifiers = [web.storage(t.dict()) for t in thing.identifiers if 'name' in t]
-    roles = thing.roles
-    return web.storage(classifications=classifications, identifiers=identifiers, roles=roles)
+    Get a three character MARC 21 language abbreviation from another abbreviation format:
+        https://www.loc.gov/marc/languages/language_code.html
+        https://www.loc.gov/standards/iso639-2/php/code_list.php
+
+    Note: This does not contain all possible languages/abbreviations and is
+    biased towards abbreviations in ISBNdb.
+    """
+    language_map = {
+        "ab": "abk",
+        "af": "afr",
+        "afr": "afr",
+        "afrikaans": "afr",
+        "agq": "agq",
+        "ak": "aka",
+        "akk": "akk",
+        "alb": "alb",
+        "alg": "alg",
+        "am": "amh",
+        "amh": "amh",
+        "ang": "ang",
+        "apa": "apa",
+        "ar": "ara",
+        "ara": "ara",
+        "arabic": "ara",
+        "arc": "arc",
+        "arm": "arm",
+        "asa": "asa",
+        "aus": "aus",
+        "ave": "ave",
+        "az": "aze",
+        "aze": "aze",
+        "ba": "bak",
+        "baq": "baq",
+        "be": "bel",
+        "bel": "bel",
+        "bem": "bem",
+        "ben": "ben",
+        "bengali": "ben",
+        "bg": "bul",
+        "bis": "bis",
+        "bislama": "bis",
+        "bm": "bam",
+        "bn": "ben",
+        "bos": "bos",
+        "br": "bre",
+        "bre": "bre",
+        "breton": "bre",
+        "bul": "bul",
+        "bulgarian": "bul",
+        "bur": "bur",
+        "ca": "cat",
+        "cat": "cat",
+        "catalan": "cat",
+        "cau": "cau",
+        "cel": "cel",
+        "chi": "chi",
+        "chinese": "chi",
+        "chu": "chu",
+        "cop": "cop",
+        "cor": "cor",
+        "cos": "cos",
+        "cpe": "cpe",
+        "cpf": "cpf",
+        "cre": "cre",
+        "croatian": "hrv",
+        "crp": "crp",
+        "cs": "cze",
+        "cy": "wel",
+        "cze": "cze",
+        "czech": "cze",
+        "da": "dan",
+        "dan": "dan",
+        "danish": "dan",
+        "de": "ger",
+        "dut": "dut",
+        "dutch": "dut",
+        "dv": "div",
+        "dz": "dzo",
+        "ebu": "ceb",
+        "egy": "egy",
+        "el": "gre",
+        "en": "eng",
+        "en_us": "eng",
+        "enf": "enm",
+        "eng": "eng",
+        "english": "eng",
+        "enm": "enm",
+        "eo": "epo",
+        "epo": "epo",
+        "es": "spa",
+        "esk": "esk",
+        "esp": "und",
+        "est": "est",
+        "et": "est",
+        "eu": "eus",
+        "f": "fre",
+        "fa": "per",
+        "ff": "ful",
+        "fi": "fin",
+        "fij": "fij",
+        "filipino": "fil",
+        "fin": "fin",
+        "finnish": "fin",
+        "fle": "fre",
+        "fo": "fao",
+        "fon": "fon",
+        "fr": "fre",
+        "fra": "fre",
+        "fre": "fre",
+        "french": "fre",
+        "fri": "fri",
+        "frm": "frm",
+        "fro": "fro",
+        "fry": "fry",
+        "ful": "ful",
+        "ga": "gae",
+        "gae": "gae",
+        "gem": "gem",
+        "geo": "geo",
+        "ger": "ger",
+        "german": "ger",
+        "gez": "gez",
+        "gil": "gil",
+        "gl": "glg",
+        "gla": "gla",
+        "gle": "gle",
+        "glg": "glg",
+        "gmh": "gmh",
+        "grc": "grc",
+        "gre": "gre",
+        "greek": "gre",
+        "gsw": "gsw",
+        "guj": "guj",
+        "hat": "hat",
+        "hau": "hau",
+        "haw": "haw",
+        "heb": "heb",
+        "hebrew": "heb",
+        "her": "her",
+        "hi": "hin",
+        "hin": "hin",
+        "hindi": "hin",
+        "hmn": "hmn",
+        "hr": "hrv",
+        "hrv": "hrv",
+        "hu": "hun",
+        "hun": "hun",
+        "hy": "hye",
+        "ice": "ice",
+        "id": "ind",
+        "iku": "iku",
+        "in": "ind",
+        "ind": "ind",
+        "indonesian": "ind",
+        "ine": "ine",
+        "ira": "ira",
+        "iri": "iri",
+        "irish": "iri",
+        "is": "ice",
+        "it": "ita",
+        "ita": "ita",
+        "italian": "ita",
+        "iw": "heb",
+        "ja": "jpn",
+        "jap": "jpn",
+        "japanese": "jpn",
+        "jpn": "jpn",
+        "ka": "kat",
+        "kab": "kab",
+        "khi": "khi",
+        "khm": "khm",
+        "kin": "kin",
+        "kk": "kaz",
+        "km": "khm",
+        "ko": "kor",
+        "kon": "kon",
+        "kor": "kor",
+        "korean": "kor",
+        "kur": "kur",
+        "ky": "kir",
+        "la": "lat",
+        "lad": "lad",
+        "lan": "und",
+        "lat": "lat",
+        "latin": "lat",
+        "lav": "lav",
+        "lcc": "und",
+        "lit": "lit",
+        "lo": "lao",
+        "lt": "ltz",
+        "ltz": "ltz",
+        "lv": "lav",
+        "mac": "mac",
+        "mal": "mal",
+        "mao": "mao",
+        "map": "map",
+        "mar": "mar",
+        "may": "may",
+        "mfe": "mfe",
+        "mic": "mic",
+        "mis": "mis",
+        "mk": "mkh",
+        "ml": "mal",
+        "mla": "mla",
+        "mlg": "mlg",
+        "mlt": "mlt",
+        "mn": "mon",
+        "moh": "moh",
+        "mon": "mon",
+        "mr": "mar",
+        "ms": "msa",
+        "mt": "mlt",
+        "mul": "mul",
+        "my": "bur",
+        "mya": "bur",
+        "burmese": "bur",
+        "myn": "myn",
+        "nai": "nai",
+        "nav": "nav",
+        "nde": "nde",
+        "ndo": "ndo",
+        "ne": "nep",
+        "nep": "nep",
+        "nic": "nic",
+        "nl": "dut",
+        "nor": "nor",
+        "norwegian": "nor",
+        "nso": "sot",
+        "ny": "nya",
+        "oc": "oci",
+        "oci": "oci",
+        "oji": "oji",
+        "old norse": "non",
+        "opy": "und",
+        "ori": "ori",
+        "ota": "ota",
+        "paa": "paa",
+        "pal": "pal",
+        "pan": "pan",
+        "per": "per",
+        "persian": "per",
+        "farsi": "per",
+        "pl": "pol",
+        "pli": "pli",
+        "pol": "pol",
+        "polish": "pol",
+        "por": "por",
+        "portuguese": "por",
+        "pra": "pra",
+        "pro": "pro",
+        "ps": "pus",
+        "pt": "por",
+        "pt-br": "por",
+        "que": "que",
+        "ro": "rum",
+        "roa": "roa",
+        "roh": "roh",
+        "romanian": "rum",
+        "ru": "rus",
+        "rum": "rum",
+        "rus": "rus",
+        "russian": "rus",
+        "rw": "kin",
+        "sai": "sai",
+        "san": "san",
+        "scc": "srp",
+        "sco": "sco",
+        "scottish gaelic": "gla",
+        "scr": "scr",
+        "sesotho": "sot",
+        "sho": "sna",
+        "shona": "sna",
+        "si": "sin",
+        "sl": "slv",
+        "sla": "sla",
+        "slo": "slv",
+        "slovenian": "slv",
+        "slv": "slv",
+        "smo": "smo",
+        "sna": "sna",
+        "som": "som",
+        "sot": "sot",
+        "sotho": "sot",
+        "spa": "spa",
+        "spanish": "spa",
+        "sq": "alb",
+        "sr": "srp",
+        "srp": "srp",
+        "srr": "srr",
+        "sso": "sso",
+        "ssw": "ssw",
+        "st": "sot",
+        "sux": "sux",
+        "sv": "swe",
+        "sw": "swa",
+        "swa": "swa",
+        "swahili": "swa",
+        "swe": "swe",
+        "swedish": "swe",
+        "swz": "ssw",
+        "syc": "syc",
+        "syr": "syr",
+        "ta": "tam",
+        "tag": "tgl",
+        "tah": "tah",
+        "tam": "tam",
+        "tel": "tel",
+        "tg": "tgk",
+        "tgl": "tgl",
+        "th": "tha",
+        "tha": "tha",
+        "tib": "tib",
+        "tl": "tgl",
+        "tr": "tur",
+        "tsn": "tsn",
+        "tso": "sot",
+        "tsonga": "tsonga",
+        "tsw": "tsw",
+        "tswana": "tsw",
+        "tur": "tur",
+        "turkish": "tur",
+        "tut": "tut",
+        "uk": "ukr",
+        "ukr": "ukr",
+        "un": "und",
+        "und": "und",
+        "urd": "urd",
+        "urdu": "urd",
+        "uz": "uzb",
+        "uzb": "uzb",
+        "ven": "ven",
+        "vi": "vie",
+        "vie": "vie",
+        "wel": "wel",
+        "welsh": "wel",
+        "wen": "wen",
+        "wol": "wol",
+        "xho": "xho",
+        "xhosa": "xho",
+        "yid": "yid",
+        "yor": "yor",
+        "yu": "ypk",
+        "zh": "chi",
+        "zh-cn": "chi",
+        "zh-tw": "chi",
+        "zul": "zul",
+        "zulu": "zul",
+    }
+    return language_map.get(language.casefold())
+
+
+@public
+def get_language_name(lang_or_key: Nothing | str | Thing, user_lang: str) -> Nothing | str:
+    if isinstance(lang_or_key, str):
+        lang = get_language(lang_or_key)
+        if not lang:
+            return lang_or_key
+    else:
+        lang = lang_or_key
+
+    return safeget(lambda: lang["name_translated"][user_lang][0]) or lang.name  # type: ignore[index]
+
+
+@public
+def get_populated_languages() -> set[str]:
+    """
+    Get the languages for which we have many available ebooks, in MARC21 format
+    See https://openlibrary.org/languages
+    """
+    # Hard-coded for now to languages with more than 15k borrowable ebooks
+    return {"eng", "fre", "ger", "spa", "chi", "ita", "lat", "dut", "rus", "jpn"}
+
+
+@public
+@functools.lru_cache(maxsize=256)
+def convert_iso_to_marc(iso_639_1: str) -> str | None:
+    """
+    e.g. 'en' -> 'eng'
+
+    Bound the cache because language values can come from request input.
+    """
+    for lang in get_languages().values():
+        code = safeget(lambda: lang["identifiers"]["iso_639_1"][0])
+        if code == iso_639_1:
+            return lang.code
+    return None
+
+
+@public
+def get_identifier_config(identifier: Literal["work", "edition", "author"]) -> Storage:
+    return _get_identifier_config(identifier)
+
+
+def format_isni_display_value(isni: str) -> str:
+    """Format an ISNI for human-readable display according to ISO 27729."""
+    normalized = re.sub(r"\s+", "", isni).upper()
+    if re.fullmatch(r"\d{15}[\dX]", normalized):
+        return " ".join(normalized[i : i + 4] for i in range(0, 16, 4))
+
+    return isni
+
+
+@public
+def format_author_identifier_value(identifier_name: str, value: str) -> str:
+    """Format author identifiers for display without changing stored values."""
+    if identifier_name == "isni":
+        return format_isni_display_value(value)
+
+    return value
+
+
+@functools.cache
+def _get_identifier_config(identifier: Literal["work", "edition", "author"]) -> Storage:
+    """
+    Returns the identifier config.
+
+    The results are cached on the first invocation. Any changes to /config/{identifier} page require restarting the app.
+
+    This is cached because fetching and creating the Thing object was taking about 20ms of time for each book request.
+    """
+    with open(f"openlibrary/plugins/openlibrary/config/{identifier}/identifiers.yml") as in_file:
+        id_config = yaml.safe_load(in_file)
+        identifiers = [Storage(id) for id in id_config.get("identifiers", []) if "name" in id]
+
+    if identifier == "edition":
+        thing = request_context.site.get().get("/config/edition")
+        classifications = [Storage(t.dict()) for t in thing.classifications if "name" in t]
+        roles = thing.roles
+        return Storage(classifications=classifications, identifiers=identifiers, roles=roles)
+
+    return Storage(identifiers=identifiers)
+
 
 from openlibrary.core.olmarkdown import OLMarkdown
-def get_markdown(text, safe_mode=False):
+
+
+def get_markdown(text: str, safe_mode: bool = False) -> OLMarkdown:
     md = OLMarkdown(source=text, safe_mode=safe_mode)
     view._register_mdx_extensions(md)
     md.postprocessors += view.wiki_processors
     return md
 
 
-class HTML(six.text_type):
+class HTML(str):
+    __slots__ = ()
+
     def __init__(self, html):
-        six.text_type.__init__(self, web.safeunicode(html))
+        str.__init__(self, str(html))
 
     def __repr__(self):
-        return "<html: %s>" % six.text_type.__repr__(self)
+        return "<html: %s>" % str.__repr__(self)
+
 
 _websafe = web.websafe
-def websafe(text):
+
+
+def websafe(text: str) -> str:
     if isinstance(text, HTML):
         return text
-    elif isinstance(text, web.template.TemplateResult):
+    elif isinstance(text, TemplateResult):
         return web.safestr(text)
     else:
         return _websafe(text)
 
 
-from openlibrary.plugins.upstream import adapter
-from openlibrary.utils.olcompress import OLCompressor
-from openlibrary.utils import olmemcache
 import memcache
+
+from openlibrary.plugins.upstream import adapter
+from openlibrary.utils import olmemcache
+from openlibrary.utils.olcompress import OLCompressor
+
 
 class UpstreamMemcacheClient:
     """Wrapper to memcache Client to handle upstream specific conversion and OL specific compression.
     Compatible with memcache Client API.
     """
+
     def __init__(self, servers):
         self._client = memcache.Client(servers)
         compressor = OLCompressor()
         self.compress = compressor.compress
-        def decompress(*args, **kw):
+
+        def decompress(*args, **kw) -> str:
             d = json.loads(compressor.decompress(*args, **kw))
             return json.dumps(adapter.unconvert_dict(d))
+
         self.decompress = decompress
 
-    def get(self, key):
+    def get(self, key: str | None):
         key = adapter.convert_key(key)
         if key is None:
             return None
@@ -635,20 +1284,23 @@ class UpstreamMemcacheClient:
         keys = [web.safestr(k) for k in keys]
 
         d = self._client.get_multi(keys)
-        return dict((web.safeunicode(adapter.unconvert_key(k)), self.decompress(v)) for k, v in d.items())
+        return {str(adapter.unconvert_key(k)): self.decompress(v) for k, v in d.items()}
 
-if config.get('upstream_memcache_servers'):
-    olmemcache.Client = UpstreamMemcacheClient
+
+if config.get("upstream_memcache_servers"):
+    olmemcache.Client = UpstreamMemcacheClient  # type: ignore[assignment, misc]
     # set config.memcache_servers only after olmemcache.Client is updated
-    config.memcache_servers = config.upstream_memcache_servers
+    config.memcache_servers = config.upstream_memcache_servers  # type: ignore[attr-defined]
+
 
 def _get_recent_changes():
-    site = web.ctx.get('site') or delegate.create_site()
+    site = request_context.site.get()
     web.ctx.setdefault("ip", "127.0.0.1")
 
-    # The recentchanges can have multiple revisions for a document if it has been modified more than once.
-    # Take only the most recent revision in that case.
+    # The recentchanges can have multiple revisions for a document if it has been
+    # modified more than once.  Take only the most recent revision in that case.
     visited = set()
+
     def is_visited(key):
         if key in visited:
             return True
@@ -657,7 +1309,8 @@ def _get_recent_changes():
             return False
 
     # ignore reverts
-    re_revert = web.re_compile(r"reverted to revision \d+")
+    re_revert = re.compile(r"reverted to revision \d+")
+
     def is_revert(r):
         return re_revert.match(r.comment or "")
 
@@ -668,10 +1321,10 @@ def _get_recent_changes():
     result = result[:50]
 
     def process_thing(thing):
-        t = web.storage()
+        t = Storage()
         for k in ["key", "title", "name", "displayname"]:
             t[k] = thing[k]
-        t['type'] = web.storage(key=thing.type.key)
+        t["type"] = Storage(key=thing.type.key)
         return t
 
     for r in result:
@@ -679,6 +1332,7 @@ def _get_recent_changes():
         r.thing = process_thing(site.get(r.key, r.revision))
 
     return result
+
 
 def _get_recent_changes2():
     """New recent changes for around the library.
@@ -688,18 +1342,21 @@ def _get_recent_changes2():
 
     If `$var ignore=True` is set by the message template, the change is ignored.
     """
-    if 'env' not in web.ctx:
+    if "env" not in web.ctx:
         delegate.fakeload()
+        request_context.set_context_from_legacy_web_py()
 
     q = {"bot": False, "limit": 100}
-    changes = web.ctx.site.recentchanges(q)
+    changes = request_context.site.get().recentchanges(q)
 
     def is_ignored(c):
         return (
             # c.kind=='update' allow us to ignore update recent changes on people
-            c.kind == 'update' or
+            c.kind == "update"
+            or
             # ignore change if author has been deleted (e.g. spammer)
-            (c.author and c.author.type.key == '/type/delete'))
+            (c.author and c.author.type.key == "/type/delete")
+        )
 
     def render(c):
         t = get_template("recentchanges/" + c.kind + "/message") or get_template("recentchanges/default/message")
@@ -709,27 +1366,16 @@ def _get_recent_changes2():
     messages = [m for m in messages if str(m.get("ignore", "false")).lower() != "true"]
     return messages
 
-_get_recent_changes = web.memoize(_get_recent_changes, expires=5*60, background=True)
-_get_recent_changes2 = web.memoize(_get_recent_changes2, expires=5*60, background=True)
 
-@public
-def get_random_recent_changes(n):
-    if "recentchanges_v2" in web.ctx.get("features", []):
-        changes = _get_recent_changes2()
-    else:
-        changes = _get_recent_changes()
+_get_recent_changes = web.memoize(_get_recent_changes, expires=5 * 60, background=True)
+_get_recent_changes2 = web.memoize(_get_recent_changes2, expires=5 * 60, background=True)
 
-    _changes = random.sample(changes, n) if len(changes) > n else changes
-    for i, change in enumerate(_changes):
-        _changes[i]['__body__'] = _changes[i]['__body__'].replace('<script>', '')\
-                                                         .replace('</script>', '')
-    return _changes
 
 def _get_blog_feeds():
-    url = "http://blog.openlibrary.org/feed/"
+    url = "https://blog.openlibrary.org/feed/"
     try:
         stats.begin("get_blog_feeds", url=url)
-        tree = etree.fromstring(requests.get(url).text)
+        tree = ET.fromstring(requests.get(url).text)
     except Exception:
         # Handle error gracefully.
         logging.getLogger("openlibrary").error("Failed to fetch blog feeds", exc_info=True)
@@ -738,127 +1384,346 @@ def _get_blog_feeds():
         stats.end()
 
     def parse_item(item):
-        pubdate = datetime.datetime.strptime(item.find("pubDate").text, '%a, %d %b %Y %H:%M:%S +0000').isoformat()
-        return dict(
-            title=item.find("title").text,
-            link=item.find("link").text,
-            pubdate=pubdate
-        )
+        pubdate = dt.datetime.strptime(item.find("pubDate").text, "%a, %d %b %Y %H:%M:%S +0000").isoformat()
+        return {
+            "title": item.find("title").text,
+            "link": item.find("link").text,
+            "pubdate": pubdate,
+        }
+
     return [parse_item(item) for item in tree.findall(".//item")]
 
-_get_blog_feeds = cache.memcache_memoize(_get_blog_feeds, key_prefix="upstream.get_blog_feeds", timeout=5*60)
 
-def get_donation_include(include):
-    web_input = web.input()
+_get_blog_feeds = cache.memcache_memoize(_get_blog_feeds, key_prefix="upstream.get_blog_feeds", timeout=60 * 60 * 24)
 
-    # The following allows archive.org staff to test banners without
-    # needing to reload openlibrary services:
-    dev_host = web_input.pop("dev_host", "")  # e.g. `www-user`
-    if dev_host and re.match('^[a-zA-Z0-9-.]+$', dev_host):
-        dev_host += "."   # e.g. `www-user.`
-    script_src = "https://%sarchive.org/includes/donate.js" % dev_host
-    if 'ymd' in web_input:
-        script_src += '?ymd=' + web_input.ymd
-
-    html = """
-    <div id="donato"></div>
-    <script src="%s" data-platform="ol"></script>
-    """ % script_src
-    return html
-
-#get_donation_include = cache.memcache_memoize(get_donation_include, key_prefix="upstream.get_donation_include", timeout=60)
 
 @public
-def item_image(image_path, default=None):
+def is_jsdef():
+    return False
+
+
+@public
+def jsdef_get(obj, key, default=None):
+    """
+    foo.get(KEY, default) isn't defined in js, so we can't use that construct
+    in our jsdef methods. This helper function provides a workaround, and works
+    in both environments.
+    """
+    return obj.get(key, default)
+
+
+@public
+def create_thing(data: dict) -> Thing:
+    """
+    Helper method to convert a data object recursively to the correct `Thing`
+    classes. Will change the dict to be the same type as when fetched from
+    the database via `web.ctx.site.get`.
+    """
+    return client.create_thing(request_context.site.get(), data["key"], request_context.site.get()._process_dict(parse_query(data)))
+
+
+@public
+def get_ia_host(allow_dev: bool = False) -> str:
+    if allow_dev:
+        web_input = web.input()
+        dev_host = web_input.pop("dev_host", "")  # e.g. `www-user`
+        if dev_host and re.match("^[a-zA-Z0-9-.]+$", dev_host):
+            return dev_host + ".archive.org"
+
+    return "archive.org"
+
+
+@public
+def item_image(image_path: str | None, default: str | None = None) -> str | None:
     if image_path is None:
         return default
-    if image_path.startswith('https:'):
+    if image_path.startswith("https:"):
         return image_path
     return "https:" + image_path
 
-@public
-def get_blog_feeds():
+
+def get_blog_feeds() -> list[Storage]:
     def process(post):
-        post = web.storage(post)
+        post = Storage(post)
         post.pubdate = parse_datetime(post.pubdate)
         return post
+
     return [process(post) for post in _get_blog_feeds()]
+
 
 class Request:
     path = property(lambda self: web.ctx.path)
     home = property(lambda self: web.ctx.home)
     domain = property(lambda self: web.ctx.host)
+    fullpath = property(lambda self: web.ctx.fullpath)
 
     @property
-    def canonical_url(self):
+    def canonical_url(self) -> str:
         """Returns the https:// version of the URL.
 
         Used for adding <meta rel="canonical" ..> tag in all web pages.
         Required to make OL retain the page rank after https migration.
         """
-        readable_path = web.ctx.get('readable_path', web.ctx.path) or ''
-        query = web.ctx.query or ''
-        host = web.ctx.host or ''
-        url = host + readable_path + query
-        if url:
-            url = "https://" + url
-            parsed_url = urlparse(url)
+        return canonical_url(web.ctx.host or "", web.ctx.get("readable_path", web.ctx.path) or "", web.ctx.query or "")
 
-            parsed_query = parse_qs(parsed_url.query)
-            queries_to_exclude = ['sort', 'mode', 'v', 'type', 'debug']
 
-            canonical_query = {q: v for q, v in parsed_query.items() if q not in queries_to_exclude}
-            query = parse_urlencode(canonical_query, doseq=True)
-            parsed_url = parsed_url._replace(query=query)
+# Params that do not change what the page is about: presentation (sort, mode,
+# layout), revision and diff selectors (v, a, b), librarian and debug toggles,
+# tracking, read-aloud autostart, and a work's selected edition (every edition
+# has its own /books/ page).
+CANONICAL_QUERY_EXCLUDES = frozenset({"sort", "mode", "v", "type", "debug", "layout", "a", "b", "show_page_status", "edition", "ref", "_autoReadAloud"})
 
-            url = urlunparse(parsed_url)
 
-            return url
-        return ''
+def canonical_url(host: str, readable_path: str, query: str) -> str:
+    """The https:// URL for ``host + readable_path + query``, minus view-only params.
+
+    ``query`` includes its leading "?", like ``web.ctx.query``.
+    """
+    if url := host + readable_path + query:
+        parsed_url = urlparse("https://" + url)
+        canonical_query = {q: v for q, v in parse_qs(parsed_url.query).items() if q not in CANONICAL_QUERY_EXCLUDES}
+        return urlunparse(parsed_url._replace(query=parse_urlencode(canonical_query, doseq=True)))
+    return ""
 
 
 @public
-def render_once(key):
-    rendered = web.ctx.setdefault('render_once', {})
+def render_once(key: str) -> bool:
+    rendered = request_context.rendered_keys.get()
+    if rendered is None:
+        # Preserve standalone template rendering without a shared mutable default.
+        rendered = set()
+        request_context.rendered_keys.set(rendered)
     if key in rendered:
         return False
     else:
-        rendered[key] = True
+        rendered.add(key)
         return True
 
 
 @public
 def today():
-    return datetime.datetime.today()
+    return dt.datetime.today()
 
 
-def setup():
+class HTMLTagRemover(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.data = []
+
+    def handle_data(self, data):
+        self.data.append(data.strip())
+
+    def handle_endtag(self, tag):
+        self.data.append("\n" if tag in ("p", "li") else " ")
+
+
+@public
+def get_user_object(username):
+    user = request_context.site.get().get(f"/people/{username}")
+    return user
+
+
+@public
+def reformat_html(html_str: str, max_length: int | None = None) -> str:
+    """
+    Reformats an HTML string, removing all opening and closing tags.
+    Adds a line break element between each set of text content.
+    Optionally truncates contents that exceeds the given max length.
+
+    returns: A reformatted HTML string
+    """
+    parser = HTMLTagRemover()
+    # Must have a root node, otherwise the parser will fail
+    parser.feed(f"<div>{html_str}</div>")
+    content = [web.websafe(s) for s in parser.data if s]
+
+    if max_length:
+        return truncate("".join(content), max_length).strip().replace("\n", "<br>")
+    else:
+        return "".join(content).strip().replace("\n", "<br>")
+
+
+@public
+def markdown_excerpt(text: str, max_length: int = 200) -> str:
+    """Plain-text excerpt of a markdown field (e.g. a book description) for meta tags.
+
+    Cuts at a word boundary and adds an ellipsis when the text is longer than max_length.
+    """
+    html = get_markdown(str(text or "")).convert()
+    html = re.sub(r"<(script|style)\b.*?</\1>", " ", html, flags=re.DOTALL | re.IGNORECASE)
+    plain = " ".join(unescape(re.sub(r"<[^>]+>", " ", html)).split())
+    plain = re.sub(r" ([,.;:!?)])", r"\1", plain)
+    if len(plain) <= max_length:
+        return plain
+    return plain[:max_length].rsplit(" ", 1)[0].rstrip(",;:—-") + "…"
+
+
+def get_colon_only_loc_pub(pair: str) -> tuple[str, str]:
+    """
+    Get a tuple of a location and publisher name from an Internet Archive
+    publisher string. For use in simple location-publisher pairs with one colon.
+
+    >>> get_colon_only_loc_pub('City : Publisher Name')
+    ('City', 'Publisher Name')
+    """
+    pairs = pair.split(":")
+    if len(pairs) == 2:
+        location = pairs[0].strip(STRIP_CHARS)
+        publisher = pairs[1].strip(STRIP_CHARS)
+
+        return (location, publisher)
+
+    # Fall back to using the entire string as the publisher.
+    return ("", pair.strip(STRIP_CHARS))
+
+
+def get_location_and_publisher(loc_pub: str) -> tuple[list[str], list[str]]:
+    """
+    Parses locations and publisher names out of Internet Archive metadata
+    `publisher` strings. For use when there is no MARC record.
+
+    Returns a tuple of list[location_strings], list[publisher_strings].
+
+    E.g.
+    >>> get_location_and_publisher("[New York] : Random House")
+    (['New York'], ['Random House'])
+    >>> get_location_and_publisher("Londres ; New York ; Paris : Berlitz Publishing")
+    (['Londres', 'New York', 'Paris'], ['Berlitz Publishing'])
+    >>> get_location_and_publisher("Paris : Pearson ; San Jose (Calif.) : Adobe")
+    (['Paris', 'San Jose (Calif.)'], ['Pearson', 'Adobe'])
+    """
+
+    if not loc_pub or not isinstance(loc_pub, str):
+        return ([], [])
+
+    if "Place of publication not identified" in loc_pub:
+        loc_pub = loc_pub.replace("Place of publication not identified", "")
+
+    loc_pub = loc_pub.translate({ord(char): None for char in REPLACE_CHARS})
+
+    # This operates on the notion that anything, even multiple items, to the
+    # left of a colon is a location, and the item immediately to the right of
+    # the colon is a publisher. This can be exploited by using
+    # string.split(";") because everything to the 'left' of a colon is a
+    # location, and whatever is to the right is a publisher.
+    locations: list[str] = []
+    publishers: list[str] = []
+    if ":" in loc_pub:
+        parts = loc_pub.split(";") if ";" in loc_pub else [loc_pub]
+        # Track in indices of values placed into locations or publishers.
+        last_placed_index = 0
+
+        # For each part, look for a semi-colon, then extract everything to
+        # the left as a location, and the item on the right as a publisher.
+        for index, part in enumerate(parts):
+            # This expects one colon per part. Two colons breaks our pattern.
+            # Breaking here gives the chance of extracting a
+            # `location : publisher` from one or more pairs with one semi-colon.
+            if part.count(":") > 1:
+                break
+
+            # Per the pattern, anything "left" of a colon in a part is a place.
+            if ":" in part:
+                location, publisher = get_colon_only_loc_pub(part)
+                publishers.append(publisher)
+                # Every index value between last_placed_index and the current
+                # index is a location.
+                for place in parts[last_placed_index:index]:
+                    locations.append(place.strip(STRIP_CHARS))
+                locations.append(location)  # Preserve location order.
+                last_placed_index = index + 1
+    else:
+        publishers = [loc_pub.strip(STRIP_CHARS)]
+
+    # Clean up and empty list items left over from strip() string replacement.
+    locations = [item for item in locations if item]
+    publishers = [item for item in publishers if item]
+    return (locations, publishers)
+
+
+@public
+def subject_name_to_key(subject: str, prefix="") -> str:
+    if prefix:
+        prefix = prefix.rstrip(":") + ":"
+    return f"/subjects/{prefix}{normalize_subject_name(subject)}"
+
+
+# The unused-template test reads this literal as ListCarousel's only static
+# reference; renaming or deleting it flips the macro to "unused".
+LIST_CAROUSEL_RE = re.compile(r"""\{\{ListCarousel\(\s*["']([^"']+)["']""")
+
+
+@public
+def get_collection_book_count(page) -> int:
+    """Number of books a /collections/* page holds, summed over the lists its
+    ListCarousel macros point at. Zero when it has no such macro (e.g. it only
+    embeds search-query carousels), so callers can drop the count.
+    """
+    body = page.get("body") or ""
+    # Each key arrives with a display slug appended: /people/x/lists/OL1L/Name.
+    keys = {"/".join(m.split("/")[:5]) for m in LIST_CAROUSEL_RE.findall(str(body))}
+    # A deleted list still resolves to a Thing, and a non-list key to one with no
+    # seed_count, so both would otherwise count as a list holding zero books.
+    lists = request_context.site.get().get_many(sorted(keys))
+    return sum(lst.seed_count for lst in lists if lst.type.key == "/type/list")
+
+
+def setup_requests(config=config) -> None:
+    logger.info("Setting up requests")
+
+    logger.info("Setting up proxy")
+    if config.get("http_proxy", ""):
+        os.environ["HTTP_PROXY"] = os.environ["http_proxy"] = config.get("http_proxy")
+        os.environ["HTTPS_PROXY"] = os.environ["https_proxy"] = config.get("http_proxy")
+        logger.info("Proxy environment variables are set")
+    else:
+        logger.info("No proxy configuration found")
+
+    logger.info("Setting up proxy bypass")
+    if config.get("no_proxy_addresses", []):
+        no_proxy = ",".join(config.get("no_proxy_addresses"))
+        os.environ["NO_PROXY"] = os.environ["no_proxy"] = no_proxy
+        logger.info("Proxy bypass environment variables are set")
+    else:
+        logger.info("No proxy bypass configuration found")
+
+    logger.info("Requests set up")
+
+
+def setup() -> None:
     """Do required initialization"""
     # monkey-patch get_markdown to use OL Flavored Markdown
     view.get_markdown = get_markdown
 
     # Provide alternate implementations for websafe and commify
     web.websafe = websafe
-    web.template.Template.FILTERS['.html'] = websafe
-    web.template.Template.FILTERS['.xml'] = websafe
+    web.template.Template.FILTERS[".html"] = websafe
+    web.template.Template.FILTERS[".xml"] = websafe
 
     web.commify = commify
 
-    web.template.Template.globals.update({
-        'HTML': HTML,
-        'request': Request(),
-        'logger': logging.getLogger("openlibrary.template"),
-        'sum': sum,
-        'get_donation_include': get_donation_include,
-        'websafe': web.websafe,
-    })
+    web.template.Template.globals.update(
+        {
+            "HTML": HTML,
+            "request": Request(),
+            "sum": sum,
+            "websafe": web.websafe,
+        }
+    )
 
     from openlibrary.core import helpers as h
-    web.template.Template.globals.update(h.helpers)
+    from openlibrary.core.fulltext import all_words_query, phrase_query
 
-    if config.get('use_gzip') == True:
+    web.template.Template.globals.update(h.helpers)
+    # For the fulltext macros' BookReader links; imported here since core.fulltext imports back into plugins.
+    web.template.Template.globals["phrase_query"] = phrase_query
+    web.template.Template.globals["all_words_query"] = all_words_query
+
+    if config.get("use_gzip") is True:
         config.middleware.append(GZipMiddleware)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     import doctest
+
     doctest.testmod()

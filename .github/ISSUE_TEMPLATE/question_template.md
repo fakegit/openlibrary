@@ -6,16 +6,23 @@ labels: "Type: Question, Needs: Triage, Needs: Lead, Needs: Community Discussion
 assignees: ''
 ---
 
-### Question
+<!-- IMPORTANT: Before posting, be sure to redact or remove sensitive data, such as passwords, secret keys, session cookies, etc. -->
+
+## Question
 <!-- What question needs to be answered to close this issue? This should be one sentence. -->
 
 
-### Additional context
+## Additional context
 <!-- Add any other context or details here. -->
 
-### Issue resolution criteria
+<details>
+<summary><strong>Resolution Details</strong> (for maintainers)</summary>
+
+#### Issue resolution criteria
 <!-- When can this issue be closed? -->
 
 
-### Stakeholders
+#### Stakeholders
 <!-- @ tag stakeholders of this bug -->
+
+</details>

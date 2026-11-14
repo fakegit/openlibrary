@@ -4,12 +4,13 @@ import json
 
 from openlibrary.data.dump import pgdecode
 
+
 def parse_data_table(filename):
     """Parses the dump of data table and returns an iterator with
     <key, type, revision, json> for all entries.
     """
-    for line in open(filename):
-        thing_id, revision, json_data = pgdecode(line).strip().split("\t")
-        d = json.loads(json_data)
-        yield d['key'], d['type']['key'], str(d['revision']), json_data
-
+    with open(filename) as file:
+        for line in file:
+            _thing_id, _revision, json_data = pgdecode(line).strip().split("\t")
+            d = json.loads(json_data)
+            yield d["key"], d["type"]["key"], str(d["revision"]), json_data

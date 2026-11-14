@@ -1,16 +1,245 @@
-# To enable this pre-commit hook (in this case, pre-push hook), run:
-# `python3 -m pip install pre-commit` or `brew install pre-commit`
+# To enable this pre-commit hook run:
+# `pip install pre-commit` or `brew install pre-commit`
+# Then run `pre-commit install`
 
 # Learn more about this config here: https://pre-commit.com/
 default_language_version:
-  python: python3.8
-default_stages: [push]
+  python: python3.14
+
+ci:
+  submodules: true
+  # Renovate keeps hook revs updated (see renovate.json). pre-commit.ci can't turn its autoupdate off
+  # (pre-commit-ci/issues#83), so run it rarely; its PRs can be closed.
+  autoupdate_schedule: "quarterly"
+
 repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-toml
+      - id: check-yaml
+        # Compose's !reset/!override tags are not plain YAML; `docker compose config` validates these
+        exclude: ^tests/e2e/i18n-baked/compose(\.dev)?\.yaml$
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        exclude: ^.*\.(po|pot|type|svg|ini|mr|mrc|pg_dump)$
+      - id: mixed-line-ending
+        args:
+          - --fix=lf
+      - id: requirements-txt-fixer
+      - id: trailing-whitespace
+        args:
+          - --markdown-linebreak-ext=md
+
+  - repo: https://github.com/MarcoGorelli/auto-walrus
+    rev: 0.4.1
+    hooks:
+      - id: auto-walrus
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.3
+    hooks:
+      - id: codespell  # See pyproject.toml for args
+        additional_dependencies:
+          - tomli
+        args: ["--skip", "*.mjs"]
+        exclude: ^(openlibrary/plugins/upstream/utils\.py|openlibrary/catalog/marc/parse\.py|openlibrary/catalog/add_book/match\.py)$
+
+  - repo: https://github.com/djlint/djLint
+    rev: v1.43.2
+    hooks:
+      - id: djlint-reformat-jinja
+      - id: djlint-jinja
+
+  - repo: https://github.com/abravalheri/validate-pyproject
+    rev: v0.25
+    hooks:
+      - id: validate-pyproject
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.4
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/MarcoGorelli/cython-lint
+    rev: v0.21.0
+    hooks:
+    - id: cython-lint
+
   - repo: local
     hooks:
-      - id: make-lint-diff
-        name: make lint-diff
-        # Running git inside docker is slow for some reason, so do that outside and pipe
-        # the results into docker.
-        entry: git diff master -U0 | docker-compose run --rm home ./scripts/flake8-diff.sh
-        language: script
+      - id: generate-solr-types
+        name: Generate Solr types
+        description: >
+          Regenerates openlibrary/solr/solr_types.py from the Solr schema
+          whenever the schema or generator changes.
+        entry: python ./openlibrary/solr/generate_solr_types.py
+        language: python
+        files: ^(conf/solr/conf/(managed-schema|enumsConfig)\.xml|openlibrary/solr/(generate_solr_types|solr_types)\.py)$
+        pass_filenames: false
+
+  - repo: local
+    hooks:
+      - id: no-bare-httpx-async-client
+        name: No bare httpx.AsyncClient() assignments
+        description: >
+          A directly-assigned httpx.AsyncClient() is unsafe to share across
+          this codebase's event loops -- see cache_per_event_loop in
+          openlibrary/utils/async_utils.py.
+        entry: python ./scripts/check_no_bare_httpx_async_client.py
+        language: python
+        types: [python]
+        exclude: (^|/)tests?/
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.4.1
+    hooks:
+      - id: mypy  # See pyproject.toml for args
+        # Declared so Renovate updates additional_dependencies (it only reads hooks with an explicit language).
+        language: python
+        additional_dependencies:
+          - types-PyYAML
+          - types-aiofiles
+          - types-python-dateutil
+          - types-requests
+          - types-simplejson
+          - fastapi
+          - psycopg[binary,pool]==3.3.5
+
+  - repo: https://github.com/oxc-project/mirrors-oxfmt
+    # Mirror tag lags npm; pin the same version as package.json.
+    rev: v0.71.0
+    hooks:
+      - id: oxfmt
+        name: oxfmt
+        # Declared so Renovate updates additional_dependencies (it only reads hooks with an explicit language).
+        language: node
+        # Mirror hook targets JS/TS by default; also run it on CSS and Vue.
+        types_or: [css, javascript, ts, vue]
+        files: \.(css|js|mjs|cjs|ts|vue)$
+        args: [--no-error-on-unmatched-pattern]
+        additional_dependencies:
+          - oxfmt@0.76.0
+
+  - repo: https://github.com/oxc-project/mirrors-oxlint
+    # Mirror tag lags npm; pin the same version as package.json.
+    rev: v1.86.0
+    hooks:
+      - id: oxlint
+        name: oxlint
+        language: node
+        # Mirror hook targets JS/TS by default.
+        types_or: [javascript, ts]
+        files: \.(js|mjs|cjs|ts)$
+        # --no-error-on-unmatched-pattern: oxlint exits 1 when every staged path
+        # is excluded by .oxlintrc.json's ignorePatterns, which would otherwise
+        # spuriously fail the hook. Mirrors the oxfmt hook above.
+        args: [--no-error-on-unmatched-pattern]
+        additional_dependencies:
+          - oxlint@1.91.0
+
+  - repo: https://github.com/awebdeveloper/pre-commit-stylelint
+    rev: 0.0.2
+    hooks:
+      - id: stylelint
+        language: node
+        # stylelint 17 resolves plugins with ESM resolution, which ignores the NODE_PATH pre-commit sets, then
+        # falls back to the global npm prefix. A system Node (the pre-commit.ci default) makes that prefix /usr,
+        # so plugins aren't found. A pre-commit-managed Node puts the prefix inside the hook env instead.
+        language_version: lts
+        files: \.css$
+        additional_dependencies: &stylelint_deps
+          - stylelint@17.16.0
+          - stylelint-declaration-strict-value@1.12.1
+          - postcss-lit@1.4.1
+        # --allow-empty-input: pre-commit passes the staged .css files, and
+        # stylelint fails with AllFilesIgnoredError if .stylelintignore excludes
+        # all of them (e.g. a commit only touching static/css/tokens/).
+        args: [--fix, --allow-empty-input]
+      - id: stylelint
+        name: stylelint (lit)
+        language: node
+        language_version: lts
+        # Same hook, but check-only. postcss-lit can't write Lit files back without
+        # shifting comment indentation, so --fix would rewrite files that had no errors.
+        # Matches all JS so a `css` literal is linted wherever it lands; files
+        # without one parse to an empty stylesheet and report nothing.
+        # Keep the file list in sync with lint:css in package.json.
+        files: ^openlibrary/.*\.js$
+        additional_dependencies: *stylelint_deps
+        args: [--allow-empty-input]
+
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v10.12.0
+    hooks:
+      # JS is linted by oxlint, and JS and Vue are formatted by oxfmt; ESLint is
+      # only kept for the Vue-specific rules oxlint can't run on .vue templates.
+      - id: eslint
+        language: node
+        types: [file]
+        types_or: [vue]
+        additional_dependencies:
+          - eslint@10.14.0
+          - "@eslint/js@10.0.1"
+          - eslint-config-prettier@10.1.8
+          - eslint-plugin-vue@10.12.0
+          - globals@17.14.0
+        args: [--fix]
+
+  - repo: local
+    hooks:
+    - id: check-unused-templates
+      name: Check for unused templates and macros
+      description: >
+        Fails if any Templetor or Jinja template/macro has no code reference
+        anywhere in the repo (including vendor/infogami).
+      entry: python ./scripts/check_unused_templates.py
+      # Keep in sync with CORPUS_SUFFIXES in openlibrary/utils/template_usage.py.
+      types_or: [python, javascript, ts, tsx, vue, html, jinja, yaml, json]
+      language: python
+      pass_filenames: false
+
+  - repo: local
+    hooks:
+    - id: generate-pot
+      name: Generate POT
+      description: This hook generates the .pot file for internationalization.
+      entry: python ./scripts/i18n-messages extract --skip-untracked
+      types_or: [python, html, jinja]
+      language: python
+      pass_filenames: false
+      # Renovate bumps these alongside requirements.txt (same package rules, same PRs).
+      additional_dependencies:
+        - Babel==2.18.0
+        - Jinja2==3.1.6
+        - multipart==1.3.1
+        - "git+https://github.com/webpy/webpy.git@2598dfe693ff931a9c67196f0b904b13637ec19f"
+        - fastapi==0.143.0 # annoyingly, these three needed to be added when we started using contextvars in i18n files
+        - simplejson==3.20.2
+        - requests==2.34.2
+
+  - repo: local
+    hooks:
+    - id: detect-missing-i18n
+      name: Detect missing i18n
+      description: This hook checks .html files for i18n strings that might be missing.
+      entry: python ./scripts/detect_missing_i18n.py
+      types: [html]
+      language: python
+      require_serial: true
+
+  - repo: https://github.com/sqlfluff/sqlfluff
+    rev: 4.4.0
+    hooks:
+      - id: sqlfluff-lint
+        args: [--dialect, postgres]
+        files: \.sql$
+        # Rule exclusions and their rationale are documented in pyproject.toml
+        # under [tool.sqlfluff.core].
+
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.29.0
+    hooks:
+      - id: zizmor

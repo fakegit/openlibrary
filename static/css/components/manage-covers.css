@@ -1,0 +1,27 @@
+.manageCoversContainer {
+  width: 100%;
+  text-align: center;
+  /* Legacy value: sits inside a jQuery UI dialog. */
+  z-index: var(--z-index-overlay);
+}
+
+/* Revealed while the cover is hovered, or while the button has keyboard focus. */
+.manageCoversContainer .manageCovers {
+  opacity: 0;
+}
+
+:where(:hover) > .manageCoversContainer .manageCovers {
+  opacity: 1;
+}
+
+.manageCoversContainer .manageCovers:focus-within {
+  opacity: 1;
+}
+
+/* @width-breakpoint-tablet: 768px */
+@media only screen and (min-width: 768px) {
+  .imagesAdd,
+  .imagesManage {
+    padding: 0 var(--spacing-3xl) var(--spacing-lg);
+  }
+}

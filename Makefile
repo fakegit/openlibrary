@@ -5,49 +5,49 @@
 
 BUILD=static/build
 ACCESS_LOG_FORMAT='%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s"'
-GITHUB_EDITOR_WIDTH=127
-FLAKE_EXCLUDE=./.*,scripts/20*,vendor/*,node_modules/*
 COMPONENTS_DIR=openlibrary/components
+OSP_DUMP_LOCATION=/solr-updater-data/osp_totals.db
 
-# Use python from local env if it exists or else default to python in the path.
-PYTHON=$(if $(wildcard env),env/bin/python,python)
 
-.PHONY: all clean distclean git css js components i18n lint
+.PHONY: all clean distclean git css js components lit-components icons i18n lint frontend test test-py test-py-uv test-py-integration test-i18n
 
-all: git css js components i18n
+all: git frontend i18n
 
-css: static/css/page-*.less
-	mkdir -p $(BUILD)
-	parallel --verbose -q npx lessc {} $(BUILD)/{/.}.css --clean-css="--s1 --advanced --compatibility=ie8" ::: $^
+frontend: node_modules icons
+	# Regenerate the Custom Elements Manifest (committed; consumed by /developers/design)
+	npx cem analyze
+	node scripts/vite/build.mjs
 
-js:
-	mkdir -p $(BUILD)
-	rm -f $(BUILD)/*.js $(BUILD)/*.js.map
-	npm run build-assets:webpack
-	# This adds FSF licensing for AGPLv3 to our js (for librejs)
-	for js in $(BUILD)/*.js; do \
-		echo "// @license magnet:?xt=urn:btih:0b31508aeb0634b347b8270c7bee4d411b5d4109&dn=agpl-3.0.txt AGPL-v3.0" | cat - $$js > /tmp/js && mv /tmp/js $$js; \
-		echo "\n// @license-end"  >> $$js; \
-	done
+node_modules: package-lock.json package.json
+ifeq ($(LOCAL_DEV),true)
+	npm ci --no-audit --no-fund
+endif
 
-components: $(COMPONENTS_DIR)/*.vue
-	mkdir -p $(BUILD)
-	rm -rf $(BUILD)/components
-	# Run these silly things one at a time, because they don't support parallelization :(
-	parallel --verbose -q --jobs 1 \
-		npx vue-cli-service build --no-clean --mode production --dest $(BUILD)/components/production --target wc --name "ol-{/.}" "{}" \
-	::: $^
+css: node_modules
+	node scripts/vite/build.mjs --only css
+
+js: node_modules
+	node scripts/vite/build.mjs --only js
+
+components: node_modules icons
+	# Regenerate the Custom Elements Manifest (committed; consumed by /developers/design)
+	npx cem analyze
+	node scripts/vite/build.mjs --only components
+
+lit-components: components
+
+icons:
+	# Build the icon sprite and the Lit glyph module from static/icons/src/.
+	# Neither is committed. No node_modules prerequisite — the script is pure Node.
+	node scripts/build_icon_sprite.mjs
 
 i18n:
-	$(PYTHON) ./scripts/i18n-messages compile
+	python ./scripts/i18n-messages compile
 
 git:
-#Do not run these on DockerHub since it recursively clones all the repos before build initiates
-ifneq ($(DOCKER_HUB),TRUE)
 	git submodule init
 	git submodule sync
 	git submodule update
-endif
 
 clean:
 	rm -rf $(BUILD)
@@ -56,28 +56,35 @@ distclean:
 	git clean -fdx
 	git submodule foreach git clean -fdx
 
-load_sample_data:
-	@echo "loading sample docs from openlibrary.org website"
-	$(PYTHON) scripts/copydocs.py --list /people/anand/lists/OL1815L
-	curl http://localhost:8080/_dev/process_ebooks # hack to show books in returncart
 
 reindex-solr:
-	psql --host db openlibrary -t -c 'select key from thing' | sed 's/ *//' | grep '^/books/' | PYTHONPATH=$(PWD) xargs python openlibrary/solr/update_work.py -s http://web:8080/ -c conf/openlibrary.yml --data-provider=legacy
-	psql --host db openlibrary -t -c 'select key from thing' | sed 's/ *//' | grep '^/authors/' | PYTHONPATH=$(PWD) xargs python openlibrary/solr/update_work.py -s http://web:8080/ -c conf/openlibrary.yml --data-provider=legacy
-
-lint-diff:
-	git diff "$${BASE_BRANCH:-master}" -U0 | ./scripts/flake8-diff.sh
+    # Keep link in sync with ol-solr-updater-start and Jenkinsfile
+	curl -C - -L "https://archive.org/download/2023_openlibrary_osp_counts/osp_totals.db" -o $(OSP_DUMP_LOCATION)
+	psql --host db openlibrary -t -c 'select key from thing' | sed 's/ *//' | grep '^/books/' | xargs python openlibrary/solr/update.py --ol-url http://web:8080/ --osp-dump $(OSP_DUMP_LOCATION) --ol-config conf/openlibrary.yml --solr-next
+	psql --host db openlibrary -t -c 'select key from thing' | sed 's/ *//' | grep '^/authors/' | xargs python openlibrary/solr/update.py --ol-url http://web:8080/ --osp-dump $(OSP_DUMP_LOCATION) --ol-config conf/openlibrary.yml --solr-next
+	psql --host db openlibrary -t -c 'select key from thing' | sed 's/ *//' | grep -E '/(lists|series)/' | xargs python openlibrary/solr/update.py --ol-url http://web:8080/ --osp-dump $(OSP_DUMP_LOCATION) --ol-config conf/openlibrary.yml --solr-next
+	parallel -j4 python ./scripts/solr_builder/solr_builder/index_subjects.py ::: subject person place time
 
 lint:
-	# stop the build if there are Python syntax errors or undefined names
-	$(PYTHON) -m flake8 . --count --exclude=$(FLAKE_EXCLUDE) --select=E9,F63,F7,F82 --show-source --statistics
-ifndef CI
-	# exit-zero treats all errors as warnings, only run this in local dev while fixing issue, not CI as it will never fail.
-	$(PYTHON) -m flake8 . --count --exclude=$(FLAKE_EXCLUDE) --exit-zero --max-complexity=10 --max-line-length=$(GITHUB_EDITOR_WIDTH) --statistics
-endif
+	# See the pyproject.toml file for ruff's settings
+	uv run --with-requirements requirements_test.txt ruff check .
+
+PYTEST_ARGS ?= . --doctest-modules
 
 test-py:
-	pytest . --ignore=tests/integration --ignore=scripts/2011 --ignore=infogami --ignore=vendor --ignore=node_modules
+	pytest $(PYTEST_ARGS)
+
+test-py-uv:
+	uv run --with-requirements requirements_test.txt pytest $(PYTEST_ARGS)
+
+# Integration tests run the async DB models against a real PostgreSQL started
+# by pytest-postgresql. Requires pg_ctl on PATH (brew install postgresql@14).
+# Skipped by default (pyproject.toml: -m 'not integration'); this target opts in.
+test-py-integration:
+	uv run --with-requirements requirements_test.txt pytest -m integration openlibrary/tests/core/
+
+test-i18n:
+	python ./scripts/i18n-messages validate
 
 test:
-	make test-py && npm run test
+	make test-py && npm run test && make test-i18n

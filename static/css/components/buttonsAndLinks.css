@@ -1,0 +1,42 @@
+a.cancel {
+  color: var(--red);
+  font-family: var(--font-family-body);
+  font-size: inherit;
+}
+a.borrowResults:link {
+  color: var(--black);
+  text-decoration: none;
+}
+a.borrowResults:visited {
+  color: var(--black);
+  text-decoration: none;
+}
+a.borrowResults:hover {
+  color: var(--color-link);
+  text-decoration: underline;
+}
+a.borrowResults:active {
+  color: var(--color-link);
+  text-decoration: underline;
+}
+a.coverLook {
+  display: block;
+}
+/* Can possibly be removed provided there are no usages of .results
+   class outside search-result-item.css */
+a.results:link {
+  color: var(--black);
+  text-decoration: none;
+}
+a.results:visited {
+  color: var(--black);
+  text-decoration: none;
+}
+a.results:hover {
+  color: var(--color-link);
+  text-decoration: underline;
+}
+a.results:active {
+  color: var(--color-link);
+  text-decoration: underline;
+}

@@ -1,0 +1,234 @@
+$def with (user, loans, history_docs=None, current_page=1, show_next=False, ia_base_url="", provider_unreachable=[], provider_unauthorized=[])
+
+<style type="text/css">
+.date, .waitrank {
+    margin: 5px 0px;
+}
+.dialog .title {
+    font-weight: bold;
+}
+
+tr.expired {
+    background: #ffcdcd;
+}
+
+td.status, th.status {
+    padding: 15px;
+    text-align: center;
+}
+
+tr.row-available .status-value {
+    color: darkgreen;
+}
+
+tr.row-available {
+    background: #fffdcd;
+}
+
+td.actions form + form {
+    margin-top: 5px;
+}
+
+th.action {
+    width: 150px;
+}
+th.status {
+    width: 150px;
+}
+.loan-history {
+  margin-top: 1em;
+}
+
+.details-content header{
+    padding-left: 0px;
+}
+
+</style>
+
+<section class="active-loans-section">
+<header>
+    <h1 class="details-title">
+        $ungettext("Active Loan (%(count)d)", "Active Loans (%(count)d)", len(loans), count=len(loans))
+    </h1>
+</header>
+
+$# A library that could not be read is said so, rather than its loans just being
+$# absent. "No loans" and "we could not ask" look identical to a patron, and the
+$# second one is the state where they are about to borrow a book they already
+$# hold. The two notes are separate because the remedies differ: wait, or
+$# reconnect. See lenny.ProviderLoans (#13687).
+$# These arrive as provider names rather than counts so the patron can be told
+$# which library is affected. Rendering only len() would have made the lists
+$# pointless -- and "one of your libraries" is not something a patron can act on
+$# when they have several.
+$if provider_unreachable:
+    <div class="note" role="status">
+        <em>$ungettext("%(libraries)s could not be reached, so any loans there are not shown.", "These libraries could not be reached, so any loans there are not shown: %(libraries)s.", len(provider_unreachable), libraries=", ".join(provider_unreachable))</em>
+    </div>
+$if provider_unauthorized:
+    <div class="note" role="status">
+        <em>$ungettext("%(libraries)s needs reconnecting before its loans can be shown. Borrowing a book from it again will restore the connection.", "These libraries need reconnecting before their loans can be shown: %(libraries)s. Borrowing a book from one again will restore the connection.", len(provider_unauthorized), libraries=", ".join(provider_unauthorized))</em>
+    </div>
+
+<div>
+  $if len(loans) == 0:
+    <div><em>$_("You've not checked out any books at this moment.")</em></div>
+    <br>
+  $else:
+    <div class="borrow borrow-table collapse">
+      <table>
+          <thead>
+              <tr>
+                  <th class="titles" colspan="2">$_("Book")</th>
+                  <th class="actions">$_("Loan actions")</th>
+              </tr>
+          </thead>
+        <tbody>
+        <!-- for each borrow -->
+        $for loan in loans:
+          $ book = get_document(loan['book'])
+          $if book:
+              <tr data-userid="$(loan['userid'])">
+                <td class="cover">
+                $:render_template('covers/book_cover_small', book)
+                </td>
+                <td class="titles">
+                    <span class="book">
+                    <a href="$book.key" class="borrowResults">
+                    <strong>$book.title</strong>
+                    </a>
+                    </span>
+                    <span class="author">
+                    $:macros.BookByline([{'name': a.name, 'url': a.url()} for a in book.get_authors()])
+                    </span>
+                    $if loan['loaned_at']:
+                        <div class="date">
+                        Borrowed $datestr(datetime_from_utc_timestamp(loan['loaned_at']))
+                        </div>
+                    $ wlsize = book.get_waitinglist_size()
+                    $if wlsize:
+                        <div class="smallest lightgreen sansserif waitrank">
+                            $ungettext("There is %(count)d person waiting for this book.", "There are %(count)d people waiting for this book.", wlsize, count=wlsize)
+                        </div>
+                </td>
+                <td class="actions">
+                    $:render_template('account/loan_actions', loan)
+                </td>
+            </tr>
+        </tbody>
+    </table>
+  </div>
+</div>
+</section>
+
+<section class="waiting-list-section">
+<header>
+    <h1 class="details-title">$_("Books You're Waiting For")</h1>
+</header>
+
+<div>
+
+    $ waitinglist = user.get_waitinglist()
+    $if len(waitinglist) == 0:
+        <div><em>$_('You are not waiting for any books at this moment.')</em></div>
+    $else:
+        $# Confirmation strings for waitlist.js, which fills in the title; see confirm-template.js
+        <template id="leave-waitinglist-dialog"
+                  data-i18n="$json_encode({'title': _('Leave the waiting list?'), 'confirm': _('Leave waiting list'), 'cancel': _('Cancel'), 'close': _('Close')})">
+            $:_('You will lose your place in line for <strong>%(title)s</strong>.', title='')
+        </template>
+        <div class="borrow borrow-table collapse waitinglist">
+          <table>
+              <thead>
+                  <tr>
+                      <th class="titles" colspan="2">
+                      $ungettext("%(count)d book", "%(count)d books", len(waitinglist), count=len(waitinglist))
+                      </th>
+                      <th class="status">$_("Status")</th>
+                      <th class="actions">$_("Actions")</th>
+                  </tr>
+              </thead>
+              <tbody>
+              <!-- FIXME: Not internationalized. Uses internal status string directly -->
+              $for record in waitinglist:
+                $ book = record.get_book()
+                $ status = record['status']
+                $if book:
+                  <tr class="row-$status">
+                      <td class="cover">
+                      $:render_template('covers/book_cover_small', book)
+                      </td>
+                      <td class="titles">
+                          <span class="book">
+                              <a href="$book.key" class="borrowResults"><strong>$book.title</strong></a>
+                          </span>
+                          <span class="author">
+                              $:macros.BookByline([{'name': a.name, 'url': a.url()} for a in book.get_authors()])
+                          </span>
+                          <div class="date">
+                              $ ndays = record.get_waiting_in_days()
+                              $ungettext("Waiting for 1 day", "Waiting for %(count)d days", ndays, count=ndays)
+                          </div>
+                          <div class="smallest lightgreen sansserif waitrank">
+                              $if status == "waiting":
+                                  $ wsize = book.get_waitinglist_size()
+                                  $ pos = record.get_position()
+                                  $if pos == 1:
+                                      $_("You are the next person to receive this book.")
+                                  $else:
+                                      $ungettext("There is one person ahead of you in the waiting list.", "There are %(count)d people ahead of you in the waiting list.", pos-1, count=pos-1)
+                          </div>
+                      </td>
+                      <td class="status">
+                          <span class="status-value">$record['status'].title()</span><br/>
+                          $if status == "available":
+                              $ delta_hours = record.get_expiry_in_hours()
+                              <div class="smaller" style="padding-top: 5px;">
+                                  $if delta_hours == 0:
+                                      $_("You have less than an hour to borrow it.")
+                                  $else:
+                                      $ungettext("You have one more hour to borrow it.", "You have %(hours)d more hours to borrow it.", delta_hours, hours=delta_hours)
+                              </div>
+                      </td>
+                      <td class="actions">
+                          $if status == "available":
+                              <form action="$book.url('/borrow')" method="post">
+                                  <input type="hidden" name="action" value="borrow" />
+                                  <input type="submit" value="$_('Borrow Now')" />
+                              </form>
+                          <form action="$book.url('/borrow?redirect=/account/loans')"
+                                method="POST" class="wlform">
+                              <input type="hidden" name="action" value="leave-waitinglist"/>
+                              <a href="javascript:;" class="leave">$_("Leave the waiting list?")</a>
+                          </form>
+                      </td>
+                  </tr>
+              </tbody>
+          </table>
+        </div>
+</div>
+</section>
+
+<section class="loan-history-section">
+<header>
+    <h1 class="details-title">$_("Loan History")</h1>
+</header>
+
+<div class="mybooks-list">
+  $if history_docs and len(history_docs) > 0:
+    $:macros.OlPaginationArrows(current_page, show_next)
+    <ul class="list-books">
+      $for idx, doc in enumerate(history_docs):
+        $if doc.get('ia_only'):
+          $:macros.IABook(doc=doc, ia_base_url=ia_base_url)
+        $else:
+          $:macros.SearchResultsWork(doc, availability=doc.get('availability'), rating=None, seq_index=loop.index0)
+    </ul>
+    $:macros.OlPaginationArrows(current_page, show_next)
+  $else:
+    <ul class="list-books">
+        <li>$_("No loans found in your borrow history.")</li>
+        <li>$:_('<a href="/search">Search for a book</a> to borrow.')</li>
+    </ul>
+</div>
+</section>

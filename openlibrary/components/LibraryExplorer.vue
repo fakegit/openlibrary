@@ -1,25 +1,27 @@
 <template>
-  <div id="app">
-    <BookRoom
-      :classification="settingsState.selectedClassification"
-      :filter="computedFilter"
-      :sort="sortState.order"
-      :class="bookRoomClass"
-      :features="bookRoomFeatures"
-      :appSettings="settingsState"
-    />
+    <div id="app">
+        <BookRoom
+            :classification="settingsState.selectedClassification"
+            :filter="computedFilter"
+            :sort="sortState.order"
+            :class="bookRoomClass"
+            :features="bookRoomFeatures"
+            :app-settings="settingsState"
+            :jump-to="jumpTo"
+        />
 
-    <LibraryToolbar :filterState="filterState" :settingsState="settingsState" :sortState="sortState" />
-  </div>
+        <LibraryToolbar :filter-state="filterState" :settings-state="settingsState" :sort-state="sortState" />
+    </div>
 </template>
 
 <script>
-import BookRoom from './LibraryExplorer/components/BookRoom';
-import LibraryToolbar from './LibraryExplorer/components/LibraryToolbar';
+import BookRoom from './LibraryExplorer/components/BookRoom.vue';
+import LibraryToolbar from './LibraryExplorer/components/LibraryToolbar.vue';
 import DDC from './LibraryExplorer/ddc.json';
 import LCC from './LibraryExplorer/lcc.json';
 import { recurForEach } from './LibraryExplorer/utils.js';
-import maxBy from 'lodash/maxBy';
+import { sortable_lcc_to_short_lcc, short_lcc_to_sortable_lcc } from './LibraryExplorer/utils/lcc.js';
+import { maxBy } from '../plugins/openlibrary/js/nonjquery_utils.js';
 
 class FilterState {
     constructor() {
@@ -59,17 +61,19 @@ class FilterState {
 export default {
     components: {
         BookRoom,
-        LibraryToolbar,
+        LibraryToolbar
     },
     data() {
+        /** @type {import('./LibraryExplorer/utils').ClassificationTree[]} */
         const classifications = [
             {
                 name: 'DDC',
                 longName: 'Dewey Decimal Classification',
                 field: 'ddc',
                 fieldTransform: ddc => ddc,
-                chooseBest: ddcs => maxBy(ddcs, ddc => ddc.replace(/[\d.]/g, '') ? ddc.length : 100 + ddc.length),
-                root: recurForEach({ children: DDC }, n => {
+                toQueryFormat: ddc => ddc,
+                chooseBest: ddcs => maxBy(ddcs, ddc => (ddc.replace(/[\d.]/g, '') ? ddc.length : 100 + ddc.length)),
+                root: recurForEach({ children: DDC, query: '*' }, n => {
                     n.position = 'root';
                     n.offset = 0;
                     n.requests = {};
@@ -79,58 +83,52 @@ export default {
                 name: 'LCC',
                 longName: 'Library of Congress Classification',
                 field: 'lcc',
-                fieldTransform: lcc =>
-                    lcc
-                        .replace(/-+0+/, '')
-                        .replace(/\.0+\./, '.')
-                        .replace(/\.0+$/, ' ')
-                        .replace(/-+/, '')
-                        .replace(/0+(\.\D)/, ($0, $1) => $1),
+                fieldTransform: sortable_lcc_to_short_lcc,
+                toQueryFormat: lcc => {
+                    const normalized = short_lcc_to_sortable_lcc(lcc);
+                    return normalized ? normalized.split(' ')[0] : lcc;
+                },
                 chooseBest: lccs => maxBy(lccs, lcc => lcc.length),
-                root: recurForEach({ children: LCC }, n => {
+                root: recurForEach({ children: LCC, query: '*' }, n => {
                     n.position = 'root';
                     n.offset = 0;
                     n.requests = {};
                 })
             }
         ];
+
+        const urlParams = new URLSearchParams(location.search);
+        let selectedClassification = classifications[0];
+        let jumpTo = null;
+        if (urlParams.has('jumpTo')) {
+            const [classificationName, classificationString] = urlParams.get('jumpTo').split(':');
+            selectedClassification = classifications.find(c => c.field === classificationName);
+            jumpTo = selectedClassification.toQueryFormat(classificationString);
+        }
         return {
             filterState: new FilterState(),
 
             sortState: {
-                order: 'editions',
+                order: jumpTo ? `${selectedClassification.field}_sort asc` : `random_${new Date().toISOString().split(':')[0]}`
             },
 
+            jumpTo,
+
             settingsState: {
-                selectedClassification: classifications[0],
+                selectedClassification,
                 classifications,
 
                 labels: ['classification'],
 
                 styles: {
                     book: {
-                        options: [
-                            'default',
-                            '3d',
-                            'spines',
-                            '3d-spines',
-                            '3d-flat'
-                        ],
+                        options: ['default', '3d', 'spines', '3d-spines', '3d-flat'],
                         selected: 'default'
                     },
 
                     cover: {
-                        options: [
-                            'image',
-                            'text'
-                        ],
+                        options: ['image', 'text'],
                         selected: 'image'
-                    },
-
-                    shelf: {
-                        debugModeOnly: true,
-                        options: ['default', 'visual'],
-                        selected: 'default'
                     },
 
                     shelfLabel: {
@@ -147,10 +145,10 @@ export default {
 
                     scrollbar: {
                         options: ['default', 'thin', 'hidden'],
-                        selected: 'thin',
-                    },
-                },
-            },
+                        selected: 'thin'
+                    }
+                }
+            }
         };
     },
 
@@ -176,462 +174,278 @@ export default {
 };
 </script>
 
-<style lang="less">
+<style>
 #app {
-  font-family: "Avenir", Helvetica, Arial, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  color: rgba(0, 0, 0, .7);
+    font-family: 'Avenir', Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    color: rgba(0, 0, 0, 0.7);
 }
 
 details[open] summary ~ * {
-  animation: sweep .2s;
+    animation: sweep 0.2s;
 }
 
 @keyframes sweep {
-  0% {
-    opacity: 0;
-  }
-  100% {
-    opacity: 1;
-  }
+    0% {
+        opacity: 0;
+    }
+    100% {
+        opacity: 1;
+    }
 }
 
 .class-slider {
-  margin-bottom: 5px;
+    margin-bottom: 5px;
 }
 
 hr {
-  width: 100%;
+    width: 100%;
 }
 
-.book-room {
-  .class-slider .sections {
-    background: rgba(255, 255, 255, .3);
-    --highlight-color: rgba(255, 255, 255, .5);
+.book-room .class-slider .sections {
+    background: rgba(255, 255, 255, 0.3);
+    --highlight-color: rgba(255, 255, 255, 0.5);
     border-radius: 4px;
     height: 4px;
-  }
-
-  .book-end-start {
-    display: none;
-  }
-
-  .book {
-    position: relative;
-    margin-left: 10px;
-  }
-  .book-end-wrapper + .book { margin-left: 20px;}
-
-  .cover-label {
-    background: rgba(0, 0, 0, .5);
-    position: absolute;
-    bottom: 0;
-    font-size: .8em;
-    opacity: .9;
-    line-height: .8em;
-  }
 }
 
-.book-room.style--book--spines {
-  .book {
+.book-room .book-end-start {
+    display: none;
+}
+
+.book-room .book {
+    position: relative;
+    margin-left: 10px;
+}
+.book-room .book-end-wrapper + .book {
+    margin-left: 20px;
+}
+
+.book-room .cover-label {
+    background: rgba(0, 0, 0, 0.5);
+    position: absolute;
+    bottom: 0;
+    font-size: 0.8em;
+    opacity: 0.9;
+    line-height: 0.8em;
+}
+
+.book-room.style--book--spines .book {
     animation: 200ms slide-in;
-    transition: width .2s;
-    transition-delay: .5s;
+    transition: width 0.2s;
+    transition-delay: 0.5s;
     width: 40px;
     margin: 0;
     overflow: hidden;
+    overflow: clip;
     flex-shrink: 0;
-    overflow: hidden;
     margin-left: 1px;
-  }
+}
 
-  .book img {
+.book-room.style--book--spines .book img {
     width: 150px;
     margin-left: -40px;
     object-fit: cover;
     object-position: center;
-    transition: margin-left .2s;
-    transition-delay: .5s;
-  }
-  .book:hover img {
+    transition: margin-left 0.2s;
+    transition-delay: 0.5s;
+}
+.book-room.style--book--spines .book:hover img {
     margin-left: 0;
-  }
-  .book:hover {
+}
+.book-room.style--book--spines .book:hover {
     width: 150px;
-  }
 }
 
-.book-room.style--shelf--visual {
-  .book-end-start {
-    display: block;
-  }
-
-  .shelf-carousel[data-short="000"] {
-    background: url("https://images.unsplash.com/photo-1515524738708-327f6b0037a7?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1350&q=60")
-      rgba(0, 0, 0, .5) !important;
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="000"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1515524738708-327f6b0037a7?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1350&q=60");
-    background-position: center !Important;
-  }
-  .shelf-carousel[data-short="001"],
-  .shelf-carousel[data-short="001"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1472289065668-ce650ac443d2?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1350&q=60");
-    background-position: 0 center !Important;
-  }
-
-  .shelf-carousel[data-short="002"],
-  .shelf-carousel[data-short="002"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1457369804613-52c61a468e7d?ixlib=rb-1.2.1&auto=format&fit=crop&w=1350&q=60")
-      rgba(0, 0, 0, .5);
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="002"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1457369804613-52c61a468e7d?ixlib=rb-1.2.1&auto=format&fit=crop&w=1350&q=60");
-  }
-  .shelf-carousel[data-short="003"] {
-    background: url("https://images.unsplash.com/photo-1569766670290-f5581d3bb53f?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1379&q=60")
-      rgba(0, 0, 0, .5);
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="003"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1569766670290-f5581d3bb53f?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1379&q=60");
-  }
-  .shelf-carousel[data-short="010"],
-  .shelf-carousel[data-short="010"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1472173148041-00294f0814a2?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1350&q=60");
-  }
-  .shelf-carousel[data-short="020"] {
-    background: url("https://images.unsplash.com/photo-1507842217343-583bb7270b66?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1453&q=60")
-      rgba(0, 0, 0, .5);
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="020"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1507842217343-583bb7270b66?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1453&q=60");
-  }
-  .shelf-carousel[data-short="030"] {
-    background: url("https://images.unsplash.com/photo-1524402822060-94f4fb30f6ff?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1267&q=60")
-      rgba(0, 0, 0, .5);
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="030"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1524402822060-94f4fb30f6ff?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1267&q=60");
-  }
-  .shelf-carousel[data-short="100"] {
-    background: url("https://images.unsplash.com/photo-1593240637899-5fc06c754c2b?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=640&q=60")
-      rgba(0, 0, 0, .5);
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="100"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1593240637899-5fc06c754c2b?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=640&q=60");
-  }
-  .shelf-carousel[data-short="110"] {
-    background: url("https://images.unsplash.com/photo-1548691905-57c36cc8d935?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1349&q=60")
-      rgba(0, 0, 0, .5);
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="110"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1548691905-57c36cc8d935?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1349&q=60");
-  }
-  .shelf-carousel[data-short="120"] {
-    background: url("https://images.unsplash.com/photo-1527066579998-dbbae57f45ce?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=632&q=60")
-      rgba(0, 0, 0, .5);
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="120"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1527066579998-dbbae57f45ce?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=632&q=60");
-  }
-  .shelf-carousel[data-short="130"] {
-    background: url("https://images.unsplash.com/photo-1565492206137-0797f1ca6dc6?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1350&q=60")
-      rgba(0, 0, 0, .5);
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="130"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1565492206137-0797f1ca6dc6?ixlib=rb-1.2.1&ixid=eyJhcHBfaWQiOjEyMDd9&auto=format&fit=crop&w=1350&q=60");
-  }
-  .shelf-carousel[data-short="140"] {
-    background: url("https://upload.wikimedia.org/wikipedia/commons/8/88/Narrenschiff_%281549%29.jpg")
-      rgba(0, 0, 0, .5);
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="140"] .book-end-start {
-    background: url("https://upload.wikimedia.org/wikipedia/commons/8/88/Narrenschiff_%281549%29.jpg");
-  }
-  .shelf-carousel[data-short="150"] {
-    background: url("https://images.unsplash.com/photo-1582390644226-33bf6dd99cfc?ixlib=rb-1.2.1&auto=format&fit=crop&w=1350&q=60")
-      rgba(0, 0, 0, .5);
-    background-blend-mode: multiply;
-  }
-  .shelf-carousel[data-short="150"] .book-end-start {
-    background: url("https://images.unsplash.com/photo-1582390644226-33bf6dd99cfc?ixlib=rb-1.2.1&auto=format&fit=crop&w=1350&q=60");
-  }
-
-  .shelf-carousel[data-short="001"] .book-end-start {
-    width: 300px;
-    -webkit-mask-image: linear-gradient(137deg, black 55%, transparent 60%);
-    mask-image: linear-gradient(137deg, black 55%, transparent 60%);
-    position: sticky;
-    top: 0;
-    left: 0;
-    bottom: 0;
-  }
-  .shelf-carousel[data-short] .book-end-start {
-    background-position: 0 0;
-  }
-  .shelf-carousel[data-short] {
-    background-position: 0 0;
-  }
-
-  @media (max-width: 450px) {
-    .book-end-start {
-      position: static !Important;
-    }
-  }
-
-  .shelf-carousel {
-    background-size: cover;
-  }
-  .book-end-start {
-    width: 200px;
-    height: 100%;
-    flex-shrink: 0;
-
-    margin-right: -40px;
-    z-index: 2;
-    -webkit-mask-image: linear-gradient(to right, black 90%, transparent);
-    mask-image: linear-gradient(to right, black 90%, transparent);
-  }
-
-  .book-end-start h3 {
-    background: rgba(0, 0, 0, .3);
-    color: white;
-    font-family: Roboto;
-    font-weight: 300;
-    line-height: 1em;
-    font-size: 1.6em;
-    text-align: center;
-    padding: 10px;
-    text-shadow: 0 0 5px black;
-  }
+.book-room.style--book--3d .cover,
+.book-room.style--book--3d-spines .cover,
+.book-room.style--book--3d-flat .cover {
+    opacity: 0.8;
+    transition: opacity 0.2s;
 }
-
-.book-room.style--book--3d,
-.book-room.style--book--3d-spines,
-.book-room.style--book--3d-flat {
-  .cover {
-    opacity: .8;
-    transition: opacity .2s;
-  }
-  .book-end-wrapper + .book { margin-left: 60px; }
-  .book:hover .cover {
+.book-room.style--book--3d .book-end-wrapper + .book,
+.book-room.style--book--3d-spines .book-end-wrapper + .book,
+.book-room.style--book--3d-flat .book-end-wrapper + .book {
+    margin-left: 60px;
+}
+.book-room.style--book--3d .book:hover .cover,
+.book-room.style--book--3d-spines .book:hover .cover,
+.book-room.style--book--3d-flat .book:hover .cover {
     opacity: 1;
-  }
-  .book:hover .book-3d.css-box {
+}
+.book-room.style--book--3d .book:hover .book-3d.css-box,
+.book-room.style--book--3d-spines .book:hover .book-3d.css-box,
+.book-room.style--book--3d-flat .book:hover .book-3d.css-box {
     backface-visibility: hidden;
     transform: perspective(2000px) translate3d(-40px, 0, 100px) rotateY(-15deg);
-  }
-
-  .css-box,
-  .css-box > * {
-    transition-duration: .2s;
+}
+.book-room.style--book--3d .css-box,
+.book-room.style--book--3d .css-box > *,
+.book-room.style--book--3d-spines .css-box,
+.book-room.style--book--3d-spines .css-box > *,
+.book-room.style--book--3d-flat .css-box,
+.book-room.style--book--3d-flat .css-box > * {
+    transition-duration: 0.2s;
     transition-property: width, height, transform;
-  }
 }
 
-.book-room.style--book--3d-spines {
-  .book {
+.book-room.style--book--3d-spines .book {
     margin-left: -100px;
-  }
-
-  .book:hover {
-    z-index: 1;
-  }
+}
+.book-room.style--book--3d-spines .book:hover {
+    z-index: var(--z-index-local-1);
 }
 
-.book-room.style--book--3d-flat {
-  .css-box {
+.book-room.style--book--3d-flat .css-box {
     transform: unset !important;
-  }
-  .book {
+}
+.book-room.style--book--3d-flat .book {
     transform: rotateX(20deg);
     transform-style: preserve-3d;
     margin-left: 18px;
-  }
-  .book-end-wrapper + .book { margin-left: 40px; }
-  .books-carousel {
+}
+.book-room.style--book--3d-flat .book-end-wrapper + .book {
+    margin-left: 40px;
+}
+.book-room.style--book--3d-flat .books-carousel {
     perspective: 2000px;
-  }
 }
 
 #app {
-  font-family: "bahnschrift", -apple-system, BlinkMacSystemFont, "Segoe UI",
-    Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji",
-    "Segoe UI Symbol";
+    font-family:
+        'bahnschrift',
+        -apple-system,
+        BlinkMacSystemFont,
+        'Segoe UI',
+        Roboto,
+        Helvetica,
+        Arial,
+        sans-serif,
+        'Apple Color Emoji',
+        'Segoe UI Emoji',
+        'Segoe UI Symbol';
 }
 
 .book-room.style--aesthetic--wip {
-  background: linear-gradient(180deg,#ebdfc5 100px, #dbbe9f 1600px,#cba37e 4800px);
-  background-position: scroll;
-
-  .classification-short {
-    opacity: .6;
-  }
-  .bookshelf-wrapper {
+    background: linear-gradient(180deg, #ebdfc5 100px, #dbbe9f 1600px, #cba37e 4800px);
+    background-position: scroll;
+}
+.book-room.style--aesthetic--wip .classification-short {
+    opacity: 0.6;
+}
+.book-room.style--aesthetic--wip .bookshelf-wrapper {
     margin-left: 140px;
-  }
-  .bookshelf {
-    // background: linear-gradient(
-    //   to bottom,
-    //   #543721 0px,
-    //   #5a3b23 10px,
-    //   #7b5130 10px,
-    //   #5f432d
-    // );
-    background: linear-gradient(
-      to right,
-      rgba(29, 5, 0, .5),
-      rgba(61, 0, 0, .1) 20%,
-      transparent,
-      rgba(61, 0, 0, .1) 60%,
-      rgba(29, 5, 0, .5)
-    ),
-      linear-gradient(
-      to bottom,
-      transparent 0,
-      transparent 10px,
-      rgba(255, 191, 0, .4) 10px,
-      rgba(255, 191, 0, .1) 15px,
-      transparent 50px
-    ),
-      linear-gradient(
-      to bottom,
-      #543721 0,
-      #5a3b23 10px,
-      #7b5130 10px,
-      #5f432d
-    );
+}
+.book-room.style--aesthetic--wip .bookshelf {
+    background:
+        linear-gradient(to right, rgba(29, 5, 0, 0.5), rgba(61, 0, 0, 0.1) 20%, transparent, rgba(61, 0, 0, 0.1) 60%, rgba(29, 5, 0, 0.5)),
+        linear-gradient(to bottom, transparent 0, transparent 10px, rgba(255, 191, 0, 0.4) 10px, rgba(255, 191, 0, 0.1) 15px, transparent 50px),
+        linear-gradient(to bottom, #543721 0, #5a3b23 10px, #7b5130 10px, #5f432d);
     border: 0;
     padding: 10px;
     padding-top: 36px;
     box-sizing: border-box;
     color: white;
-  }
-
-  .bookshelf-name button {
+}
+.book-room.style--aesthetic--wip .bookshelf-name button {
     background: none;
     border: none;
     color: inherit;
-
     padding: 6px 8px;
-
     transition: background-color 0.2s;
     cursor: pointer;
-  }
-
-  .bookshelf-name button:hover {
-    background: rgba(255, 255, 255, .1);
-  }
-
-  .shelf {
-    display: flex;
-    flex-direction: column;
+}
+.book-room.style--aesthetic--wip .bookshelf-name button:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+.book-room.style--aesthetic--wip .shelf {
     margin-bottom: 35px;
-
-    .shelf-label { order: 1; }
-    .shelf-index { order: 2; }
-    .shelf-carousel { order: 3; }
-
-    .shelf-index {
-      padding: 4px 8px;
-      opacity: 0.95;
-
-      a {
-        border-radius: 4px;
-        border: 1px solid transparent;
-        line-height: 0.9em;
-      }
-      .selected {
-        background: rgba(255,255,255, 0.1);
-        border: 1px solid white;
-        border-left-width: 4px;
-        color: inherit;
-      }
-
-      .shelf-label--subclasses--count {
-        font-size: 0.8em;
-        font-weight: 300;
-        opacity: 0.8;
-        &::before {
-          content: "• "
-        }
-      }
-    }
-  }
-
-  .shelf-carousel {
+}
+.book-room.style--aesthetic--wip .shelf .shelf-index {
+    padding: 4px 8px;
+    opacity: 0.95;
+}
+.book-room.style--aesthetic--wip .shelf .shelf-index a {
+    border-radius: 4px;
+    border: 1px solid transparent;
+    line-height: 0.9em;
+}
+.book-room.style--aesthetic--wip .shelf .shelf-index .selected {
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid white;
+    border-left-width: 4px;
+    color: inherit;
+}
+.book-room.style--aesthetic--wip .shelf .shelf-index .shelf-label--subclasses--count {
+    font-size: 0.8em;
+    font-weight: 300;
+    opacity: 0.8;
+}
+.book-room.style--aesthetic--wip .shelf .shelf-index .shelf-label--subclasses--count::before {
+    content: '• ';
+}
+.book-room.style--aesthetic--wip .shelf-carousel {
     border: 0;
     margin: 0 10px;
-    @media (max-width: 450px) { margin: 0; }
     background-color: #563822;
-    background-image: linear-gradient(
-      to bottom,
-      rgba(0, 0, 0, .36),
-      #563822 50px
-    );
-  }
-
-  .class-slider.shelf-label {
+    background-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.36), #563822 50px);
+}
+@media (max-width: 450px) {
+    .book-room.style--aesthetic--wip .shelf-carousel {
+        margin: 0;
+    }
+}
+.book-room.style--aesthetic--wip .class-slider.shelf-label {
     border: 0;
     background: none;
-    color: rgba(255, 255, 255, .9);
+    color: rgba(255, 255, 255, 0.9);
     font-weight: 400;
     margin: 0;
     min-height: 2em;
-  }
-
-  .shelf-label {
+}
+.book-room.style--aesthetic--wip .shelf-label {
     background: none;
-  }
-
-  .class-slider.shelf-label small {
-    display: none;
-  }
-
-  .shelf-label button {
+}
+.book-room.style--aesthetic--wip .shelf-label button {
     border: 0;
     border-radius: 4px;
-    transition: background-color .2s;
+    transition: background-color 0.2s;
     cursor: pointer;
-
-    &.selected {
-      border: 1px solid white;
-      background-color: rgba(255, 255, 255, .3);
-    }
-  }
-
-  .shelf-label button:hover {
-    background-color: rgba(255, 255, 255, .2);
-  }
-  .shelf-label .sections {
+}
+.book-room.style--aesthetic--wip .shelf-label button.selected {
+    border: 1px solid white;
+    background-color: rgba(255, 255, 255, 0.3);
+}
+.book-room.style--aesthetic--wip .shelf-label button:hover {
+    background-color: rgba(255, 255, 255, 0.2);
+}
+.book-room.style--aesthetic--wip .shelf-label .sections {
     height: 4px;
     bottom: 0;
-  }
 }
 
-.book-room.style--scrollbar--thin {
-  .books-carousel { scrollbar-width: thin; }
-
-  // Chrome-specific scroll fixes
-  .books-carousel::-webkit-scrollbar { height: 6px; }
-  .books-carousel::-webkit-scrollbar-thumb { background: rgba(255,255,255, 0.35); }
-  .books-carousel::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255, 0.25); }
-  .books-carousel::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.2); }
+.book-room.style--scrollbar--thin .books-carousel {
+    scrollbar-width: thin;
+}
+/* Chrome-specific scroll fixes */
+.book-room.style--scrollbar--thin .books-carousel::-webkit-scrollbar {
+    height: 6px;
+}
+.book-room.style--scrollbar--thin .books-carousel::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.35);
+}
+.book-room.style--scrollbar--thin .books-carousel::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.25);
+}
+.book-room.style--scrollbar--thin .books-carousel::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.2);
 }
 
-.book-room.style--scrollbar--hidden {
-  .books-carousel { scrollbar-width: none; }
-  .books-carousel::-webkit-scrollbar { height: 0; }
+.book-room.style--scrollbar--hidden .books-carousel {
+    scrollbar-width: none;
+}
+.book-room.style--scrollbar--hidden .books-carousel::-webkit-scrollbar {
+    height: 0;
 }
 </style>

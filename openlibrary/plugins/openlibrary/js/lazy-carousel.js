@@ -1,0 +1,253 @@
+import { initialzeCarousels } from './carousel';
+import { initNativeCarousels } from './carousel/native.js';
+import { trackEvent } from './ol.analytics.js';
+import { buildPartialsUrl, whenVisible } from './utils';
+
+let relatedBooksTracked = false;
+let bannerClicked = false;
+
+const CAROUSEL_SELECTOR = '.carousel--progressively-enhanced, ol-carousel';
+// Includes grid rows, which have nothing to initialize.
+const ROW_SELECTOR = '.carousel, ol-carousel';
+
+function initCarousels(elems) {
+    const slick = [];
+    const native = [];
+    elems.forEach(elem => (elem.localName === 'ol-carousel' ? native : slick).push(elem));
+    initialzeCarousels(slick);
+    initNativeCarousels(native);
+}
+
+/**
+ * Sets up rows that arrive already loaded, like the "Browse the stacks" genre row.
+ *
+ * @param root {HTMLElement}
+ */
+export function initLoadedCarousels(root) {
+    initCarousels(root.querySelectorAll(CAROUSEL_SELECTOR));
+    // Counted like a lazy row's, which reports once it's loaded.
+    root.querySelectorAll('.lazy-carousel-loaded[data-config]').forEach(row => {
+        if (row.querySelector(CAROUSEL_SELECTOR)) trackImpression(row, JSON.parse(row.dataset.config).key);
+    });
+}
+
+document.addEventListener('click', e => {
+    if (e.target.closest('a[data-ol-link-track="OpenRelatedBooks|BannerClick"]')) {
+        bannerClicked = true;
+    }
+});
+
+/**
+ * Adds functionality that allows carousels to lazy-load when a patron
+ * scrolls near any of the given elements
+ *
+ * @param elems {NodeList<HTMLElement>} Collection of placeholder carousel elements
+ */
+export function initLazyCarousel(elems) {
+    elems.forEach(elem => {
+        whenVisible(elem).then(() => doFetchAndUpdate(elem));
+
+        // Add retry listener
+        const retryElem = elem.querySelector('.retry-btn');
+        retryElem.addEventListener('click', e => {
+            e.preventDefault();
+            handleRetry(elem);
+        });
+    });
+}
+
+/**
+ * Prepares and makes a request for carousel HTML.
+ *
+ * `config.partial` picks the partials endpoint (default: LazyCarousel);
+ * everything else in the config is sent as query params.
+ *
+ * @param config {object}
+ * @returns {Promise<Response>}
+ */
+async function fetchPartials(config) {
+    const { partial = 'LazyCarousel', ...params } = config;
+    return fetch(buildPartialsUrl(partial, params));
+}
+
+/**
+ * Attempts to fetch HTML for a single carousel, and updates the view
+ * with the results.
+ *
+ * If the request is successful, the given `target` element is replaced
+ * by the carousel.  Otherwise, a retry button is presented to the patron.
+ *
+ * On retry, this function is called again.
+ *
+ * @param target {HTMLElement} A placeholder element for a carousel
+ */
+function doFetchAndUpdate(target) {
+    const requested = target.dataset.config;
+    const config = JSON.parse(requested);
+    const skeleton = target.querySelector('.carousel-skeleton');
+
+    fetchPartials(config)
+        .then(resp => {
+            if (!resp.ok) {
+                throw new Error('Failed to fetch partials from server');
+            }
+            return resp.json();
+        })
+        .then(data => {
+            // The shelf's sort changed while this was in flight.
+            if (target.dataset.config !== requested) {
+                doFetchAndUpdate(target);
+                return;
+            }
+            const newElem = document.createElement('div');
+            newElem.className = 'lazy-carousel-loaded';
+            newElem.innerHTML = (data.partials || '').trim();
+            const carouselElements = newElem.querySelectorAll(CAROUSEL_SELECTOR);
+            const hasRow = newElem.querySelector(ROW_SELECTOR) !== null;
+            skeleton.classList.add('hidden');
+
+            if (!newElem.innerHTML && !config.fallback) {
+                // Nothing to show (e.g. no Nearby Books); free the space.
+                target.remove();
+            } else if (!hasRow && config.fallback) {
+                // No results, disable filters
+                if (typeof config.fallback === 'string') {
+                    config.query = config.fallback;
+                }
+                config.has_fulltext_only = false;
+                config.fallback = false; // Prevents infinite retries
+                target.dataset.config = JSON.stringify(config);
+
+                target.querySelector('.lazy-carousel-fallback').classList.remove('hidden');
+            } else if (!hasRow) {
+                target.remove();
+            } else {
+                // Keep the config for refetches and the id for jump links.
+                newElem.dataset.config = JSON.stringify(config);
+                if (target.id) newElem.id = target.id;
+                target.parentNode.insertBefore(newElem, target);
+                target.remove();
+                initCarousels(carouselElements);
+                if (carouselElements.length) trackImpression(newElem, config.key);
+
+                // ==========================================
+                // EXPERIMENT TRACKING: Related Books Discovery
+                // Tracks natural scrolling vs banner clicks.
+                // Can be safely deleted no problems
+                // ==========================================
+                if (config.key === 'related-subjects-carousel' || config.key === 'related-authors-carousel') {
+                    const body = document.getElementById('contentBody');
+                    const lendingState = body ? body.getAttribute('data-lending-state') : null;
+                    const unavailableStates = ['preview_only', 'checkedout', 'waitlist', 'locate'];
+                    const isUnavailable = unavailableStates.indexOf(lendingState) !== -1;
+
+                    let action;
+                    if (bannerClicked) {
+                        action = 'FromBanner';
+                    } else if (isUnavailable) {
+                        action = 'ScrolledDownUnavailable';
+                    } else {
+                        action = 'ScrolledDownAvailable';
+                    }
+
+                    if (!relatedBooksTracked && window.archive_analytics && window.archive_analytics.ol_send_event_ping) {
+                        window.archive_analytics.ol_send_event_ping({
+                            category: 'OpenRelatedBooks',
+                            action: action,
+                            label: lendingState
+                        });
+                        relatedBooksTracked = true;
+                    }
+                }
+            }
+        })
+        .catch(() => {
+            skeleton.classList.add('hidden');
+            const retryElem = target.querySelector('.lazy-carousel-retry');
+            retryElem.classList.remove('hidden');
+        });
+}
+
+/**
+ * Reports `BookCarousel|Impression|<key>` once, when at least half of a
+ * loaded carousel is on screen. Pairs with the carousel's click events.
+ *
+ * @param elem {HTMLElement}
+ * @param key {string}
+ */
+function trackImpression(elem, key) {
+    whenVisible(elem, { rootMargin: '0px', threshold: 0.5 }).then(() => trackEvent('BookCarousel', 'Impression', key));
+}
+
+/**
+ * Shows loading indicator, hides retry element, and attempts to
+ * fetch data and update the view again.
+ *
+ * @param target {Element}
+ */
+function handleRetry(target) {
+    target.querySelector('.carousel-skeleton').classList.remove('hidden');
+    target.querySelector('.lazy-carousel-retry').classList.add('hidden');
+    const carouselFallbackElem = target.querySelector('.lazy-carousel-fallback');
+    if (carouselFallbackElem) {
+        carouselFallbackElem.classList.add('hidden');
+    }
+    doFetchAndUpdate(target);
+}
+
+// A "Browse the stacks" shelf's sort control re-sorts every row, loaded or not.
+document.addEventListener('ol-menu-popover-select', e => {
+    const shelf = e.target.closest?.('.genre-shelf__sort')?.closest('.genre-shelf');
+    if (!shelf) return;
+    const sort = e.detail.value;
+    // The menu fires for the current item too.
+    if (sort === shelf.dataset.sort) return;
+    shelf.dataset.sort = sort;
+    trackEvent('CarouselSort', sort, `genre-${shelf.dataset.genre}`);
+    shelf.querySelectorAll('.lazy-carousel-loaded[data-config]').forEach(row => {
+        refetch(row, { ...JSON.parse(row.dataset.config), sort });
+    });
+    shelf.querySelectorAll('.lazy-carousel[data-config]').forEach(placeholder => {
+        placeholder.dataset.config = JSON.stringify({ ...JSON.parse(placeholder.dataset.config), sort });
+    });
+});
+
+// So a slower earlier response can't overwrite a newer one.
+const latestRefetch = new WeakMap();
+
+/**
+ * Re-renders a loaded carousel for `config`, keeping the old cards dimmed until then.
+ *
+ * @param host {HTMLElement}
+ * @param config {object}
+ */
+function refetch(host, config) {
+    const previous = JSON.parse(host.dataset.config);
+    const request = {};
+    latestRefetch.set(host, request);
+    host.dataset.config = JSON.stringify(config);
+    host.classList.add('lazy-carousel-loaded--refreshing');
+    host.setAttribute('aria-busy', 'true');
+
+    fetchPartials(config)
+        .then(resp => {
+            if (!resp.ok) {
+                throw new Error('Failed to fetch partials from server');
+            }
+            return resp.json();
+        })
+        .then(data => {
+            if (latestRefetch.get(host) !== request) return;
+            host.innerHTML = data.partials.trim();
+            initCarousels(host.querySelectorAll(CAROUSEL_SELECTOR));
+        })
+        .catch(() => {
+            if (latestRefetch.get(host) !== request) return;
+            host.dataset.config = JSON.stringify(previous);
+        })
+        .finally(() => {
+            if (latestRefetch.get(host) !== request) return;
+            host.classList.remove('lazy-carousel-loaded--refreshing');
+            host.removeAttribute('aria-busy');
+        });
+}

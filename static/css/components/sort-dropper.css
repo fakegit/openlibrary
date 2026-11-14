@@ -1,0 +1,7 @@
+/* The sort control is <ol-menu-popover>, painted by the component and
+   ol-button.css. Only the shuffle link beside it needs styling here. */
+
+.sort-random-shuffle {
+  display: inline-flex;
+  padding: 5px;
+}

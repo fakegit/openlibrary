@@ -1,0 +1,3 @@
+$def with ()
+
+$:render_jinja_template("SearchNavigation.html.jinja", nav=dict(path=ctx.path, q_query=urlencode(dict(q=query_param("q", ""))), advanced_href=changequery(_path="/advancedsearch", page=None)))

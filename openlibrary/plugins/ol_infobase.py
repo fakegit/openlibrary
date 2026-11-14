@@ -1,9 +1,8 @@
 #!/usr/bin/env python
-"""Open Library plugin for infobase.
-"""
-from __future__ import print_function
+"""Open Library plugin for infobase."""
 
-import datetime
+import datetime as dt
+import functools
 import json
 import logging
 import logging.config
@@ -11,13 +10,13 @@ import os
 import re
 import sys
 import traceback
-import unicodedata
 
 import requests
-import six
 import web
 
-from infogami.infobase import cache, common, config, dbstore, server
+from infogami.infobase import cache as _ib_cache
+from infogami.infobase import common, config, dbstore, server
+from openlibrary.plugins.upstream.utils import strip_accents
 
 from ..utils.isbn import isbn_10_to_isbn_13, isbn_13_to_isbn_10, normalize_isbn
 
@@ -29,32 +28,32 @@ logger = logging.getLogger("infobase.ol")
 
 def init_plugin():
     """Initialize infobase plugin."""
-    from infogami.infobase import common, dbstore
+    from infogami.infobase import common, dbstore, server
     from infogami.infobase import logger as infobase_logger
-    from infogami.infobase import server
+
     dbstore.default_schema = schema.get_schema()
 
     # Replace infobase Indexer with OL custom Indexer
     dbstore.Indexer = OLIndexer
 
-    if config.get('errorlog'):
-        common.record_exception = lambda: save_error(config.errorlog, 'infobase')
+    if config.get("errorlog"):
+        common.record_exception = lambda: save_error(config.errorlog, "infobase")  # type: ignore[attr-defined]
 
-    ol = server.get_site('openlibrary.org')
+    ol = server.get_site("openlibrary.org")
     ib = server._infobase
 
-    if config.get('writelog'):
+    if config.get("writelog"):
         ib.add_event_listener(infobase_logger.Logger(config.writelog))
 
     ib.add_event_listener(invalidate_most_recent_change)
     setup_logging()
 
-    if ol:
+    if ol:  # noqa: SIM102
         # install custom indexer
         # XXX-Anand: this might create some trouble. Commenting out.
         # ol.store.indexer = Indexer()
 
-        if config.get('http_listeners'):
+        if config.get("http_listeners"):
             logger.info("setting up http listeners")
             ol.add_trigger(None, http_notify)
 
@@ -102,66 +101,92 @@ class _inspect:
 
     Tries to import _inspect module and executes inspect function in that. The module is reloaded on every invocation.
     """
+
     def GET(self):
         sys.modules.pop("_inspect", None)
         try:
             import _inspect
+
             return _inspect.inspect()
         except Exception:
             return traceback.format_exc()
 
 
 def get_db():
-    site = server.get_site('openlibrary.org')
+    site = server.get_site("openlibrary.org")
     return site.store.db
 
 
-@web.memoize
+@functools.cache
 def get_property_id(type, name):
     db = get_db()
     type_id = get_thing_id(type)
     try:
-        return db.where('property', type=type_id, name=name)[0].id
+        return db.where("property", type=type_id, name=name)[0].id
     except IndexError:
         return None
 
 
 def get_thing_id(key):
     try:
-        return get_db().where('thing', key=key)[0].id
+        return get_db().where("thing", key=key)[0].id
     except IndexError:
         return None
 
 
+# `count(table, ...)` interpolates `table` raw into the SQL. All current
+# callers pass a hard-coded literal ("edition_ref"), but limit the accepted
+# values explicitly so a future caller can't turn this into a SQL injection
+# sink by forwarding user input as the table name. Add to the set if a new
+# legitimate caller needs to count a different table.
+_COUNT_ALLOWED_TABLES = frozenset({"edition_ref"})
+
+
 def count(table, type, key, value):
+    if table not in _COUNT_ALLOWED_TABLES:
+        raise ValueError(f"Invalid table: {table!r}. Must be one of {sorted(_COUNT_ALLOWED_TABLES)}.")
     pid = get_property_id(type, key)
 
     value_id = get_thing_id(value)
     if value_id is None:
         return 0
-    return get_db().query("SELECT count(*) FROM " + table + " WHERE key_id=$pid AND value=$value_id", vars=locals())[0].count
+    return (
+        get_db()
+        .query(
+            "SELECT count(*) FROM " + table + " WHERE key_id=$pid AND value=$value_id",
+            vars=locals(),
+        )[0]
+        .count
+    )
 
 
 class count_editions_by_author:
     @server.jsonify
     def GET(self, sitename):
-        i = server.input('key')
-        return count('edition_ref', '/type/edition', 'authors', i.key)
+        i = server.input("key")
+        return count("edition_ref", "/type/edition", "authors", i.key)
 
 
 class count_editions_by_work:
     @server.jsonify
     def GET(self, sitename):
-        i = server.input('key')
-        return count('edition_ref', '/type/edition', 'works', i.key)
+        i = server.input("key")
+        return count("edition_ref", "/type/edition", "works", i.key)
 
 
 class count_edits_by_user:
     @server.jsonify
     def GET(self, sitename):
-        i = server.input('key')
+        i = server.input("key")
         author_id = get_thing_id(i.key)
-        return get_db().query("SELECT count(*) as count FROM transaction WHERE author_id=$author_id", vars=locals())[0].count
+        return (
+            get_db()
+            .query(
+                "SELECT count(*) as count FROM transaction WHERE author_id=$author_id",
+                vars=locals(),
+            )[0]
+            .count
+        )
 
 
 class has_user:
@@ -170,12 +195,15 @@ class has_user:
         i = server.input("username")
 
         # Don't allows OLIDs to be usernames
-        if web.re_compile(r"OL\d+[A-Z]").match(i.username.upper()):
+        if re.compile(r"OL\d+[A-Z]").match(i.username.upper()):
             return True
 
         key = "/user/" + i.username.lower()
         type_user = get_thing_id("/type/user")
-        d = get_db().query("SELECT * from thing WHERE lower(key) = $key AND type=$type_user", vars=locals())
+        d = get_db().query(
+            "SELECT * from thing WHERE lower(key) = $key AND type=$type_user",
+            vars=locals(),
+        )
         return bool(d)
 
 
@@ -186,16 +214,16 @@ class stats:
 
     def stats(self, today):
         tomorrow = self.nextday(today)
-        yield 'edits', self.edits(today, tomorrow)
-        yield 'edits_by_bots', self.edits(today, tomorrow, bots=True)
-        yield 'new_accounts', self.new_accounts(today, tomorrow)
+        yield "edits", self.edits(today, tomorrow)
+        yield "edits_by_bots", self.edits(today, tomorrow, bots=True)
+        yield "new_accounts", self.new_accounts(today, tomorrow)
 
     def nextday(self, today):
         return get_db().query("SELECT date($today) + 1 AS value", vars=locals())[0].value
 
     def edits(self, today, tomorrow, bots=False):
-        tables = 'version v, transaction t'
-        where = 'v.transaction_id=t.id AND t.created >= date($today) AND t.created < date($tomorrow)'
+        tables = "version v, transaction t"
+        where = "v.transaction_id=t.id AND t.created >= date($today) AND t.created < date($tomorrow)"
 
         if bots:
             where += " AND t.author_id IN (SELECT thing_id FROM account WHERE bot = 't')"
@@ -203,23 +231,19 @@ class stats:
         return self.count(tables=tables, where=where, vars=locals())
 
     def new_accounts(self, today, tomorrow):
-        type_user = get_thing_id('/type/user')
+        type_user = get_thing_id("/type/user")
         return self.count(
-            'thing',
-            'type=$type_user AND created >= date($today) AND created < date($tomorrow)',
-            vars=locals())
+            "thing",
+            "type=$type_user AND created >= date($today) AND created < date($tomorrow)",
+            vars=locals(),
+        )
 
     def total_accounts(self):
-        type_user = get_thing_id('/type/user')
-        return self.count(tables='thing', where='type=$type_user', vars=locals())
+        type_user = get_thing_id("/type/user")
+        return self.count(tables="thing", where="type=$type_user", vars=locals())
 
     def count(self, tables, where, vars):
-        return get_db().select(
-            what="count(*) as value",
-            tables=tables,
-            where=where,
-            vars=vars
-        )[0].value
+        return get_db().select(what="count(*) as value", tables=tables, where=where, vars=vars)[0].value
 
 
 most_recent_change = None
@@ -235,8 +259,8 @@ class most_recent:
     def GET(self, sitename):
         global most_recent_change
         if most_recent_change is None:
-            site = server.get_site('openlibrary.org')
-            most_recent_change = site.versions({'limit': 1})[0]
+            site = server.get_site("openlibrary.org")
+            most_recent_change = site.versions({"limit": 1})[0]
         return most_recent_change
 
 
@@ -244,46 +268,53 @@ class clear_cache:
     @server.jsonify
     def POST(self, sitename):
         from infogami.infobase import cache
+
         cache.global_cache.clear()
-        return {'done': True}
+        return {"done": True}
 
 
 class olid_to_key:
     @server.jsonify
     def GET(self, sitename):
-        i = server.input('olid')
-        d = get_db().query('SELECT key FROM thing WHERE get_olid(key) = $i.olid', vars=locals())
-        key = d and d[0].key or None
-        return {'olid': i.olid, 'key': key}
+        i = server.input("olid")
+        d = get_db().query("SELECT key FROM thing WHERE get_olid(key) = $i.olid", vars=locals())
+        key = (d and d[0].key) or None
+        return {"olid": i.olid, "key": key}
 
 
 def write(path, data):
     dir = os.path.dirname(path)
     if not os.path.exists(dir):
         os.makedirs(dir)
-    f = open(path, 'w')
-    f.write(data)
-    f.close()
+    with open(path, "w") as file:
+        file.write(data)
 
 
 def save_error(dir, prefix):
     try:
         logger.error("Error", exc_info=True)
         error = web.djangoerror()
-        now = datetime.datetime.utcnow()
-        path = '%s/%04d-%02d-%02d/%s-%02d%02d%02d.%06d.html' % (
+        now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
+        path = "%s/%04d-%02d-%02d/%s-%02d%02d%02d.%06d.html" % (
             dir,
-            now.year, now.month, now.day, prefix,
-            now.hour, now.minute, now.second, now.microsecond
+            now.year,
+            now.month,
+            now.day,
+            prefix,
+            now.hour,
+            now.minute,
+            now.second,
+            now.microsecond,
         )
-        logger.error('Error saved to %s', path)
+        logger.error("Error saved to %s", path)
         write(path, web.safestr(error))
     except Exception:
-        logger.error('Exception in saving the error', exc_info=True)
+        logger.error("Exception in saving the error", exc_info=True)
 
 
 def get_object_data(site, thing):
     """Return expanded data of specified object."""
+
     def expand(value):
         if isinstance(value, list):
             return [expand(v) for v in value]
@@ -296,7 +327,7 @@ def get_object_data(site, thing):
     d = thing._get_data()
     for k, v in d.items():
         # save some space by not expanding type
-        if k != 'type':
+        if k != "type":
             d[k] = expand(v)
     return d
 
@@ -310,12 +341,22 @@ def http_notify(site, old, new):
         data = new.format_data()
 
     json_data = json.dumps(data)
-    key = data['key']
+    key = data["key"]
 
     # optimize the most common case.
     # The following prefixes are never cached at the client. Avoid cache invalidation in that case.
-    not_cached = ['/b/', '/a/', '/books/', '/authors/', '/works/', '/subjects/', '/publishers/', '/user/',
-                  '/usergroup/', '/people/']
+    not_cached = [
+        "/b/",
+        "/a/",
+        "/books/",
+        "/authors/",
+        "/works/",
+        "/subjects/",
+        "/publishers/",
+        "/user/",
+        "/usergroup/",
+        "/people/",
+    ]
     for prefix in not_cached:
         if key.startswith(prefix):
             return
@@ -324,10 +365,10 @@ def http_notify(site, old, new):
         try:
             response = requests.get(url, params=json_data)
             response.raise_for_status()
-            print('http_notify', repr(url), repr(key), repr(response.text), file=web.debug)
+            print("http_notify", repr(url), repr(key), repr(response.text), file=web.debug)
         except Exception:
-            print('failed to send http_notify', repr(url), repr(key), file=web.debug)
-            import traceback
+            print("failed to send http_notify", repr(url), repr(key), file=web.debug)
+
             traceback.print_exc()
 
 
@@ -336,9 +377,9 @@ class MemcacheInvalidater:
         self.memcache = self.get_memcache_client()
 
     def get_memcache_client(self):
-        _cache = config.get('cache', {})
-        if _cache.get('type') == 'memcache' and 'servers' in _cache:
-            return olmemcache.Client(_cache['servers'])
+        _cache = config.get("cache", {})
+        if _cache.get("type") == "memcache" and "servers" in _cache:
+            return olmemcache.Client(_cache["servers"])
 
     def to_dict(self, d):
         if isinstance(d, dict):
@@ -354,18 +395,18 @@ class MemcacheInvalidater:
         old = self.to_dict(old)
         new = self.to_dict(new)
 
-        type = old['type']['key']
+        type = old["type"]["key"]
 
-        if type == '/type/author':
+        if type == "/type/author":
             keys = self.invalidate_author(site, old)
-        elif type == '/type/edition':
+        elif type == "/type/edition":
             keys = self.invalidate_edition(site, old)
-        elif type == '/type/work':
+        elif type == "/type/work":
             keys = self.invalidate_work(site, old)
         else:
             keys = self.invalidate_default(site, old)
 
-        self.memcache.delete_multi(['details/' + k for k in keys])
+        self.memcache.delete_multi(["details/" + k for k in keys])
 
     def invalidate_author(self, site, old):
         yield old.key
@@ -373,23 +414,23 @@ class MemcacheInvalidater:
     def invalidate_edition(self, site, old):
         yield old.key
 
-        for w in old.get('works', []):
-            if 'key' in w:
-                yield w['key']
+        for w in old.get("works", []):
+            if "key" in w:
+                yield w["key"]
 
     def invalidate_work(self, site, old):
         yield old.key
 
         # invalidate all work.editions
-        editions = site.things({'type': '/type/edition', 'work': old.key})
+        editions = site.things({"type": "/type/edition", "work": old.key})
         for e in editions:
-            yield e['key']
+            yield e["key"]
 
         # invalidate old.authors
-        authors = old.get('authors', [])
+        authors = old.get("authors", [])
         for a in authors:
-            if 'author' in a and 'key' in a['author']:
-                yield a['author']['key']
+            if "author" in a and "key" in a["author"]:
+                yield a["author"]["key"]
 
     def invalidate_default(self, site, old):
         yield old.key
@@ -397,29 +438,33 @@ class MemcacheInvalidater:
 
 # openlibrary.utils can't be imported directly because
 # openlibrary.plugins.openlibrary masks openlibrary module
-olmemcache = __import__('openlibrary.utils.olmemcache', None, None, ['x'])
+olmemcache = __import__("openlibrary.utils.olmemcache", None, None, ["x"])
 
 
 def MemcachedDict(servers=None):
     servers = servers or []
     """Cache implementation with OL customized memcache client."""
     client = olmemcache.Client(servers)
-    return cache.MemcachedDict(memcache_client=client)
+    return _ib_cache.MemcachedDict(memcache_client=client)
 
 
-cache.register_cache('memcache', MemcachedDict)
+_ib_cache.register_cache("memcache", MemcachedDict)
 
 
 def _process_key(key):
     mapping = (
-        '/l/', '/languages/',
-        '/a/', '/authors/',
-        '/b/', '/books/',
-        '/user/', '/people/'
+        "/l/",
+        "/languages/",
+        "/a/",
+        "/authors/",
+        "/b/",
+        "/books/",
+        "/user/",
+        "/people/",
     )
     for old, new in web.group(mapping, 2):
         if key.startswith(old):
-            return new + key[len(old):]
+            return new + key[len(old) :]
     return key
 
 
@@ -427,15 +472,15 @@ def _process_data(data):
     if isinstance(data, list):
         return [_process_data(d) for d in data]
     elif isinstance(data, dict):
-        if 'key' in data:
-            data['key'] = _process_key(data['key'])
-        return dict((k, _process_data(v)) for k, v in data.items())
+        if "key" in data:
+            data["key"] = _process_key(data["key"])
+        return {k: _process_data(v) for k, v in data.items()}
     else:
         return data
 
 
 def safeint(value, default=0):
-    """Convers the value to integer. Returns 0, if the conversion fails."""
+    """Convert the value to integer. Returns default, if the conversion fails."""
     try:
         return int(value)
     except Exception:
@@ -443,43 +488,63 @@ def safeint(value, default=0):
 
 
 def fix_table_of_contents(table_of_contents):
-    """Some books have bad table_of_contents. This function converts them in to correct format.
-    """
+    """Some books have bad table_of_contents. This function converts them in to correct format."""
+
+    core_fields = ("level", "label", "title", "pagenum")
+
     def row(r):
-        if isinstance(r, six.string_types):
+        extra_fields = {}
+        if isinstance(r, str):
             level = 0
-            label = ''
-            title = web.safeunicode(r)
-            pagenum = ''
-        elif 'value' in r:
+            label = ""
+            title = str(r)
+            pagenum = ""
+        elif "value" in r:
             level = 0
-            label = ''
-            title = web.safeunicode(r['value'])
-            pagenum = ''
+            label = ""
+            title = str(r["value"])
+            pagenum = ""
         elif isinstance(r, dict):
-            level = safeint(r.get('level', '0'), 0)
-            label = r.get('label', '')
-            title = r.get('title', '')
-            pagenum = r.get('pagenum', '')
+            level = safeint(r.get("level", "0"), 0)
+            label = r.get("label", "")
+            title = r.get("title", "")
+            pagenum = r.get("pagenum", "")
+            # Only the core fields need coercing; anything else a toc_item
+            # carries (authors, subtitle, description, ...) passes through.
+            extra_fields = {k: v for k, v in r.items() if k not in core_fields}
         else:
             return {}
 
-        return dict(level=level, label=label, title=title, pagenum=pagenum)
+        return {
+            "level": level,
+            "label": label,
+            "title": title,
+            "pagenum": pagenum,
+            **extra_fields,
+        }
 
     d = [row(r) for r in table_of_contents]
-    return [row for row in d if any(row.values())]
+    return [row for row in d if any(row.get(k) for k in core_fields)]
 
 
 def process_json(key, json_str):
     if key is None or json_str is None:
         return None
-    base = key[1:].split('/')[0]
-    if base in ['authors', 'books', 'works', 'languages', 'people', 'usergroup', 'permission']:
+    base = key[1:].split("/")[0]
+    if base in [
+        "authors",
+        "books",
+        "works",
+        "languages",
+        "people",
+        "usergroup",
+        "permission",
+    ]:
         data = json.loads(json_str)
         data = _process_data(data)
 
-        if base == 'books' and 'table_of_contents' in data:
-            data['table_of_contents'] = fix_table_of_contents(data['table_of_contents'])
+        if base == "books" and "table_of_contents" in data:
+            data["table_of_contents"] = fix_table_of_contents(data["table_of_contents"])
 
         json_str = json.dumps(data)
     return json_str
@@ -489,22 +554,22 @@ dbstore.process_json = process_json
 
 _Indexer = dbstore.Indexer
 
-re_normalize = re.compile('[^[:alphanum:] ]', re.U)
+re_normalize = re.compile("[^[:alphanum:] ]", re.UNICODE)
 
 
-class OLIndexer(_Indexer):
-    """OL custom indexer to index normalized_title etc.
-    """
+class OLIndexer(_Indexer):  # type: ignore[misc,valid-type]
+    """OL custom indexer to index normalized_title etc."""
+
     def compute_index(self, doc):
         type = self.get_type(doc)
 
-        if type == '/type/edition':
+        if type == "/type/edition":
             doc = self.process_edition_doc(doc)
 
         return _Indexer.compute_index(self, doc)
 
     def get_type(self, doc):
-        return doc.get('type', {}).get('key')
+        return doc.get("type", {}).get("key")
 
     def process_edition_doc(self, doc):
         """Process edition doc to add computed fields used for import.
@@ -513,36 +578,31 @@ class OLIndexer(_Indexer):
         """
         doc = dict(doc)
 
-        title = doc.get('title', '')
-        doc['normalized_title_'] = self.normalize_edition_title(title)
+        title = doc.get("title", "")
+        doc["normalized_title_"] = self.normalize_edition_title(title)
 
-        isbns = doc.get('isbn_10', []) + doc.get('isbn_13', [])
+        isbns = doc.get("isbn_10", []) + doc.get("isbn_13", [])
         isbns = [normalize_isbn(isbn) for isbn in isbns if normalize_isbn(isbn)]
-        doc['isbn_'] = self.expand_isbns(isbns)
+        doc["isbn_"] = self.expand_isbns(isbns)
         return doc
 
     def normalize_edition_title(self, title):
         if isinstance(title, bytes):
-            title = title.decode('utf-8', 'ignore')
+            title = title.decode("utf-8", "ignore")
 
-        if not isinstance(title, six.text_type):
+        if not isinstance(title, str):
             return ""
 
-        # http://stackoverflow.com/questions/517923/what-is-the-best-way-to-remove-accents-in-a-python-unicode-string
-        def strip_accents(s):
-            return ''.join((c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn'))
-
         norm = strip_accents(title).lower()
-        norm = norm.replace(' and ', ' ')
-        if norm.startswith('the '):
+        norm = norm.replace(" and ", " ")
+        if norm.startswith("the "):
             norm = norm[4:]
-        elif norm.startswith('a '):
+        elif norm.startswith("a "):
             norm = norm[2:]
-        return norm.replace(' ', '')[:25]
+        return norm.replace(" ", "")[:25]
 
     def expand_isbns(self, isbns):
-        """Expands the list of isbns by adding ISBN-10 for ISBN-13 and vice-verse.
-        """
+        """Expands the list of isbns by adding ISBN-10 for ISBN-13 and vice-verse."""
         s = set(isbns)
         for isbn in isbns:
             if len(isbn) == 10:

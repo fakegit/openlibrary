@@ -1,28 +1,16 @@
 $def with (ocaid)
 $# :param str ocaid:
+$# A text-link Preview under a result's cover. Without an ocaid there is
+$# nothing to preview, so nothing is shown.
 
-<a class="cta-btn cta-btn--shell cta-btn--preview"
-   data-iframe-src="https://archive.org/stream/$ocaid?wrapper=false"
-   data-iframe-link="https://archive.org/details/$ocaid"
-   data-ol-link-track="CTAClick|Preview" href="#bookPreview">$_('Preview')</a>
-
-$if render_once('book-preview-floater'):
-  <div class="hidden">
-    <div class="floater" id="bookPreview">
-      <div class="book-preview">
-        <div class="floaterHead">
-          <h2>$_('Preview Book')</h2>
-          <a class="dialog--close" data-key="book_preview">&times;<span class="shift">$_("Close")</span></a>
-        </div>
-        <div class="iframe-container">
-          <iframe style="width:100%; height:515px"></iframe>
-        </div>
-        <p class="learn-more">
-          <a data-key="book_preview_learn_more"
-             data-ol-link-track="book_preview_learn_more">
-            $_("See more about this book on Archive.org")
-          </a>
-        </p>
-      </div>
-    </div>
+$if ocaid:
+  <div class="cta-button-group">
+    <a class="cta-btn cta-btn--preview"
+      href="#bookPreview"
+      data-book-preview
+      data-iframe-src="https://archive.org/details/$ocaid?view=theater&wrapper=false"
+      data-iframe-link="https://archive.org/details/$ocaid"
+      data-ol-link-track="CTAClick|Preview">$:macros.icon("book-open", size="sm")<span class="cta-btn__label">$_('Preview')</span></a>
   </div>
+
+$:macros.BookPreviewFloater()

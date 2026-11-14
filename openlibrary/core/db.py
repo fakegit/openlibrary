@@ -1,11 +1,24 @@
-"""Interface to access the database of openlibrary.
-"""
-import web
-from infogami.utils import stats
+"""Interface to access the database of openlibrary."""
 
-@web.memoize
+import functools
+import sqlite3
+from datetime import datetime
+from sqlite3 import IntegrityError
+from typing import ClassVar, cast
+
+import web
+from psycopg.errors import UniqueViolation as AsyncUniqueViolation
+from psycopg2.errors import UniqueViolation  # noqa: TID251
+from web.db import PostgresDB  # noqa: TID251
+
+from infogami.utils import stats
+from openlibrary.core.async_db import connection
+
+
+@functools.cache
 def _get_db():
-    return web.database(**web.config.db_parameters)
+    return cast(PostgresDB, web.database(**web.config.db_parameters))  # noqa: TID251
+
 
 def get_db():
     """Returns an instance of webpy database object.
@@ -14,6 +27,139 @@ def get_db():
     """
     return _get_db()
 
+
+class CommonExtras:
+    """
+    A set of methods used by bookshelves, booknotes, ratings, and observations tables
+    """
+
+    TABLENAME: ClassVar[str]
+
+    @classmethod
+    def update_work_id(cls, current_work_id, new_work_id, _test=False):
+        """This method allows all instances of a work_id (such as that of a
+        redirect) to be updated to a new work_id.
+        """
+        oldb = get_db()
+        t = oldb.transaction()
+        rows_changed = 0
+        rows_deleted = 0
+        failed_deletes = 0
+
+        try:
+            rows_changed = oldb.update(
+                cls.TABLENAME,
+                where="work_id=$work_id",
+                work_id=new_work_id,
+                vars={"work_id": current_work_id},
+            )
+        except UniqueViolation, IntegrityError:
+            (
+                rows_changed,
+                rows_deleted,
+                failed_deletes,
+            ) = cls.update_work_ids_individually(current_work_id, new_work_id, _test=_test)
+        t.rollback() if _test else t.commit()
+        return {
+            "rows_changed": rows_changed,
+            "rows_deleted": rows_deleted,
+            "failed_deletes": failed_deletes,
+        }
+
+    @classmethod
+    def update_work_ids_individually(cls, current_work_id, new_work_id, _test=False):
+        oldb = get_db()
+        rows_changed = 0
+        rows_deleted = 0
+        failed_deletes = 0
+
+        # `cls.PRIMARY_KEY` is a class-defined tuple, but the values pulled out
+        # of `row` for those keys come from user-writable columns (username,
+        # work_id, edition_id, ...). Build the WHERE clause as `col=$col` named
+        # parameters with `vars=` so the values are passed as bound parameters
+        # rather than being f-string-interpolated into the SQL. See
+        # https://github.com/internetarchive/openlibrary/pull/12460 for the
+        # /merges precedent that motivated this hardening.
+        primary_key_columns = tuple(cls.PRIMARY_KEY) if isinstance(cls.PRIMARY_KEY, (tuple, list)) else (cls.PRIMARY_KEY,)
+
+        # get records with old work_id
+        # `list` used to solve sqlite cursor test
+        rows = list(
+            oldb.select(
+                cls.TABLENAME,
+                where="work_id=$work_id",
+                vars={"work_id": current_work_id},
+            )
+        )
+        for row in rows:
+            row_pk = {k: row[k] for k in primary_key_columns if k in row}
+            where = " AND ".join(f"{k}=${k}" for k in row_pk)
+            update_vars = dict(row_pk, new_work_id=new_work_id)
+            try:
+                # try to update the row to new_work_id
+                t_update = oldb.transaction()
+                oldb.query(
+                    f"UPDATE {cls.TABLENAME} SET work_id=$new_work_id WHERE {where}",
+                    vars=update_vars,
+                )
+                rows_changed += 1
+                t_update.rollback() if _test else t_update.commit()
+            except UniqueViolation, IntegrityError:
+                t_delete = oldb.transaction()
+                # otherwise, delete row with current_work_id if failed
+                oldb.query(
+                    f"DELETE FROM {cls.TABLENAME} WHERE {where}",
+                    vars=row_pk,
+                )
+                rows_deleted += 1
+                if _test or not cls.ALLOW_DELETE_ON_CONFLICT:
+                    t_delete.rollback()
+                else:
+                    t_delete.commit()
+
+                if not cls.ALLOW_DELETE_ON_CONFLICT:
+                    failed_deletes += 1
+                    rows_deleted -= 1
+        return rows_changed, rows_deleted, failed_deletes
+
+    @classmethod
+    def select_all_by_username(cls, username, _test=False):
+        oldb = get_db()
+        return list(oldb.select(cls.TABLENAME, where="username=$username", vars={"username": username}))
+
+    @classmethod
+    async def update_username(cls, username: str, new_username: str, _test: bool = False) -> int:
+        """Update a patron's username, optionally rolling back for dry-run counts."""
+        rows_changed = 0
+        async with connection() as conn:
+            try:
+                cursor = await conn.execute(
+                    f"UPDATE {cls.TABLENAME} SET username = %(new_username)s WHERE username = %(username)s",
+                    {"username": username, "new_username": new_username},
+                )
+                rows_changed = cursor.rowcount
+            except AsyncUniqueViolation:
+                await conn.rollback()
+                return 0
+            if _test:
+                await conn.rollback()
+        return rows_changed
+
+    @classmethod
+    async def delete_all_by_username(cls, username: str, _test: bool = False) -> int:
+        """Delete a patron's rows, optionally rolling back for dry-run counts."""
+        rows_deleted = 0
+        async with connection() as conn:
+            cursor = await conn.execute(
+                f"DELETE FROM {cls.TABLENAME} WHERE username = %(username)s",
+                {"username": username},
+            )
+            rows_deleted = cursor.rowcount
+            if _test:
+                await conn.rollback()
+        return rows_deleted
+
+
 def _proxy(method_name):
     """Create a new function that call method with given name on the
     database object.
@@ -21,16 +167,29 @@ def _proxy(method_name):
     The new function also takes care of recording the stats about how
     long it took to execute this query etc.
     """
+
     def f(*args, **kwargs):
         stats.begin("db", method=method_name, args=list(args), kwargs=kwargs)
         m = getattr(get_db(), method_name)
         result = m(*args, **kwargs)
         stats.end()
         return result
+
     f.__name__ = method_name
-    f.__doc__ = "Equivalent to get_db().%s(*args, **kwargs).""" % method_name
+    f.__doc__ = f"Equivalent to get_db().{method_name}(*args, **kwargs)."
     return f
 
+
+def adapt_datetime_iso(date_time: datetime) -> str:
+    """
+    Convert a Python datetime.datetime into a timezone-naive ISO 8601 date string.
+    >>> adapt_datetime_iso(datetime(2023, 4, 5, 6, 7, 8, 9))
+    '2023-04-05 06:07:08.000009'
+    """
+    return date_time.isoformat(" ")
+
+
+sqlite3.register_adapter(datetime, adapt_datetime_iso)
 query = _proxy("query")
 select = _proxy("select")
 where = _proxy("where")
@@ -39,4 +198,3 @@ insert = _proxy("insert")
 update = _proxy("update")
 delete = _proxy("delete")
 transaction = _proxy("transaction")
-

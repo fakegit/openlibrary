@@ -1,0 +1,11 @@
+$def with ()
+
+<ul class="nav-bar">
+  <li class="$('selected' if ctx.path == '/import/batch/new' else '')">
+    <a data-ol-link-track="BatchImportNav|NewBatch" href="/import/batch/new">$_("New Batch Import")</a>
+  </li>
+  $if ctx.user and ctx.user.is_admin():
+    <li class="$('selected' if ctx.path == '/import/batch' else '')">
+      <a data-ol-link-track="BatchImportNav|All" href="/import/batch">$_("All Batches")</a>
+    </li>
+</ul>

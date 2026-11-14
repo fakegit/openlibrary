@@ -1,86 +1,309 @@
-$def with (doc, decorations=None, cta=True, availability=None, extra=None)
+$def with (doc, decorations=None, cta=True, availability=None, extra=None, extra_row=None, attrs=None, rating=None, highlighting=None, show_librarian_extras=False, include_dropper=False, blur=False, footer=None, seq_index=None, show_title_year=False, reading_states=None, layout=None)
 
-$ availability = availability or doc.get('availability') or {}
-$ ocaid = availability.get('identifier')
-$ is_work = doc.get('type', {}).get('key') == '/type/work'
-$ book_url = doc.url() if is_work else doc.key
-$ cover_ids =  [cover for cover in doc.get('covers', []) if cover != -1]
-<li class="searchResultItem" itemscope itemtype="https://schema.org/Book">
-  <span class="bookcover">
-    $if availability:
-      $if availability.get('openlibrary_edition'):
-        $ cover = get_coverstore_url() + "/b/olid/%s-M.jpg" % availability.get('openlibrary_edition')
-      $elif ocaid:
-        $ cover = "//archive.org/download/%s/page/cover_w60_h60.jpg" % ocaid
-    $elif doc.get('cover_i') or cover_ids:
-      $ cover = get_coverstore_url() + "/b/id/%s-M.jpg" % (doc.cover_i or cover_ids[0])
-    $elif doc.get('cover_edition_key'):
-      $ cover = get_coverstore_url() + "/b/olid/%s-M.jpg" % doc.cover_edition_key
-    $elif doc.get('ocaid'):
-      $ cover = "//archive.org/download/%s/page/cover_w60_h60.jpg" % doc.get('ocaid')
-    $else:
-      $ cover = "/images/icons/avatar_book-sm.png"
-    <a href="$(book_url)?edition=$(ocaid)"><img itemprop="image" src="$cover" alt="Cover of: $doc.title$(': ' + doc.subtitle if doc.get('subtitle', None) else '')" title="Cover of: $doc.title$(': ' + doc.subtitle if doc.get('subtitle', None) else '')"/></a>
-  </span>
+$# reading_states: get_reading_states() for the whole page, keyed by work key,
+$# so one page is one round of queries. Left out, the row looks its own up.
 
-  <div class="details">
-      <div class="resultTitle">
-         <h3 itemprop="name" class="booktitle">
-           <a itemprop="url" href="$(book_url)?edition=$(ocaid)"
-              class="results">$doc.title$(': ' + doc.subtitle if doc.get('subtitle', None) else '')</a>
-           $if doc.get('publish_date'):
-             ($(doc['publish_date']))
-         </h3>
-        </div>
-      <span itemprop="author" itemscope itemtype="https://schema.org/Organization" class="bookauthor">$_('by')
-        $if not doc.authors:
-          <em>$_('Unknown author')</em>
-        $else:
-          $for a in doc.authors:
-            $if not (hasattr(a, 'name') and a.name) and not (hasattr(a, 'author') and hasattr(a.author, 'name') and a.author.name):
-              <em>$_('Unknown author')</em>$(',' if not loop.last else '')
-              $continue
-            <a itemprop="url" href="$(a.get('url') or a.get('key') or a.author.get('url') or a.author.key)" class="results">$(a.name or a.author.name)</a>$(',' if not loop.last else '')
+$code:
+  max_rendered_authors = 9
+  doc_type = (
+    'infogami_work' if doc.get('type', {}).get('key') == '/type/work' else
+    'infogami_edition' if doc.get('type', {}).get('key') == '/type/edition' else
+    'solr_work' if not doc.get('editions') else
+    'solr_edition'
+  )
+
+  # Depending on where we come from, editions is either a dict with docs,
+  # or a list of editions directly.
+  editions = doc.get('editions') or []
+  if isinstance(editions, dict):
+    editions = editions.get('docs') or []
+
+  selected_ed = doc
+  if doc_type == 'solr_edition' and editions:
+    selected_ed = editions[0]
+
+  selected_ed['availability'] = selected_ed.get('availability', {}) or doc.get('availability', {}) or availability or {}
+  ocaid = (selected_ed.get('ia') and selected_ed['ia'][0]) or selected_ed.get('ocaid')
+
+  if doc_type.startswith('infogami_'):
+    book_url = doc.url()
+  else:
+    book_url = doc.key + '/' + urlsafe(doc.get('title', '-'))
+
+  if doc_type == 'solr_edition':
+    work_edition_url = book_url + '?edition=' + urlquote('key:' + selected_ed['key'])
+  else:
+    book_provider = get_book_provider(doc)
+    if book_provider and doc_type.endswith('_work'):
+      work_edition_url = book_url + '?edition=' + urlquote(book_provider.get_best_identifier_slug(doc))
+    else:
+      work_edition_url = book_url
+
+  work_edition_all_url = work_edition_url
+  if '?' in work_edition_url:
+    work_edition_all_url += '&mode=all'
+  else:
+    work_edition_all_url += '?mode=all'
+
+  edition_work = None
+  if doc_type == 'infogami_edition' and 'works' in doc:
+    edition_work = doc['works'][0]
+
+  full_title = selected_ed.get('title', '') + (': ' + selected_ed['subtitle'] if selected_ed.get('subtitle') else '')
+  if doc_type == 'infogami_edition' and edition_work:
+    full_work_title = edition_work.get('title', '') + (': ' + edition_work['subtitle'] if edition_work.get('subtitle') else '')
+  else:
+    full_work_title = doc.get('title', '') + (': ' + doc['subtitle'] if doc.get('subtitle') else '')
+
+  # Only data already on the record; never a second lookup.
+  title_year = None
+  if show_title_year:
+    if doc_type.startswith('solr_'):
+      title_year = doc.get('first_publish_year')
+    elif doc_type == 'infogami_edition':
+      title_year = extract_year(selected_ed.get('publish_date') or '') or None
+    elif doc_type == 'infogami_work':
+      title_year = extract_year(doc.get('first_publish_date') or '') or None
+
+$# layout: 'grid' puts the shelf button on the cover as a badge, like a carousel
+$# card; anything else keeps the labelled split in the CTA column. list_books.js
+$# moves it between the two slots when the reader flips the layout.
+$ shelf_button = shelf_button_for(doc, variant=('icon' if layout == 'grid' else 'split'), reading_states=reading_states) if include_dropper else None
+
+<li class="searchResultItem sri--w-main" itemscope itemtype="https://schema.org/Book" $:attrs>
+  $ blur_cover = "bookcover--blur" if blur else ""
+  $if 'log' in doc:
+    <div class="feed-item">
+      <a class="feed-item--patron" href="/people/$(doc['log']['username'])">
+        <img src="/people/$(doc['log']['username'])/avatar" class="account-avatar account-avatar--sm account-avatar-fix">
+        $doc['log']['username']
+      </a> $_("added to")
+      <a href="/people/$(doc['log']['username'])/books/$(doc['log']['shelf'].replace(' ', '-'))" class="feed-item--shelf">$doc['log']['shelf']</a> $datestr(doc['log']['updated'])
+    </div>
+  <div class="sri__main">
+    <span class="bookcover $blur_cover">
+      $ cover_url = get_cover_url(selected_ed)
+      $ cover = cover_url or "/static/images/icons/avatar_book-sm.png"
+      $# width/height reserve layout space before the cover loads (CLS). Solr dimensions describe cover_i,
+      $# so only use them when that's the image shown (not an availability/IA cover); else a 2:3 book.
+      $ cover_dims = (84, 115)
+      $if cover_url:
+        $ shows_cover_i = selected_ed.get('cover_i') and ('/b/id/%s-' % selected_ed['cover_i']) in cover_url
+        $ cover_dims = (selected_ed.get('cover_width'), selected_ed.get('cover_height')) if shows_cover_i else (None, None)
+      $ cover_w, cover_h = cover_dims if all(cover_dims) else (180, 270)
+      <span class="book-cover-wrapper">
+        <a href="$work_edition_url">
+          <img
+            itemprop="image"
+            src="$cover"
+            width="$cover_w"
+            height="$cover_h"
+            alt="$_('Cover of: %(title)s', title=full_title)"
+            title="$_('Cover of: %(title)s', title=full_title)"
+            $:cond(seq_index is not None and seq_index > 3, 'loading="lazy"')
+            /></a>
+        $if shelf_button and layout == 'grid':
+          $:shelf_button
       </span>
-      <span class="resultPublisher">
-        $if doc.get('first_publish_year'):
-          <span class="publishedYear">
-            $_('First published in %(year)s', year=doc.first_publish_year)
-          </span>
-        $if doc.get('edition_count'):
-          <a href="$(book_url)?edition=$(ocaid)#editions-list">$ungettext('1 edition', '%(count)d editions', doc.edition_count, count=doc.edition_count)</a>
-          $if doc.get('languages'):
-            <span class="languages">
-              $_('in') <a class="hoverlink" title="$(', '.join(doc.languages))">$(len(doc.languages)) $_('languages')</a>
+    $:macros.BookPreview(ocaid)
+    </span>
+
+    <div class="details">
+        <div class="resultTitle">
+          $ series_edge = None
+          $if doc_type == 'infogami_work':
+            $ series_edge = doc.get_primary_series()
+          $elif doc_type.startswith('solr_'):
+            $if doc.get('series'):
+              $ series_edge = doc['series'][0]
+            $elif doc.get('series_key'):
+              $ series_edge = { 'series': { 'key': doc['series_key'][0], 'name': doc['series_name'][0] }, 'position': doc['series_position'][0] }
+
+          $if series_edge:
+            <span class="bookseries" itemprop="isPartOf" itemscope itemtype="https://schema.org/Series">
+              <a href="/series/$series_edge['series']['key']/$urlsafe(series_edge['series'].get('name'))" itemprop="name url">$series_edge['series'].get('name')</a>$cond(series_edge.get('position'), ': ')
+              $if series_edge.get('position'):
+                <span class="bookseries__position">$_('Book %(position)s', position=series_edge.get('position'))</span>
             </span>
-          $if doc.get('ia'):
-            &mdash; $_('%s previewable', len(doc.get('ia')))
-            $if len(doc.get('ia')) > 1:
-              <span class="preview-covers">
-                $for x, i in enumerate(doc.get('ia')[1:10]):
-                  <a href="$(book_url)?edition=$(i)">
-                    <img width="30" height="45" loading="lazy" src="//archive.org/download/$(i)/page/cover_w60_h60.jpg" alt="Cover of edition $i">
-                  </a>
+          <h3 itemprop="name" class="booktitle">
+            <a itemprop="url" href="$work_edition_url" class="results">$full_title</a>
+          </h3>
+        </div>
+        <span itemprop="author" itemscope itemtype="https://schema.org/Organization" class="bookauthor">
+          $ authors = None
+          $if doc_type == 'infogami_work':
+            $ authors = doc.get_authors()
+          $elif doc_type == 'infogami_edition':
+            $ authors = edition_work.get_authors() if edition_work else doc.get_authors()
+          $elif doc_type.startswith('solr_'):
+            $if 'authors' in doc:
+              $ authors = doc['authors']
+            $elif 'author_key' in doc:
+              $ authors = [ { 'key': '/authors/' + key, 'name': name } for key, name in zip(doc['author_key'], doc['author_name']) ]
+          $if not authors:
+            <em>$_('Unknown author')</em>
+          $else:
+            $code:
+              author_data = [
+                {
+                  'name': a.get('name') or a.get('author', {}).get('name'),
+                  'url': (a.get('url') or a.get('key') or a.get('author', {}).get('url') or a.get('author', {}).get('key'))
+                }
+                for a in authors
+              ]
+            $:macros.BookByline(author_data, limit=max_rendered_authors, overflow_url=work_edition_url)
+        </span>
+        $if title_year:
+          <span class="bookyear">$title_year</span>
+        <span class="resultStats">
+          $ ratings_count = doc.get('ratings_count') or 0
+          $ ratings_avg = doc.get('ratings_average', None)
+          $ want_to_read_count = doc.get('want_to_read_count') or 0
+          $:macros.StarRatingsByline(ratings_count, ratings_avg, want_to_read_count)
+          $if show_librarian_extras and doc.get('trending_z_score') is not None:
+            $:macros.TrendingBadge(doc)
+        </span>
+
+        $if highlighting:
+          $if highlighting.get('subject'):
+            <br />
+            <ol-chip-group class="srw__subjects" gap="small">
+              $for subj in highlighting['subject']:
+                $# detect-missing-i18n-skip-line
+                <ol-chip size="small" href="$subject_name_to_key(subj.replace('<em>', '').replace('</em>', ''))">$:subj</ol-chip>
+            </ol-chip-group>
+
+          $if highlighting.get('chapter'):
+            <br />
+            $ matching_chapters = highlighting.get('chapter', [])
+
+            <ol-read-more class="srw__chapters" more-text="$_('Show more')" less-text="$_('Show less')" background-color="#E2ECF8" label-size="small">
+              $for chapter in matching_chapters:
+                $if not chapter.strip():
+                  $continue
+                $ ed_olid, rest = chapter.split(' | ', 1)
+                $if '/books/' + ed_olid != selected_ed.get('key'):
+                  $continue
+                $ chapter_parts = rest.split('|')
+                $if len(chapter_parts) < 3:
+                  $ chapter_parts = ['', chapter, '']
+                $ pagenum = None
+                $if chapter_parts[2].strip():
+                  $ pagenum = chapter_parts[2].strip()
+                $ is_link = pagenum and pagenum.isdigit() and selected_ed.get('ia')
+                $ tag = 'a' if is_link else 'div'
+                <$tag class="srw__chapter" $:('href="https://archive.org/details/%s/page/%s"' % (selected_ed.get('ia')[0], pagenum) if is_link else '')>
+                  <span>
+                    $if chapter_parts[0].strip() and not chapter_parts[0].strip().endswith('.'):
+                      $ chapter_parts[0] = chapter_parts[0].strip() + '. '
+                    $# This isn't html injection, because solr returns everything
+                    $# already html escaped except for the em of the highlight
+                    $:chapter_parts[0]
+                    $:chapter_parts[1]
+                  </span>
+                  $if pagenum:
+                    <div style="flex:1; border-bottom: 1px dotted;"></div>
+                    Page $pagenum
+                </$tag>
+            </ol-read-more>
+
+        $if doc.get('ia') and len(doc.get('ia')) > 1:
+          $ blur_preview = "search-result-item__preview-covers--blur" if blur else ""
+
+          <div class="search-result-item__preview-covers-container">
+            <span class="search-result-item__preview-covers $blur_preview">
+              $for x, i in enumerate(doc.get('ia')[1:6]):
+                <a href="$(book_url)?edition=ia:$(urlquote(i))">
+                  <img width="35" height="53" loading="lazy" src="//archive.org/services/img/$i" alt="$_('Cover of edition %(id)s', id=i)">
+                </a>
+            </span>
+
+            <span class="resultDetails">
+              $if doc.get('first_publish_year'):
+                <span>
+                  $_('First published in %(year)s', year=doc.first_publish_year)
                 </span>
-      </span>
-      $if extra:
-        <div class="serp-extras">
+                <br>
+              $if doc.get('edition_count'):
+                <span>
+                  <a href="$work_edition_all_url#editions-list">$ungettext('%(count)s edition', '%(count)s editions', doc.edition_count, count=doc.edition_count)</a>,
+                </span>
+              <span>
+                <a href="$work_edition_all_url#editions-list">$ungettext('%(count)s ebook', '%(count)s ebooks', len(doc.get('ia')), count=len(doc.get('ia')))</a>
+              </span>
+              $if doc.get('languages') and doc_type in ['infogami_work', 'solr_work']:
+                <span class="languages">
+                  $ user_lang = get_lang() or 'en'
+                  $ langs = [get_language_name(lang.key if hasattr(lang, 'key') else '/languages/' + lang, user_lang) for lang in doc.languages]
+                  $:ungettext('in <a class="hoverlink" title="%(langs)s">%(count)d language</a>', 'in <a class="hoverlink" title="%(langs)s">%(count)d languages</a>', len(doc.languages), count=len(doc.languages), langs=commify_list(langs))
+                </span>
+            </span>
+          </div>
+
+        $else:
+          <span class="resultDetails">
+            $if doc.get('first_publish_year'):
+              <span>
+                $_('First published in %(year)s', year=doc.first_publish_year)
+              </span>
+              <br>
+            $if doc.get('edition_count'):
+              <span>
+                <a href="$work_edition_all_url#editions-list">$ungettext('%(count)s edition', '%(count)s editions', doc.edition_count, count=doc.edition_count)</a>$cond(doc.get('ia'), ',')
+              </span>
+            $if doc.get('ia'):
+              <span>
+                <a href="$work_edition_all_url#editions-list">$ungettext('%(count)s ebook', '%(count)s ebooks', len(doc.get('ia')), count=len(doc.get('ia')))</a>
+              </span>
+            $if doc.get('languages') and doc_type in ['infogami_work', 'solr_work']:
+              <span class="languages">
+                $ user_lang = get_lang() or 'en'
+                $ langs = [get_language_name(lang.key if hasattr(lang, 'key') else '/languages/' + lang, user_lang) for lang in doc.languages]
+                $:ungettext('in <a class="hoverlink" title="%(langs)s">%(count)d language</a>', 'in <a class="hoverlink" title="%(langs)s">%(count)d languages</a>', len(doc.languages), count=len(doc.languages), langs=commify_list(langs))
+              </span>
+          </span>
+
+        $if show_librarian_extras:
+          <div class="searchResultItem__librarian-extras" title="$_('This is only visible to librarians.')">
+            $if doc_type == 'solr_edition' or (doc_type == 'infogami_edition' and edition_work):
+              <div>$_("Work Title"): <i>$full_work_title</i></div>
+            $ is_orphan = doc_type.startswith('solr_') and doc['key'].endswith('M') or doc_type == 'infogami_edition' and not edition_work
+            $if is_orphan:
+              <div>$_("Orphaned Edition")</div>
+          </div>
+        $if extra:
           $:extra
+    </div>
+
+    <div class="searchResultItemCTA">
+        $if decorations:
+          $# should show reading log status widget if there is one in decorations, or read, or return, or leave waitlist
+          <div class="decorations">
+            $:decorations
+          </div>
+
+        <div class="searchResultItemCTA-lending">
+          $if cta:
+            $:macros.LoanStatus(selected_ed, work_key=doc.key)
         </div>
 
-      </div>
+        $if shelf_button:
+          <div class="searchResultItemCTA__shelf">
+            $if layout != 'grid':
+              $:shelf_button
+          </div>
 
-  <div class="searchResultItemCTA">
-      $if decorations:
-        $# should show reading log status widget if there is one in decorations, or read, or return, or leave waitlist
-        <div class="decorations">
-          $:decorations
-        </div>
+        $if rating:
+          $:rating
+    </div>
 
-      <div class="searchResultItemCTA-lending">
-        $if cta:
-          $ doc['availability'] = doc.get('availability', {})
-          $:macros.LoanStatus(doc, work_key=doc.key)
-      </div>
+    $# Full-width row under details/CTA, placed by the .list-books--fulltext grid.
+    $if extra_row:
+      $:extra_row
   </div>
+
+  $if footer:
+    <div class="list-books__note">
+      $:sanitize(format(footer))
+    </div>
 </li>

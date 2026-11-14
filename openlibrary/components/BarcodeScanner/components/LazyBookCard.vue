@@ -1,0 +1,163 @@
+<template>
+    <a class="lazy-book-card" :href="link" :class="{ loading: loading, errored: errored }">
+        <div class="cover">
+            <img :src="coverSrc" />
+        </div>
+        <div class="info">
+            <div class="title">{{ title }}</div>
+            <div class="byline">{{ byline }}</div>
+            <div class="identifier">{{ identifier }}</div>
+        </div>
+    </a>
+</template>
+
+<script>
+import CONFIGS from '../../configs';
+export default {
+    props: {
+        isbn: {
+            type: String,
+            required: true
+        },
+        tentativeCover: {
+            type: String,
+            default: null
+        }
+    },
+    data() {
+        return {
+            link: null,
+            coverSrc: this.tentativeCover,
+            title: this.isbn,
+            byline: null,
+            identifier: null,
+            errored: false,
+            loading: true
+        };
+    },
+    mounted() {
+        this.fromISBN(this.isbn);
+    },
+    methods: {
+        async fromISBN(isbn) {
+            fetch(`https://${CONFIGS.OL_BASE_PUBLIC}/isbn/${isbn}.json`)
+                .then(r => r.json())
+                .then(editionRecord => {
+                    this.title = editionRecord.title;
+                    this.identifier = isbn;
+                    this.link = editionRecord.key;
+
+                    if (editionRecord.covers) {
+                        const coverId = editionRecord.covers.find(x => x !== -1);
+                        if (coverId) {
+                            this.coverSrc = `https://covers.openlibrary.org/b/id/${coverId}-M.jpg`;
+                        }
+                    }
+                    return fetch(`https://${CONFIGS.OL_BASE_PUBLIC}${editionRecord.works[0].key}.json`).then(r => r.json());
+                })
+                .then(workRecord => {
+                    return Promise.all(workRecord.authors.map(a => fetch(`https://${CONFIGS.OL_BASE_PUBLIC}${a.author.key}.json`).then(r => r.json())));
+                })
+                .then(authorRecords => {
+                    this.loading = false;
+                    this.byline = authorRecords.map(a => a.name).join(', ');
+                })
+                // eslint-disable-next-line no-unused-vars
+                .catch(err => {
+                    this.loading = false;
+                    this.errored = true;
+                });
+        }
+    }
+};
+</script>
+
+<style>
+@keyframes pulse {
+    0% {
+        opacity: 0;
+    }
+    100% {
+        opacity: 0.95;
+    }
+}
+
+a.lazy-book-card {
+    background: hsl(0, 0%, 100%);
+    flex-shrink: 0;
+    margin-right: 6px;
+    width: 80vw;
+    max-width: 300px;
+    height: 120px;
+    border: 1px solid hsl(0, 0%, 67%);
+    border-radius: 4px;
+    display: flex;
+    overflow: hidden;
+    color: hsl(0, 0%, 0%);
+    text-decoration: none;
+    position: relative;
+    transition-property: background-color border-color;
+    transition-duration: 0.2s;
+}
+a.lazy-book-card:first-child {
+    animation: slideUp 0.8s;
+}
+a.lazy-book-card:nth-child(2) {
+    animation: shiftRight 0.8s;
+}
+a.lazy-book-card:hover {
+    background: hsl(240, 100%, 95%);
+    border-color: hsl(240, 100%, 65%);
+    color: hsl(240, 100%, 60%);
+}
+a.lazy-book-card::before {
+    display: none;
+    content: '';
+    position: absolute;
+    width: 6px;
+    height: 6px;
+    border-radius: 100px;
+    margin: 10px;
+    right: 0;
+}
+a.lazy-book-card.loading::before {
+    display: block;
+    background: hsl(240, 100%, 50%);
+    opacity: 0;
+    animation: pulse 0.5s infinite alternate;
+    /* Only show loading animation if it takes longer than this */
+    animation-delay: 0.5s;
+}
+a.lazy-book-card.errored::before {
+    display: block;
+    background: hsl(8, 78%, 49%);
+}
+a.lazy-book-card .title {
+    font-weight: bold;
+    line-height: 1.1em;
+}
+a.lazy-book-card .byline {
+    font-size: 0.9em;
+    margin-top: 0.1em;
+}
+a.lazy-book-card .cover {
+    width: 25%;
+}
+a.lazy-book-card .cover img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+a.lazy-book-card .identifier {
+    margin-top: 4px;
+    padding-top: 4px;
+    color: hsl(0, 0%, 33%);
+    border-top: 1px dotted;
+    font-family: monospace;
+    font-size: 1.2em;
+}
+a.lazy-book-card .info {
+    flex: 1;
+    padding: 8px;
+}
+</style>

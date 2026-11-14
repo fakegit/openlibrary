@@ -1,0 +1,166 @@
+/**
+ * Read Options Panel
+ * https://docs.openlibrary.org/designers/design-pattern-library.html#read-panel
+ */
+
+.waitinglist-message {
+  margin: 0 0 10px;
+  text-wrap: balance;
+  font-size: var(--font-size-label-medium);
+  width: 100%;
+}
+
+/* .Tools .btn-notice is a legacy selector. Remove at earliest opportunity. */
+.read-options,
+.btn-notice {
+  font-size: inherit;
+  padding: var(--spacing-md);
+  margin-bottom: 10px;
+  background-color: var(--white);
+  border-radius: 5px;
+  border: 1px solid var(--color-border-subtle);
+  margin-top: 0;
+}
+
+.read-options .cta-btn,
+.read-options .cta-button-group,
+.btn-notice .cta-btn,
+.btn-notice .cta-button-group {
+  margin-bottom: var(--spacing-stack-sm);
+}
+
+/* Inside a group only the group carries the gap; a margin on the buttons
+   would pad the flex row and double the space below it. */
+.read-options .cta-button-group > .cta-btn,
+.read-options .cta-button-group > .cta-dropper__menu,
+.btn-notice .cta-button-group > .cta-btn,
+.btn-notice .cta-button-group > .cta-dropper__menu {
+  margin-bottom: 0;
+}
+
+.read-options .cta-section,
+.btn-notice .cta-section {
+  font-size: 0.78em;
+}
+
+.read-options strong,
+.btn-notice strong {
+  font-size: var(--font-size-label-medium);
+  font-weight: var(--font-weight-bold);
+}
+
+.read-options .cta-section-title,
+.btn-notice .cta-section-title {
+  font-size: var(--font-size-label-medium);
+  display: block;
+  font-weight: var(--font-weight-bold);
+}
+
+/* stylelint-disable selector-max-specificity */
+.read-options table,
+.btn-notice table {
+  width: 100%;
+}
+
+.read-options td,
+.btn-notice td {
+  text-align: left;
+  width: 49%;
+}
+/* stylelint-enable selector-max-specificity */
+
+ul.ebook-download-options li {
+  margin: 5px 0;
+}
+
+.Tools .booklinks li {
+  list-style: none;
+  font-size: var(--font-size-label-medium);
+}
+
+/* desktop */
+@media only screen and (min-width: 960px /* @width-breakpoint-desktop */) {
+  /* stylelint-disable selector-max-specificity */
+  .readers-stats__wrapper.mobile {
+    display: none;
+  }
+  /* stylelint-enable selector-max-specificity */
+}
+
+/* mobile */
+@media only screen and (max-width: 960px /* @width-breakpoint-desktop */) {
+  .Tools .btn-notice,
+  .read-options {
+    border: none;
+  }
+
+  /* Hide border for desktop version of modal links and ratings form on mobile */
+  /* stylelint-disable no-descending-specificity */
+  .Tools .btn-notice > hr,
+  .read-options > hr {
+    display: none;
+  }
+  /* stylelint-enable no-descending-specificity */
+
+  .read-options .star-rating-form.desktop,
+  .btn-notice .star-rating-form.desktop,
+  .modal-links.desktop {
+    display: none;
+  }
+
+  .readers-stats__wrapper.mobile {
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 5px;
+    padding: 10px 0;
+  }
+
+  .readers-stats__wrapper.mobile .share-modal-wrapper {
+    display: none;
+  }
+
+  .readers-stats__wrapper.mobile > hr {
+    margin: 0 20px;
+  }
+
+  .readers-stats__wrapper.mobile .readers-stats {
+    display: flex;
+    justify-content: space-between;
+    margin: 0;
+    width: 100%;
+  }
+
+  /* stylelint-disable max-nesting-depth*/
+  /* stylelint-disable selector-max-specificity */
+  .readers-stats__wrapper.mobile .readers-stats li {
+    border-right: 1px solid var(--color-border-subtle);
+    display: flex;
+    flex-direction: column-reverse;
+    flex: 1 1 auto;
+    margin: 0;
+    position: relative;
+    text-align: center;
+  }
+
+  .readers-stats__wrapper.mobile .readers-stats li .readers-stats__label {
+    font-size: 0.85em;
+  }
+
+  .readers-stats__wrapper.mobile .readers-stats li + li {
+    border-right: solid 1px var(--color-border-subtle);
+  }
+
+  .readers-stats__wrapper.mobile .readers-stats li:last-child {
+    border-right: none;
+  }
+
+  /* Clearing out the 'dot' spacer content used on desktop */
+  .readers-stats__wrapper.mobile .readers-stats li::after {
+    content: "";
+  }
+
+  .readers-stats__wrapper.mobile .readers-stats li.avg-ratings {
+    display: none;
+  }
+  /* stylelint-enable selector-max-specificity */
+  /* stylelint-enable max-nesting-depth */
+}

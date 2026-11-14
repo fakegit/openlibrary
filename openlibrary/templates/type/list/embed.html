@@ -3,21 +3,23 @@ $def with (list)
 $var title: $list.name
 
 $putctx('cssfile', 'form')
+$putctx("show_ol_shell", False)
 
 $ page = safeint(query_param('page'), 1) - 1
 $ page_size = 10
 
 $def render_seed_count(seed_count):
-    $ungettext("1 item", "%(count)d items", seed_count, count=seed_count)
+    $ungettext("%(count)d item", "%(count)d items", seed_count, count=seed_count)
 
 <div id="contentHead" style="margin-bottom:0;">
     <div class="superNav">
-        <a href="/" title="$_('Visit Open Library')"><img src="/images/logo_OL-sm.png" width="90" height="71" alt="$_('Open Library logo')" class="right"/></a>
+        <a href="/" title="$_('Visit Open Library')"><img src="/static/images/logo_OL-sm.png" width="90" height="71" alt="$_('Open Library logo')" class="right"/></a>
 
         $ owner = list.get_owner()
-        <a href="$owner.key">$owner.displayname</a>
-        /
-        <a href="$owner.key/lists">$_('Lists')</a>
+        $if owner:
+            <a href="$owner.key">$owner.displayname</a>
+            /
+            <a href="$owner.key/lists">$_('Lists')</a>
     </div>
     <h1>
         $list.name
@@ -41,11 +43,10 @@ $def render_seed_count(seed_count):
     $for seed in list.get_seeds(sort=True)[page*page_size:page*page_size+page_size]:
         <li id="seed-$loop.index" class="searchResultItem">
             $ cover = seed.get_cover()
-            $ cover_url = cover and cover.url("M") or "/images/icons/avatar_book-sm.png"
+            $ cover_url = cover and cover.url("M") or "/static/images/icons/avatar_book-sm.png"
             <span class="image">
                 <a href="$seed.url"><img src="$cover_url" height="70"/></a>
             </span>
-            <span class="seed-key hidden">$seed.key</span>
             <div class="details">
                 <div class="resultTitle">
                     $if seed.type in ['edition', 'work']:
@@ -59,16 +60,10 @@ $def render_seed_count(seed_count):
                                     <span class="label">$_('Read')</span>
                                 </a>
                             $elif 'borrow_url' in ebook:
-                                $if ebook.get('borrowed'):
-                                    <a href="$ebook['borrow_url']" title="$_('This book is checked out')">
-                                        <span class="image checked-out"></span>
-                                        <span class="label">$_('Checked out')</span>
-                                    </a>
-                                $else:
-                                    <a href="$ebook['borrow_url']" title="$_('Borrow book')">
-                                        <span class="image borrow"></span>
-                                        <span class="label">$_('Borrow')</span>
-                                    </a>
+                                <a href="$ebook['borrow_url']" title="$_('Borrow book')">
+                                    <span class="image borrow"></span>
+                                    <span class="label">$_('Borrow')</span>
+                                </a>
                             $elif 'daisy_url' in ebook:
                                 <a href="$ebook['daisy_url']" title="$_('Protected DAISY')">
                                     <span class="image daisy"></span>
@@ -97,6 +92,5 @@ $def render_seed_count(seed_count):
     </ul></div>
 
     <div class="clearfix"></div>
-    $:macros.Pager(page+1, len(list.seeds), page_size)
+    $:macros.OlPagination(page+1, ceil(len(list.seeds) / page_size))
 </div>
-

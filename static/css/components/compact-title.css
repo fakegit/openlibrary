@@ -1,0 +1,42 @@
+:root {
+  --compact-title-height: 35px;
+  --desktop-title-max-width: calc(
+    var(--test-body-mobile-width) - var(--sidebar-width-with-margin)
+  );
+}
+
+@media screen and (min-width: 769px /* @width-breakpoint-tablet */) {
+  .compact-title {
+    background: var(--white);
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    /* Legacy value: fixed chrome that has to clear page-level dropdowns. */
+    z-index: var(--z-index-dropdown);
+    position: fixed;
+    top: 0;
+    height: var(--compact-title-height);
+    width: calc(100% - var(--contentBody-padding));
+    padding: 0 var(--spacing-inset-md);
+  }
+
+  .compact-title__edit-btn {
+    transform: translateY(6px);
+  }
+
+  .compact-title__heading {
+    font-size: var(--font-size-title-large);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-family: var(--font-family-title);
+    font-weight: var(--font-weight-semibold);
+  }
+}
+
+@media only screen and (min-width: 960px /* @width-breakpoint-desktop */) {
+  .compact-title {
+    width: calc(100% - var(--sidebar-width-with-margin));
+    max-width: var(--desktop-title-max-width);
+  }
+}

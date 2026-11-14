@@ -1,0 +1,146 @@
+/**
+ * JS only module.
+ * Styles the `datatables.net-dt` npm package. Imported by:
+ * - openlibrary/plugins/openlibrary/js/editions-table/index.js
+ * It will be refactored at the earliest opportunity.
+ * DO NOT ADD NEW CSS here
+ * Unless... you are removing an inline style and moving it into here.
+ *
+ * We are currently in the process of:
+ * - moving styles from this file into the components
+ * - removing dead code
+ * - removing redundant CSS in favor of common reusable styles
+ *
+ * DO NOT ADD NEW CSS HERE
+ */
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * DataTables features
+ */
+
+.dataTables_wrapper {
+  font-family: var(--font-family-body);
+  position: relative;
+  z-index: var(--z-index-base);
+  clear: both;
+  zoom: 1; /* Feeling sorry for IE */
+}
+
+.dataTables_processing {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 250px;
+  height: 30px;
+  margin-left: -125px;
+  margin-top: -15px;
+  padding: 14px 0 5px;
+  border: 1px solid var(--color-border-subtle);
+  text-align: center;
+  color: var(--light-grey);
+  font-size: var(--font-size-label-large);
+}
+
+.dataTables_length {
+  font-size: var(--font-size-label-medium);
+  color: var(--color-text-secondary);
+  display: inline-block;
+}
+
+.dataTables_info {
+  width: 100%;
+  font-size: var(--font-size-label-medium);
+  color: var(--color-text-secondary);
+  margin-top: 20px;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * DataTables display
+ */
+table.display {
+  float: left;
+  margin: 0 auto;
+  width: 918px;
+  clear: both;
+}
+
+table.display thead th {
+  cursor: pointer;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * DataTables sorting
+ *
+ * The .sort-indicator rules live in components/editions.css: they have to
+ * apply before this lazily-imported stylesheet lands, or the server-rendered
+ * icons stack up unstyled until the editions-table chunk loads.
+ */
+
+.sorting:hover {
+  text-decoration: none;
+}
+
+tr.even,
+tr.odd {
+  border-bottom: 1px solid var(--color-border-muted);
+}
+
+div.box {
+  height: 100px;
+  padding: var(--spacing-inset-sm);
+  overflow: auto;
+  border: 1px solid var(--dark-baby-blue);
+  background-color: var(--color-primary-subtle);
+}
+
+.top .dataTables_info {
+  float: none;
+}
+
+.dataTables_empty {
+  text-align: center;
+  font-size: var(--font-size-label-large);
+  font-weight: var(--font-weight-regular);
+  padding: var(--spacing-inset-md) 0;
+  color: var(--red);
+}
+
+tfoot input {
+  margin: 0.5em 0;
+  width: 100%;
+  color: var(--darker-grey);
+}
+
+td.group {
+  background-color: var(--gray-d1cfd0);
+  border-bottom: 2px solid var(--gray-a19b9e);
+  border-top: 2px solid var(--gray-a19b9e);
+}
+
+td.details {
+  background-color: var(--gray-d1cfd0);
+  border: 2px solid var(--gray-a19b9e);
+}
+
+div.dataTables_filter {
+  float: right;
+  text-align: right;
+  font-size: var(--font-size-label-medium);
+  margin: 0;
+  color: var(--color-text-secondary);
+}
+
+.dataTables_filter input {
+  margin: 0 0 0 var(--spacing-inline-sm);
+  border-radius: var(--border-radius-input);
+  padding: var(--spacing-inset-xs);
+  border: 1px solid var(--grey);
+}
+
+@media only screen and (max-width: 768px) {
+  div.dataTables_filter {
+    float: none;
+    text-align: left;
+    margin: 5px 0 0;
+  }
+}

@@ -1,95 +1,969 @@
+import importlib
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
+
 from openlibrary.core.vendors import (
-    split_amazon_title, clean_amazon_metadata_for_load,
-    betterworldbooks_fmt)
+    AmazonAPI,
+    AmazonCreatorsAPI,
+    amazon_affiliate_url,
+    betterworldbooks_fmt,
+    clean_amazon_metadata_for_load,
+    get_amazon_metadata,
+    get_amazon_metadata_async,
+    is_dvd,
+    split_amazon_title,
+)
+from openlibrary.tests.core.sample_amazon_record import get_sample_amazon_item
 
 
 def test_clean_amazon_metadata_for_load_non_ISBN():
     # results from get_amazon_metadata() -> _serialize_amazon_product()
     # available from /prices?asin=B000KRRIZI
-    amazon = {"publishers": ["Dutton"], "languages": [], "price_amt": "74.00", "source_records": ["amazon:B000KRRIZI"], "title": "The Man With the Crimson Box", "url": "https://www.amazon.com/dp/B000KRRIZI/?tag=internetarchi-20", "price": "$74.00 (used)", "number_of_pages": None, "cover": "https://images-na.ssl-images-amazon.com/images/I/31aTq%2BNA1EL.jpg", "qlt": "used", "physical_format": "hardcover", "edition": "First Edition", "publish_date": "1940", "authors": [{"name": "H.S. Keeler"}], "product_group": "Book", "offer_summary": {"total_used": 1, "total_new": 0, "total_collectible": 0, "lowest_used": 7400, "amazon_offers": 0}}
+    amazon = {
+        "publishers": ["Dutton"],
+        "languages": [],
+        "price_amt": "74.00",
+        "source_records": ["amazon:B000KRRIZI"],
+        "title": "The Man With the Crimson Box",
+        "url": "https://www.amazon.com/dp/B000KRRIZI/?tag=internetarchi-20",
+        "price": "$74.00 (used)",
+        "number_of_pages": None,
+        "cover": "https://images-na.ssl-images-amazon.com/images/I/31aTq%2BNA1EL.jpg",
+        "qlt": "used",
+        "physical_format": "hardcover",
+        "edition": "First Edition",
+        "publish_date": "1940",
+        "authors": [{"name": "H.S. Keeler"}],
+        "product_group": "Book",
+        "offer_summary": {
+            "total_used": 1,
+            "total_new": 0,
+            "total_collectible": 0,
+            "lowest_used": 7400,
+            "amazon_offers": 0,
+        },
+    }
     result = clean_amazon_metadata_for_load(amazon)
     # this result is passed to load() from vendors.create_edition_from_amazon_metadata()
-    assert isinstance(result['publishers'], list)
-    assert result['publishers'][0] == 'Dutton'
-    assert result['cover'] == 'https://images-na.ssl-images-amazon.com/images/I/31aTq%2BNA1EL.jpg'
-    assert result['authors'][0]['name'] == 'H.S. Keeler'
-    for isbn in ('isbn', 'isbn_10', 'isbn_13'):
+    assert isinstance(result["publishers"], list)
+    assert result["publishers"][0] == "Dutton"
+    assert result["cover"] == "https://images-na.ssl-images-amazon.com/images/I/31aTq%2BNA1EL.jpg"
+    assert result["authors"][0]["name"] == "H.S. Keeler"
+    for isbn in ("isbn", "isbn_10", "isbn_13"):
         assert result.get(isbn) is None
-    assert result['identifiers']['amazon'] == ['B000KRRIZI']
-    assert result['source_records'] == ['amazon:B000KRRIZI']
-    assert result['publish_date'] == '1940'
+    assert result["identifiers"]["amazon"] == ["B000KRRIZI"]
+    assert result["source_records"] == ["amazon:B000KRRIZI"]
+    assert result["publish_date"] == "1940"
 
 
 def test_clean_amazon_metadata_for_load_ISBN():
-    amazon =  {"publishers": ["Oxford University Press"], "price": "$9.50 (used)", "physical_format": "paperback", "edition": "3", "authors": [{"name": "Rachel Carson"}], "isbn_13": ["9780190906764"], "price_amt": "9.50", "source_records": ["amazon:0190906766"], "title": "The Sea Around Us", "url": "https://www.amazon.com/dp/0190906766/?tag=internetarchi-20", "offer_summary": {"amazon_offers": 1, "lowest_new": 1050, "total_new": 31, "lowest_used": 950, "total_collectible": 0, "total_used": 15}, "number_of_pages": "256", "cover": "https://images-na.ssl-images-amazon.com/images/I/51XKo3FsUyL.jpg", "languages": ["english"], "isbn_10": ["0190906766"], "publish_date": "Dec 18, 2018", "product_group": "Book", "qlt": "used"}
+    amazon = {
+        "publishers": ["Oxford University Press"],
+        "price": "$9.50 (used)",
+        "physical_format": "paperback",
+        "edition": "3",
+        "authors": [{"name": "Rachel Carson"}],
+        "isbn_13": ["9780190906764"],
+        "price_amt": "9.50",
+        "source_records": ["amazon:0190906766"],
+        "title": "The Sea Around Us",
+        "url": "https://www.amazon.com/dp/0190906766/?tag=internetarchi-20",
+        "offer_summary": {
+            "amazon_offers": 1,
+            "lowest_new": 1050,
+            "total_new": 31,
+            "lowest_used": 950,
+            "total_collectible": 0,
+            "total_used": 15,
+        },
+        "number_of_pages": "256",
+        "cover": "https://images-na.ssl-images-amazon.com/images/I/51XKo3FsUyL.jpg",
+        "languages": ["english"],
+        "isbn_10": ["0190906766"],
+        "publish_date": "Dec 18, 2018",
+        "product_group": "Book",
+        "qlt": "used",
+    }
     result = clean_amazon_metadata_for_load(amazon)
     # TODO: implement and test edition number
-    assert isinstance(result['publishers'], list)
-    assert result['cover'] == 'https://images-na.ssl-images-amazon.com/images/I/51XKo3FsUyL.jpg'
-    assert result['authors'][0]['name'] == 'Rachel Carson'
-    assert result.get('isbn') is None
-    assert result.get('isbn_13') == ['9780190906764']
-    assert result.get('isbn_10') == [   '0190906766']
-    assert result.get('identifiers') is None  # No Amazon id present
-    assert result['source_records'] == ['amazon:0190906766']
-    assert result['publish_date'] == 'Dec 18, 2018'
-    assert result['physical_format'] == 'paperback'
-    assert result['number_of_pages'] == '256'
-    assert result.get('price') is None
-    assert result.get('qlt') is None
-    assert result.get('offer_summary') is None
+    assert isinstance(result["publishers"], list)
+    assert result["cover"] == "https://images-na.ssl-images-amazon.com/images/I/51XKo3FsUyL.jpg"
+    assert result["authors"][0]["name"] == "Rachel Carson"
+    assert result.get("isbn") is None
+    assert result.get("isbn_13") == ["9780190906764"]
+    assert result.get("isbn_10") == ["0190906766"]
+    assert result.get("languages") == ["english"]
+    assert result.get("identifiers") is None  # No Amazon id present
+    assert result["source_records"] == ["amazon:0190906766"]
+    assert result["publish_date"] == "Dec 18, 2018"
+    assert result["physical_format"] == "paperback"
+    assert result["number_of_pages"] == "256"
+    assert result.get("price") is None
+    assert result.get("qlt") is None
+    assert result.get("offer_summary") is None
+
+
+def test_clean_amazon_metadata_for_load_translator():
+    amazon = {
+        "publishers": ["Oxford University Press"],
+        "price": "$9.50 (used)",
+        "physical_format": "paperback",
+        "edition": "3",
+        "authors": [{"name": "Rachel Kushner"}],
+        "contributors": [
+            {"role": "Translator", "name": "Suat Ertüzün"},
+            {"role": "Translator", "name": "Second Translator"},
+        ],
+        "isbn_13": ["9780190906764"],
+        "price_amt": "9.50",
+        "source_records": ["amazon:0190906766"],
+        "title": "The Sea Around Us",
+        "url": "https://www.amazon.com/dp/0190906766/?tag=internetarchi-20",
+        "offer_summary": {
+            "amazon_offers": 1,
+            "lowest_new": 1050,
+            "total_new": 31,
+            "lowest_used": 950,
+            "total_collectible": 0,
+            "total_used": 15,
+        },
+        "number_of_pages": "256",
+        "cover": "https://images-na.ssl-images-amazon.com/images/I/51XKo3FsUyL.jpg",
+        "languages": ["english"],
+        "isbn_10": ["0190906766"],
+        "publish_date": "Dec 18, 2018",
+        "product_group": "Book",
+        "qlt": "used",
+    }
+    result = clean_amazon_metadata_for_load(amazon)
+    # TODO: implement and test edition number
+    assert isinstance(result["publishers"], list)
+    assert result["cover"] == "https://images-na.ssl-images-amazon.com/images/I/51XKo3FsUyL.jpg"
+    assert result["authors"][0]["name"] == "Rachel Kushner"
+    assert result["contributors"][0]["role"] == "Translator"
+    assert result["contributors"][0]["name"] == "Suat Ertüzün"
+    assert result["contributors"][1]["role"] == "Translator"
+    assert result["contributors"][1]["name"] == "Second Translator"
+    assert result.get("isbn") is None
+    assert result.get("isbn_13") == ["9780190906764"]
+    assert result.get("isbn_10") == ["0190906766"]
+    assert result.get("languages") == ["english"]
+    assert result.get("identifiers") is None  # No Amazon id present
+    assert result["source_records"] == ["amazon:0190906766"]
+    assert result["publish_date"] == "Dec 18, 2018"
+    assert result["physical_format"] == "paperback"
+    assert result["number_of_pages"] == "256"
+    assert result.get("price") is None
+    assert result.get("qlt") is None
+    assert result.get("offer_summary") is None
 
 
 amazon_titles = [
-        # Original title, title, subtitle
-        ['Test Title', 'Test Title', None],
-        ['Killers of the Flower Moon: The Osage Murders and the Birth of the FBI',
-            'Killers of the Flower Moon',
-            'The Osage Murders and the Birth of the FBI'],
-        ['Pachinko (National Book Award Finalist)',
-            'Pachinko', None],
-        ['Trapped in a Video Game (Book 1) (Volume 1)',
-            'Trapped in a Video Game', None],
-        ["An American Marriage (Oprah's Book Club): A Novel",
-            'An American Marriage', 'A Novel'],
-        ['A Novel (German Edition)',
-            'A Novel', None],
-        ['Vietnam Travel Guide 2019: Ho Chi Minh City - First Journey : 10 Tips For an Amazing Trip',
-            'Vietnam Travel Guide 2019 : Ho Chi Minh City - First Journey',
-            '10 Tips For an Amazing Trip'],
-        ['Secrets of Adobe(r) Acrobat(r) 7. 150 Best Practices and Tips (Russian Edition)',
-            'Secrets of Adobe Acrobat 7. 150 Best Practices and Tips', None],
-        ['Last Days at Hot Slit: The Radical Feminism of Andrea Dworkin (Semiotext(e) / Native Agents)',
-            'Last Days at Hot Slit',
-            'The Radical Feminism of Andrea Dworkin'],
-        ['Bloody Times: The Funeral of Abraham Lincoln and the Manhunt for Jefferson Davis',
-            'Bloody Times',
-            'The Funeral of Abraham Lincoln and the Manhunt for Jefferson Davis'],
+    # Original title, title, subtitle
+    ["Test Title", "Test Title", None],
+    [
+        "Killers of the Flower Moon: The Osage Murders and the Birth of the FBI",
+        "Killers of the Flower Moon",
+        "The Osage Murders and the Birth of the FBI",
+    ],
+    ["Pachinko (National Book Award Finalist)", "Pachinko", None],
+    ["Trapped in a Video Game (Book 1) (Volume 1)", "Trapped in a Video Game", None],
+    [
+        "An American Marriage (Oprah's Book Club): A Novel",
+        "An American Marriage",
+        "A Novel",
+    ],
+    ["A Novel (German Edition)", "A Novel", None],
+    [
+        "Vietnam Travel Guide 2019: Ho Chi Minh City - First Journey : 10 Tips For an Amazing Trip",
+        "Vietnam Travel Guide 2019 : Ho Chi Minh City - First Journey",
+        "10 Tips For an Amazing Trip",
+    ],
+    [
+        "Secrets of Adobe(r) Acrobat(r) 7. 150 Best Practices and Tips (Russian Edition)",
+        "Secrets of Adobe Acrobat 7. 150 Best Practices and Tips",
+        None,
+    ],
+    [
+        "Last Days at Hot Slit: The Radical Feminism of Andrea Dworkin (Semiotext(e) / Native Agents)",
+        "Last Days at Hot Slit",
+        "The Radical Feminism of Andrea Dworkin",
+    ],
+    [
+        "Bloody Times: The Funeral of Abraham Lincoln and the Manhunt for Jefferson Davis",
+        "Bloody Times",
+        "The Funeral of Abraham Lincoln and the Manhunt for Jefferson Davis",
+    ],
 ]
 
-@pytest.mark.parametrize('amazon,title,subtitle', amazon_titles)
+
+@pytest.mark.parametrize(("amazon", "title", "subtitle"), amazon_titles)
 def test_split_amazon_title(amazon, title, subtitle):
     assert split_amazon_title(amazon) == (title, subtitle)
 
 
 def test_clean_amazon_metadata_for_load_subtitle():
-    amazon = {"publishers": ["Vintage"], "price": "$4.12 (used)", "physical_format": "paperback", "edition": "Reprint", "authors": [{"name": "David Grann"}], "isbn_13": ["9780307742483"], "price_amt": "4.12", "source_records": ["amazon:0307742482"], "title": "Killers of the Flower Moon: The Osage Murders and the Birth of the FBI", "url": "https://www.amazon.com/dp/0307742482/?tag=internetarchi-20", "offer_summary": {"lowest_new": 869, "amazon_offers": 1, "total_new": 57, "lowest_used": 412, "total_collectible": 2, "total_used": 133, "lowest_collectible": 1475}, "number_of_pages": "400", "cover": "https://images-na.ssl-images-amazon.com/images/I/51PP3iTK8DL.jpg", "languages": ["english"], "isbn_10": ["0307742482"], "publish_date": "Apr 03, 2018", "product_group": "Book", "qlt": "used"}
+    amazon = {
+        "publishers": ["Vintage"],
+        "price": "$4.12 (used)",
+        "physical_format": "paperback",
+        "edition": "Reprint",
+        "authors": [{"name": "David Grann"}],
+        "isbn_13": ["9780307742483"],
+        "price_amt": "4.12",
+        "source_records": ["amazon:0307742482"],
+        "title": "Killers of the Flower Moon: The Osage Murders and the Birth of the FBI",
+        "url": "https://www.amazon.com/dp/0307742482/?tag=internetarchi-20",
+        "offer_summary": {
+            "lowest_new": 869,
+            "amazon_offers": 1,
+            "total_new": 57,
+            "lowest_used": 412,
+            "total_collectible": 2,
+            "total_used": 133,
+            "lowest_collectible": 1475,
+        },
+        "number_of_pages": "400",
+        "cover": "https://images-na.ssl-images-amazon.com/images/I/51PP3iTK8DL.jpg",
+        "languages": ["english"],
+        "isbn_10": ["0307742482"],
+        "publish_date": "Apr 03, 2018",
+        "product_group": "Book",
+        "qlt": "used",
+    }
     result = clean_amazon_metadata_for_load(amazon)
-    assert result['title'] == 'Killers of the Flower Moon'
-    assert result.get('subtitle') == 'The Osage Murders and the Birth of the FBI'
-    assert result.get('full_title') == 'Killers of the Flower Moon : The Osage Murders and the Birth of the FBI'
-    #TODO: test for, and implement languages
+    assert result["title"] == "Killers of the Flower Moon"
+    assert result.get("subtitle") == "The Osage Murders and the Birth of the FBI"
+    assert result.get("full_title") == "Killers of the Flower Moon : The Osage Murders and the Birth of the FBI"
+    assert result["languages"] == ["english"]
 
 
 def test_betterworldbooks_fmt():
-    isbn = '9780393062274'
+    isbn = "9780393062274"
     bad_data = betterworldbooks_fmt(isbn)
-    assert bad_data.get('isbn') == isbn
-    assert bad_data.get('price') is None
-    assert bad_data.get('price_amt') is None
-    assert bad_data.get('qlt') is None
+    assert bad_data.get("isbn") == isbn
+    assert bad_data.get("price") is None
+    assert bad_data.get("price_amt") is None
+    assert bad_data.get("qlt") is None
+    assert bad_data.get("new_qty") is None
+    assert bad_data.get("used_price") is None
+
 
 # Test cases to add:
 # Multiple authors
 
+
+def test_get_amazon_metadata() -> None:
+    """
+    Mock a reply from the Amazon affiliate server so we can do a basic test for
+    get_amazon_metadata(), the sync async_bridge wrapper around the canonical
+    get_amazon_metadata_async().
+    """
+
+    class MockResponse:
+        def raise_for_status(self):
+            return True
+
+        def json(self):
+            return mock_response
+
+    mock_response = {
+        "status": "success",
+        "hit": {
+            "url": "https://www.amazon.com/dp/059035342X/?tag=internetarchi-20",
+            "source_records": ["amazon:059035342X"],
+            "isbn_10": ["059035342X"],
+            "isbn_13": ["9780590353427"],
+            "price": "$5.10",
+            "price_amt": 509,
+            "title": "Harry Potter and the Sorcerer's Stone",
+            "cover": "https://m.media-amazon.com/images/I/51Wbz5GypgL._SL500_.jpg",
+            "authors": [{"name": "Rowling, J.K."}, {"name": "GrandPr_, Mary"}],
+            "publishers": ["Scholastic"],
+            "number_of_pages": 309,
+            "edition_num": "1",
+            "publish_date": "Sep 02, 1998",
+            "product_group": "Book",
+            "physical_format": "paperback",
+        },
+    }
+    expected = {
+        "url": "https://www.amazon.com/dp/059035342X/?tag=internetarchi-20",
+        "source_records": ["amazon:059035342X"],
+        "isbn_10": ["059035342X"],
+        "isbn_13": ["9780590353427"],
+        "price": "$5.10",
+        "price_amt": 509,
+        "title": "Harry Potter and the Sorcerer's Stone",
+        "cover": "https://m.media-amazon.com/images/I/51Wbz5GypgL._SL500_.jpg",
+        "authors": [{"name": "Rowling, J.K."}, {"name": "GrandPr_, Mary"}],
+        "publishers": ["Scholastic"],
+        "number_of_pages": 309,
+        "edition_num": "1",
+        "publish_date": "Sep 02, 1998",
+        "product_group": "Book",
+        "physical_format": "paperback",
+    }
+    isbn = "059035342X"
+
+    async def mock_async_get(*args, **kwargs):
+        return MockResponse()
+
+    with (
+        patch(
+            "openlibrary.core.vendors.get_async_session",
+            new=lambda: SimpleNamespace(get=mock_async_get),
+        ),
+        patch("openlibrary.core.vendors.affiliate_server_url", new=True),
+    ):
+        got = get_amazon_metadata(id_=isbn, id_type="isbn")
+        assert got == expected
+
+
+@pytest.mark.asyncio
+async def test_get_amazon_metadata_async() -> None:
+    """
+    Async version of get_amazon_metadata: mock a reply from the affiliate
+    server via the shared httpx async session and verify the metadata is
+    returned without blocking.
+    """
+
+    class MockResponse:
+        def raise_for_status(self):
+            return True
+
+        def json(self):
+            return mock_response
+
+    captured_kwargs = {}
+
+    async def mock_async_get(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return MockResponse()
+
+    mock_response = {
+        "status": "success",
+        "hit": {
+            "url": "https://www.amazon.com/dp/059035342X/?tag=internetarchi-20",
+            "source_records": ["amazon:059035342X"],
+            "isbn_10": ["059035342X"],
+            "isbn_13": ["9780590353427"],
+            "price": "$5.10",
+            "price_amt": 509,
+            "title": "Harry Potter and the Sorcerer's Stone",
+            "cover": "https://m.media-amazon.com/images/I/51Wbz5GypgL._SL500_.jpg",
+            "authors": [{"name": "Rowling, J.K."}, {"name": "GrandPr_, Mary"}],
+            "publishers": ["Scholastic"],
+            "number_of_pages": 309,
+            "edition_num": "1",
+            "publish_date": "Sep 02, 1998",
+            "product_group": "Book",
+            "physical_format": "paperback",
+        },
+    }
+    expected = mock_response["hit"]
+    # Use the ISBN-13 form of the same book for a distinct cache key.
+    isbn = "9780590353427"
+    with (
+        patch(
+            "openlibrary.core.vendors.get_async_session",
+            new=lambda: SimpleNamespace(get=mock_async_get),
+        ),
+        patch("openlibrary.core.vendors.affiliate_server_url", new=True),
+    ):
+        got = await get_amazon_metadata_async(id_=isbn, id_type="isbn", timeout=5.0)
+        assert got == expected
+        assert captured_kwargs["timeout"] == 5.0
+
+
+@dataclass
+class ProductGroup:
+    display_value: str | None
+
+
+@dataclass
+class Binding:
+    display_value: str | None
+
+
+@dataclass
+class Classifications:
+    product_group: ProductGroup | None
+    binding: Binding
+
+
+@dataclass
+class Contributor:
+    locale: str | None
+    name: str | None
+    role: str | None
+
+
+@dataclass
+class ByLineInfo:
+    brand: str | None
+    contributors: list[Contributor] | None
+    manufacturer: str | None
+
+
+@dataclass
+class ItemInfo:
+    classifications: Classifications | None
+    content_info: str
+    by_line_info: ByLineInfo | None
+    title: str
+
+
+@dataclass
+class AmazonAPIReply:
+    item_info: ItemInfo
+    images: str
+    offers: str
+    asin: str
+
+
+@pytest.mark.parametrize(
+    ("product_group", "expected"),
+    [
+        ("dvd", {}),
+        ("DVD", {}),
+        ("Dvd", {}),
+    ],
+)
+def test_clean_amazon_metadata_does_not_load_DVDS_product_group(product_group, expected) -> None:
+    """Ensure data load does not load dvds and relies on fake API response objects"""
+    dvd_product_group = ProductGroup(product_group)
+    classification = Classifications(product_group=dvd_product_group, binding=Binding(""))
+    item_info = ItemInfo(classifications=classification, content_info="", by_line_info=None, title="")
+    amazon_metadata = AmazonAPIReply(
+        item_info=item_info,
+        images="",
+        offers="",
+        asin="",
+    )
+    result = AmazonAPI.serialize(amazon_metadata)
+    assert result == expected
+
+
+def test_serialize_sample_record() -> None:
+    assert AmazonAPI.serialize(get_sample_amazon_item()) == {
+        "authors": [{"name": "Glasgow, Kathleen"}],
+        "contributors": [{"name": "Paris, Christel", "role": "Translator"}],
+        "cover": "https://m.media-amazon.com/images/I/41vfxwDpB2L._SL500_.jpg",
+        "edition_num": None,
+        "isbn_10": ["2380821313"],
+        "isbn_13": ["9782380821314"],
+        "languages": ["French"],
+        "number_of_pages": 448,
+        "physical_format": "paperback",
+        "price": "$34.59",
+        "price_amt": 3459,
+        "product_group": "Book",
+        "publish_date": "Sep 22, 2023",
+        "publishers": ["ANNE CARRIERE"],
+        "source_records": ["amazon:2380821313"],
+        "title": "Girl in pieces",
+        "url": "https://www.amazon.com/dp/2380821313/?tag=",
+    }
+
+
+def test_serialize_pages_0() -> None:
+    amz_item = get_sample_amazon_item()
+    amz_item.item_info.content_info.pages_count.display_value = 0
+    result = AmazonAPI.serialize(amz_item)
+    assert "number_of_pages" not in result
+
+
+def test_serialize_does_not_load_translators_as_authors() -> None:
+    """Ensure data load does not load translators as author and relies on fake API response objects"""
+    classification = None
+    contributors = [
+        Contributor(None, "Rachel Kushner", "Author"),
+        Contributor(None, "Suat Ertüzün", "Translator"),
+        Contributor(None, "Second Translator", "Translator"),
+        Contributor(None, "No Role", ""),
+        Contributor(None, "Third Contributor", "Unsupported Role"),
+    ]
+    by_line_info = ByLineInfo(None, contributors, None)
+    item_info = ItemInfo(
+        classifications=classification,
+        content_info="",
+        by_line_info=by_line_info,
+        title="",
+    )
+    amazon_metadata = AmazonAPIReply(
+        item_info=item_info,
+        images="",
+        offers="",
+        asin="",
+    )
+    result = AmazonAPI.serialize(amazon_metadata)
+    expected = {
+        "url": "https://www.amazon.com/dp//?tag=",
+        "source_records": ["amazon:"],
+        "isbn_10": [""],
+        "isbn_13": [],
+        "price": "",
+        "price_amt": "",
+        "title": "",
+        "cover": None,
+        "authors": [{"name": "Rachel Kushner"}],
+        "contributors": [
+            {"role": "Translator", "name": "Suat Ertüzün"},
+            {"role": "Translator", "name": "Second Translator"},
+        ],
+        "publishers": [],
+        "edition_num": "",
+        "publish_date": "",
+        "product_group": None,
+        "physical_format": None,
+    }
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    ("physical_format", "expected"),
+    [
+        ("dvd", {}),
+        ("DVD", {}),
+        ("Dvd", {}),
+    ],
+)
+def test_clean_amazon_metadata_does_not_load_DVDS_physical_format(physical_format, expected) -> None:
+    dvd_product_group = ProductGroup("isolate_physical_format")
+    binding = Binding(physical_format)
+    classification = Classifications(product_group=dvd_product_group, binding=binding)
+    item_info = ItemInfo(classifications=classification, content_info="", by_line_info=None, title="")
+    amazon_metadata = AmazonAPIReply(
+        item_info=item_info,
+        images="",
+        offers="",
+        asin="",
+    )
+    result = AmazonAPI.serialize(amazon_metadata)
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    ("physical_format", "product_group", "expected"),
+    [
+        ("dvd", "dvd", True),
+        (None, None, False),
+        ("Book", "Book", False),
+        ("DVD", None, True),
+        ("Dvd", None, True),
+        ("dvd", None, True),
+        ("Book", "dvd", True),
+        (None, "dvd", True),
+        (None, "Book", False),
+        ("dvd", "book", True),
+    ],
+)
+def test_is_dvd(physical_format, product_group, expected):
+    book = {
+        "physical_format": physical_format,
+        "product_group": product_group,
+    }
+
+    got = is_dvd(book)
+    assert got is expected
+
+
+# ---- Creators API dataclass fixtures ----------------------------------------
+# Minimal stand-ins for the objects returned by the python-amazon-paapi SDK.
+# Only attributes accessed by AmazonCreatorsAPI.serialize() are defined.
+
+
+@dataclass
+class CDisplayVal:
+    display_value: object
+
+
+@dataclass
+class CLangEntry:
+    display_value: str
+    type: str
+
+
+@dataclass
+class CLangs:
+    display_values: list
+
+
+@dataclass
+class CEans:
+    display_values: list  # list[str] — raw EAN strings
+
+
+@dataclass
+class CExtIds:
+    eans: object = None
+
+
+@dataclass
+class CContentInfo:
+    pages_count: object = None
+    publication_date: object = None
+    languages: object = None
+    edition: object = None
+
+
+@dataclass
+class CCreatorsContributor:
+    name: str
+    role: str
+
+
+@dataclass
+class CByLine:
+    contributors: list | None = None
+    brand: object = None
+    manufacturer: object = None
+
+
+@dataclass
+class CClassify:
+    product_group: object = None
+    binding: object = None
+
+
+@dataclass
+class CItemInfo:
+    title: object = None
+    by_line_info: object = None
+    classifications: CClassify | None = None
+    content_info: object = None
+    external_ids: CExtIds | None = None
+
+
+@dataclass
+class CImage:
+    url: str = ""
+
+
+@dataclass
+class CImgSizes:
+    large: object = None
+
+
+@dataclass
+class CImages:
+    primary: object = None
+    variants: list = field(default_factory=list)
+
+
+@dataclass
+class CMoney:
+    display_amount: str = ""
+    amount: float = 0.0
+
+
+@dataclass
+class CSavings:
+    percentage: float = 0.0
+
+
+@dataclass
+class CSavingBasis:
+    money: object = None
+
+
+@dataclass
+class CPrice:
+    money: object = None
+    savings: object = None
+    saving_basis: object = None
+
+
+@dataclass
+class CAvailability:
+    type: str = ""
+    message: str | None = None
+
+
+@dataclass
+class CCondition:
+    value: str | None = None
+    sub_condition: str | None = None
+
+
+@dataclass
+class CMerchantInfo:
+    name: str | None = None
+
+
+@dataclass
+class CDealDetails:
+    badge: str | None = None
+
+
+@dataclass
+class CListing:
+    price: object = None
+    availability: object = None
+    condition: object = None
+    merchant_info: object = None
+    deal_details: object = None
+
+
+@dataclass
+class COffersV2:
+    listings: list = field(default_factory=list)
+
+
+@dataclass
+class CBrowseNode:
+    context_free_name: str = ""
+    ancestor: object = None
+
+
+@dataclass
+class CBrowseNodeInfo:
+    browse_nodes: list = field(default_factory=list)
+
+
+@dataclass
+class CItem:
+    asin: str = ""
+    item_info: CItemInfo | None = None
+    images: object = None
+    offers_v2: object = None
+    browse_node_info: object = None
+
+
+def _make_creators_item() -> CItem:
+    """
+    Fully-populated Creators API item fixture modelling a real book
+    (The Sea Around Us by Rachel Carson, ISBN-10 0190906766).
+    """
+    return CItem(
+        asin="0190906766",
+        item_info=CItemInfo(
+            title=CDisplayVal("The Sea Around Us"),
+            by_line_info=CByLine(
+                contributors=[
+                    CCreatorsContributor("Rachel Carson", "Author"),
+                    CCreatorsContributor("Translator Name", "Translator"),
+                ],
+                manufacturer=CDisplayVal("Oxford University Press"),
+            ),
+            classifications=CClassify(
+                product_group=CDisplayVal("Book"),
+                binding=CDisplayVal("Paperback"),
+            ),
+            content_info=CContentInfo(
+                pages_count=CDisplayVal(256),
+                publication_date=CDisplayVal("2018-12-18T00:00:01Z"),
+                languages=CLangs(
+                    display_values=[
+                        CLangEntry("English", "Published"),
+                        CLangEntry("English", "Original Language"),
+                    ]
+                ),
+            ),
+            external_ids=CExtIds(eans=CEans(["9780190906764"])),
+        ),
+        images=CImages(
+            primary=CImgSizes(large=CImage("https://m.media-amazon.com/images/I/example.jpg")),
+            variants=[CImgSizes(large=CImage("https://m.media-amazon.com/images/I/variant1.jpg"))],
+        ),
+        offers_v2=COffersV2(
+            listings=[
+                CListing(
+                    price=CPrice(
+                        money=CMoney("$9.50", 9.50),
+                        savings=CSavings(10.0),
+                        saving_basis=CSavingBasis(money=CMoney("$10.56", 10.56)),
+                    ),
+                    availability=CAvailability("IN_STOCK", "In Stock"),
+                    condition=CCondition("New", "New"),
+                    merchant_info=CMerchantInfo("Amazon.com"),
+                    deal_details=CDealDetails("Limited time deal"),
+                )
+            ]
+        ),
+        browse_node_info=CBrowseNodeInfo(
+            browse_nodes=[
+                CBrowseNode("Science & Math", ancestor=CBrowseNode("Books")),
+                CBrowseNode("Oceans & Seas"),
+            ]
+        ),
+    )
+
+
+def test_amazon_creatorsapi_lazy_import_resolves() -> None:
+    """
+    `AmazonCreatorsAPI.__init__` does `from amazon_creatorsapi import ...` at call
+    time, so a missing dependency surfaces only when the affiliate server boots.
+
+    This matters more since #13277 removed the legacy PA-API fallback: there is no
+    longer a second client to degrade to, so a broken import is a total outage. The
+    module ships inside `python-amazon-paapi` (requirements.txt), which is not an
+    obvious place to look, so a dependency bump can break it with nothing else failing.
+    """
+    module = importlib.import_module("amazon_creatorsapi")
+    assert hasattr(module, "AmazonCreatorsApi")
+    assert hasattr(module.Country, "US")
+
+
+# ---- AmazonCreatorsAPI.serialize() tests ------------------------------------
+
+
+def test_creators_serialize_full_book() -> None:
+    """Golden path: all standard and Creators-API-specific fields serialize correctly."""
+    result = AmazonCreatorsAPI.serialize(_make_creators_item())
+
+    # Core identity fields
+    assert result["source_records"] == ["amazon:0190906766"]
+    assert result["isbn_10"] == ["0190906766"]
+    assert result["isbn_13"] == ["9780190906764"]
+    assert result["title"] == "The Sea Around Us"
+
+    # Contributors
+    assert result["authors"] == [{"name": "Rachel Carson"}]
+    assert result["contributors"] == [{"name": "Translator Name", "role": "Translator"}]
+    assert result["publishers"] == ["Oxford University Press"]
+
+    # Edition metadata
+    assert result["physical_format"] == "paperback"
+    assert result["product_group"] == "Book"
+    assert result["languages"] == ["English"]  # "Original Language" duplicate removed
+    assert result["number_of_pages"] == 256
+    assert result["publish_date"] == "Dec 18, 2018"
+
+    # Price (Creators API path: price.money.display_amount)
+    assert result["price"] == "$9.50"
+    assert result["price_amt"] == 950
+
+    # Cover image
+    assert result["cover"] == "https://m.media-amazon.com/images/I/example.jpg"
+
+    # Creators API additions absent from the legacy PA-API output
+    assert result["categories"] == ["Science & Math", "Oceans & Seas"]
+    assert result["availability"] == "IN_STOCK"
+    assert result["availability_message"] == "In Stock"
+    assert result["condition"] == "New"
+    assert result["sub_condition"] == "New"
+    assert result["merchant"] == "Amazon.com"
+    assert result["deal_badge"] == "Limited time deal"
+    assert result["price_savings_pct"] == 10.0
+    assert result["list_price"] == "$10.56"
+    assert result["image_variants"] == ["https://m.media-amazon.com/images/I/variant1.jpg"]
+
+
+def test_creators_serialize_isbn13_fallback_from_isbn10() -> None:
+    """When external_ids.eans is absent, ISBN-13 is computed from the ISBN-10 ASIN."""
+    item = _make_creators_item()
+    assert item.item_info is not None
+    item.item_info.external_ids = None
+    result = AmazonCreatorsAPI.serialize(item)
+    assert result["isbn_10"] == ["0190906766"]
+    assert result["isbn_13"] == ["9780190906764"]
+
+
+def test_creators_serialize_non_isbn_asin() -> None:
+    """An ASIN starting with 'B' (not an ISBN) produces empty isbn_10 and isbn_13."""
+    item = _make_creators_item()
+    item.asin = "B000KRRIZI"
+    assert item.item_info is not None
+    item.item_info.external_ids = None
+    result = AmazonCreatorsAPI.serialize(item)
+    assert result["isbn_10"] == []
+    assert result["isbn_13"] == []
+    assert result["source_records"] == ["amazon:B000KRRIZI"]
+
+
+def test_creators_serialize_dvd_returns_empty() -> None:
+    """Items whose binding is 'DVD' are filtered out and return an empty dict."""
+    item = _make_creators_item()
+    assert item.item_info is not None
+    assert item.item_info.classifications is not None
+    item.item_info.classifications.binding = CDisplayVal("DVD")
+    assert AmazonCreatorsAPI.serialize(item) == {}
+
+
+def test_creators_serialize_categories_filter_internal_nodes() -> None:
+    """UUID-named, ASIN-containing, promotional, and generic root nodes are excluded."""
+    item = _make_creators_item()
+    item.browse_node_info = CBrowseNodeInfo(
+        browse_nodes=[
+            CBrowseNode("Science & Math"),  # kept
+            CBrowseNode("1a2b3c4d-5e6f-7890-abcd-ef1234567890"),  # UUID → dropped
+            CBrowseNode("ASIN lookup"),  # contains 'ASIN' → dropped
+            CBrowseNode("Test node alpha"),  # matches ^Test node → dropped
+            CBrowseNode("Subjects"),  # generic root → dropped
+            CBrowseNode("Oceans & Seas"),  # kept
+        ]
+    )
+    result = AmazonCreatorsAPI.serialize(item)
+    assert result["categories"] == ["Science & Math", "Oceans & Seas"]
+
+
+@pytest.mark.parametrize(
+    ("product_group", "expected"),
+    [
+        ("dvd", {}),
+        ("DVD", {}),
+        ("Dvd", {}),
+    ],
+)
+def test_creators_serialize_does_not_load_dvds(product_group, expected) -> None:
+    """DVD product_group is filtered out regardless of case."""
+    item = _make_creators_item()
+    assert item.item_info is not None
+    assert item.item_info.classifications is not None
+    item.item_info.classifications.product_group = CDisplayVal(product_group)
+    item.item_info.classifications.binding = CDisplayVal(product_group)
+    assert AmazonCreatorsAPI.serialize(item) == expected
+
+
+def test_amazon_affiliate_url_978_isbn_uses_dp_route() -> None:
+    """978-prefix ISBN-13 converts to ISBN-10 -> /dp/ link is used."""
+    url = amazon_affiliate_url("9780590353427", None, "test-tag")  # -> 059035342X
+    assert url is not None
+    assert "/dp/059035342X/" in url
+    assert "/s?k=" not in url
+
+
+def test_amazon_affiliate_url_979_isbn_falls_back_to_search_url() -> None:
+    """979-prefix ISBN-13 has no ISBN-10 -> Amazon search URL is used (fix for #6572).
+
+    'Pickleball Soap Opera' (ISBN-13 9798776159572) previously produced a
+    broken /dp/ link because Amazon does not resolve 979-prefix ISBNs via /dp/.
+    """
+    url = amazon_affiliate_url("9798776159572", None, "test-tag")
+    assert url is not None
+    assert "/s?k=9798776159572" in url
+    assert "/dp/" not in url
+
+
+def test_amazon_affiliate_url_explicit_asin_overrides_isbn_conversion() -> None:
+    """Explicit ASIN takes priority over isbn_13_to_isbn_10 conversion."""
+    url = amazon_affiliate_url("9798776159572", "B09MJ3TKX3", "test-tag")
+    assert url is not None
+    assert "/dp/B09MJ3TKX3/" in url
+
+
+def test_amazon_affiliate_url_no_identifiers_returns_none() -> None:
+    """Without isbn or asin, function returns None."""
+    assert amazon_affiliate_url(None, None, "test-tag") is None
+
+
+def test_amazon_affiliate_url_falls_back_to_keyword_search() -> None:
+    """Without isbn or asin, a query searches Amazon's books for those keywords."""
+    url = amazon_affiliate_url(None, None, "test-tag", query="Dune Frank Herbert")
+    assert url == "https://www.amazon.com/s?k=Dune%20Frank%20Herbert&i=stripbooks&tag=test-tag"
+
+
+def test_amazon_affiliate_url_prefers_identifiers_over_query() -> None:
+    """An isbn or asin identifies the book exactly, so it wins over keywords."""
+    isbn_10_url = amazon_affiliate_url("9780590353427", None, "test-tag", query="Holes Louis Sachar")
+    assert isbn_10_url is not None
+    assert "/dp/059035342X/" in isbn_10_url
+
+    isbn_979_url = amazon_affiliate_url("9798776159572", None, "test-tag", query="Pickleball Soap Opera")
+    assert isbn_979_url is not None
+    assert "/s?k=9798776159572" in isbn_979_url

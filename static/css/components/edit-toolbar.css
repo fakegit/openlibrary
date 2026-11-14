@@ -1,0 +1,41 @@
+/**
+ * EditToolbar component
+ * https://docs.openlibrary.org/designers/design-pattern-library.html#edit-toolbar
+ */
+
+/* stylelint-disable selector-max-specificity */
+div#editTools,
+div#editHistory {
+  width: auto;
+}
+
+/* The Edit control carries its own button padding, so all this needs is the
+   inline gap separating it from the edit info beside it. */
+div.editButton {
+  width: auto;
+  display: inline-block;
+  padding-left: var(--spacing-inline-md);
+}
+
+div#editInfo {
+  white-space: normal;
+  text-align: right;
+}
+
+div#editInfo > div {
+  font-size: var(--font-size-label-small);
+  font-weight: var(--font-weight-regular);
+  color: var(--brown) !important;
+  font-family: var(--font-family-body);
+}
+
+/* Flex at every width, not just tablet-up: under the old float layout the
+   button landed on the opposite side below 768px. */
+div#editTools {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  white-space: nowrap;
+  padding: 0 0 var(--spacing-inset-md);
+}
+/* stylelint-enable selector-max-specificity */

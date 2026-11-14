@@ -1,0 +1,17 @@
+$def with (work, link_markup, id, classes='', reload_id=None)
+$# :param Work work: The work that is being reviewed
+$# :param str link_markup: arkup for element that triggers observations modal
+$# :param str id: Unique identifier for this modal
+$# :param str classes: HTML classes for this component
+$# :param str reload_id: Reference to UI component that will update when observations are added or removed
+
+$ username = ctx.user and ctx.user.key.split('/')[-1]
+
+<div class="observations-modal $classes">
+  $:link_markup
+
+  $if ctx.user:
+    <ol-dialog id="$id-metadata-form" label="$_('My Book Review')" label-close="$_('Close')" width="large" data-reload-id="$(reload_id or '')">
+      $:render_component('ObservationForm', asyncDefer=True, attrs={'schema': dict(get_observations()), 'observations': dict(work.get_users_observations(username)), 'work-key': work.key, 'username': username})
+    </ol-dialog>
+</div>

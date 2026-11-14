@@ -1,0 +1,332 @@
+"""
+Request context management for OpenLibrary.
+
+This module provides utilities for managing request-scoped context variables
+and parsing request data for both web.py and FastAPI frameworks.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+from urllib.parse import unquote
+
+import web
+
+from infogami import config
+from infogami.utils import delegate
+from infogami.utils.delegate import create_site
+
+if TYPE_CHECKING:
+    from fastapi import Request
+
+    from infogami.infobase.client import Site
+
+
+@dataclass(frozen=True)
+class RequestContextVars:
+    """
+    These are scoped to a specific request and should be derived directly from the request.
+    Use sparingly.
+    """
+
+    x_forwarded_for: str | None
+    user_agent: str | None
+    lang: str | None
+    solr_editions: bool
+    print_disabled: bool
+    sfw: bool = False
+    is_recognized_bot: bool = False
+    is_bot: bool = False
+    provider_pref: str | None = None
+
+
+req_context: ContextVar[RequestContextVars] = ContextVar("req_context")
+
+# TODO: Create an async and stateless version of site so we don't have to do this
+site: ContextVar[Site] = ContextVar("site")
+
+# Each request owns a fresh set; copied worker/task contexts share that set.
+rendered_keys: ContextVar[set[str] | None] = ContextVar("rendered_keys", default=None)
+
+
+@dataclass
+class Visitor:
+    """Who made the request, for the ``visitor`` label of the request metrics.
+    Mutable, so a worker thread or task running the route can mark the user a librarian."""
+
+    user_key: str | None  # None without a valid session cookie
+    is_librarian: bool = False  # set by User.is_librarian_or_higher(), which every HTML page's header calls
+    is_bot: bool = False  # RequestContextVars.is_bot
+
+    @property
+    def label(self) -> Literal["anonymous", "bot", "logged_in", "librarian"]:
+        """``bot`` is a logged-out request ``is_bot`` flags, the rule that also keeps it out of Matomo.
+        ``logged_in`` means logged in but not a librarian; ``librarian`` is librarian or higher."""
+        if not self.user_key:
+            return "bot" if self.is_bot else "anonymous"
+        return "librarian" if self.is_librarian else "logged_in"
+
+
+visitor: ContextVar[Visitor | None] = ContextVar("visitor", default=None)
+
+
+def _visitor(cookie_value: str | None, is_bot: bool) -> Visitor:
+    """The visitor for a session cookie. Only checks the cookie's signature; looks nothing up."""
+    from openlibrary.fastapi.auth import authenticate_user_from_cookie  # noqa: PLC0415
+
+    user = authenticate_user_from_cookie(cookie_value)
+    return Visitor(user_key=user.user_key if user else None, is_bot=is_bot)
+
+
+USER_AGENT_BOTS = [line for line in Path(__file__).with_name("bot_user_agents.txt").read_text().splitlines() if line and not line.startswith("#")]
+
+
+def _compute_is_recognized_bot(user_agent: str) -> bool:
+    my_ua = user_agent.lower()
+    return any(ua in my_ua for ua in USER_AGENT_BOTS)
+
+
+def _compute_is_bot(user_agent: str | None, hhcl: str | None) -> bool:
+    """Determine if the request is from a bot.
+
+    ``is_bot`` (broader) vs ``is_recognized_bot`` (narrower):
+    - ``is_recognized_bot``: UA matched against the known-crawler list. Used to
+      skip the /verify_human redirect — we don't want crawlers indexing the
+      challenge page, and they can't click the button anyway.
+    - ``is_bot``: is_recognized_bot PLUS missing UA and nginx X-HHCL=1 signal.
+      Used to skip Matomo tracking and other per-request overhead.
+
+    Args:
+        user_agent: The User-Agent header value
+        hhcl: The X-HHCL header value (set by nginx)
+
+    Returns:
+        True if the request appears to be from a bot, False otherwise
+    """
+
+    # Check hhcl header first (set by nginx)
+    if hhcl == "1":
+        return True
+
+    # Check user agent
+    if not user_agent:
+        return True
+
+    return _compute_is_recognized_bot(user_agent)
+
+
+def _parse_solr_editions_from_web() -> bool:
+    """Parse solr_editions from web.py context."""
+
+    def read_query_string():
+        # _method="GET" keeps this off the request body. Without it web.py parses
+        # multipart POSTs here, draining wsgi.input before the handler sees it.
+        return web.input(editions=None, _method="GET").get("editions")
+
+    def read_cookie():
+        if "SOLR_EDITIONS" in web.ctx.env.get("HTTP_COOKIE", ""):
+            return web.cookies().get("SOLR_EDITIONS")
+
+    if (qs_value := read_query_string()) is not None:
+        return qs_value == "true"
+
+    if (cookie_value := read_cookie()) is not None:
+        return cookie_value == "true"
+
+    return True
+
+
+def _parse_solr_editions_from_fastapi(request) -> bool:
+    """Parse solr_editions preference from query string or cookie."""
+    if editions_param := request.query_params.get("editions"):
+        return editions_param.lower() == "true"
+
+    if cookie_value := request.cookies.get("SOLR_EDITIONS"):
+        return cookie_value.lower() == "true"
+
+    return True
+
+
+def set_context_from_legacy_web_py() -> None:
+    """
+    Extracts context from the global web.ctx and populates ContextVars.
+    """
+    solr_editions = _parse_solr_editions_from_web()
+    provider_pref = web.input(providerPref=None, _method="GET").get("providerPref")
+    print_disabled = bool(web.cookies().get("pd", False))
+    sfw = bool(web.cookies().get("sfw", ""))
+
+    # Compute is_bot once during request setup
+    is_recognized_bot = _compute_is_recognized_bot(user_agent=web.ctx.env.get("HTTP_USER_AGENT", ""))
+    is_bot = _compute_is_bot(
+        user_agent=web.ctx.env.get("HTTP_USER_AGENT"),
+        hhcl=web.ctx.env.get("HTTP_X_HHCL"),
+    )
+
+    site.set(web.ctx.site)
+    rendered_keys.set(set())
+    visitor.set(_visitor(web.cookies().get(config.get("login_cookie_name", "session")), is_bot))
+    req_context.set(
+        RequestContextVars(
+            x_forwarded_for=web.ctx.env.get("HTTP_X_FORWARDED_FOR"),
+            user_agent=web.ctx.env.get("HTTP_USER_AGENT"),
+            lang=web.ctx.get("lang") or "en",
+            solr_editions=solr_editions,
+            print_disabled=print_disabled,
+            sfw=sfw,
+            is_recognized_bot=is_recognized_bot,
+            is_bot=is_bot,
+            provider_pref=provider_pref,
+        )
+    )
+
+
+def caching_prethread():
+    """Return a callback that re-establishes request context on a worker thread.
+
+    Memcache-memoized fetches (homepage, carousels, featured subjects, cached
+    macros) can be computed on a background thread where the `web.ctx.*` globals
+    are stale or unset. The returned callback copies the language, host, and bot
+    flag captured on the main thread onto the worker thread before the fetch runs.
+    """
+    # Module-level would cycle: `code.py` imports this module.
+    from openlibrary.plugins.openlibrary.code import is_bot  # noqa: PLC0415
+
+    # web.ctx.lang is undefined on the new thread, so need to transfer it over
+    lang = req_context.get().lang
+    host = web.ctx.host
+    _is_bot = is_bot()
+
+    def main():
+        # Leaving this in since this is a bit strange, but you can see it clearly
+        # in action with this debug line:
+        # web.debug(f'XXXXXXXXXXX web.ctx.lang={web.ctx.get("lang")}; {lang=}')
+        delegate.fakeload()
+        web.ctx.lang = lang
+        web.ctx.is_bot = _is_bot
+        web.ctx.host = host
+        set_context_from_legacy_web_py()
+
+    return main
+
+
+def set_context_from_fastapi(request: Request) -> None:
+    """
+    Extracts context from a FastAPI request (async) and populates ContextVars.
+    Should be called within the middleware stack.
+    """
+    # NOTE: Avoid adding new fields here if they can be passed as function arguments instead.
+
+    solr_editions = _parse_solr_editions_from_fastapi(request)
+    provider_pref = request.query_params.get("providerPref")
+
+    # Compute is_bot once during request setup
+    is_recognized_bot = _compute_is_recognized_bot(user_agent=request.headers.get("User-Agent", ""))
+    is_bot = _compute_is_bot(
+        user_agent=request.headers.get("User-Agent"),
+        hhcl=request.headers.get("X-HHCL"),
+    )
+
+    s = create_site()
+    cookie_name = config.get("login_cookie_name", "session")
+    if cookie_value := request.cookies.get(cookie_name):
+        s._conn.set_auth_token(unquote(cookie_value))
+
+    site.set(s)
+    rendered_keys.set(set())
+    visitor.set(_visitor(cookie_value, is_bot))
+    req_context.set(
+        RequestContextVars(
+            x_forwarded_for=request.headers.get("X-Forwarded-For"),
+            user_agent=request.headers.get("User-Agent"),
+            lang=request.state.lang or "en",
+            solr_editions=solr_editions,
+            print_disabled=bool(request.cookies.get("pd", False)),
+            sfw=bool(request.cookies.get("sfw", "")),
+            is_recognized_bot=is_recognized_bot,
+            is_bot=is_bot,
+            provider_pref=provider_pref,
+        )
+    )
+
+
+def create_context_for_script() -> RequestContextVars:
+    """
+    These are the defaults we will use when executing from scripts.
+    Why not set these as default all the time?
+    Because we still run many things on threads and we don't want to
+    silently have it using defaults we don't expect. It's better to have it loudly fail,
+    like it has with scripts. See #12249
+    """
+    return RequestContextVars(
+        x_forwarded_for=None,
+        user_agent=None,
+        lang=None,
+        solr_editions=True,
+        print_disabled=False,
+        sfw=False,
+        is_bot=False,
+        provider_pref=None,
+    )
+
+
+@contextmanager
+def web_ctx_ip(ip: str = "127.0.0.1"):
+    """
+    Context manager that temporarily sets web.ctx.ip for legacy code that needs it.
+
+    This is a workaround for threadpool threads where web.ctx.ip may not be set
+    by the web server. The legacy database audit fields require an IP address.
+
+    Usage:
+        with web_ctx_ip('192.168.1.1'):
+            legacy_save_operation(doc)
+
+    Args:
+        ip: The IP address to use during the context. Defaults to '127.0.0.1'.
+    """
+    original_ip = getattr(web.ctx, "ip", None)
+    web.ctx.ip = ip
+    try:
+        yield
+    finally:
+        web.ctx.ip = original_ip
+
+
+def get_provider_pref() -> str | None:
+    """Return the request provider preference, defaulting safely outside requests."""
+    try:
+        return req_context.get().provider_pref
+    except LookupError:
+        return None
+
+
+def get_print_disabled() -> bool:
+    """Whether the patron has the print-disabled (``pd``) cookie.
+
+    Reads the unified request context so it works under both web.py and
+    FastAPI. FastAPI has no ``web.ctx``, so ``web.cookies()`` there returns
+    nothing; going through ``req_context`` is what keeps print-disabled
+    patrons eligible for Special Access on FastAPI-rendered partials.
+    Defaults to False outside a request (scripts, cron).
+    """
+    try:
+        return req_context.get().print_disabled
+    except LookupError:
+        return False
+
+
+def get_request_lang() -> str:
+    """The request's UI language, safe to call from templates rendered on
+    either the legacy web.py server or the FastAPI server. The Templetor
+    global `get_lang()` reads `web.ctx.lang` directly, which isn't populated
+    by FastAPI — partials rendered there would AttributeError. Reading from
+    the unified `req_context` works on both. Falls back to 'en'."""
+    try:
+        return req_context.get().lang or "en"
+    except LookupError:
+        return "en"

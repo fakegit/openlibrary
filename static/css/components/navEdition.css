@@ -1,0 +1,9 @@
+/**
+ * NavEdition
+ * https://docs.openlibrary.org/designers/design-pattern-library.html#navedition
+ */
+span.booktitle {
+  color: var(--color-text);
+  font-family: var(--font-family-title);
+  font-weight: var(--font-weight-bold);
+}

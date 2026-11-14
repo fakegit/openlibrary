@@ -1,0 +1,138 @@
+h1 {
+  font-size: var(--font-size-headline-large);
+}
+h1.title {
+  font-size: var(--font-size-title-large);
+}
+h1 span.subtitle {
+  font-size: var(--font-size-title-small);
+  font-weight: var(--font-weight-regular);
+}
+/* TODO: Check if this class is still used. */
+h1.publisher {
+  color: var(--color-text-heading);
+  font-size: var(--font-size-headline-medium);
+  font-family: var(--font-family-serif) !important;
+  font-weight: var(--font-weight-regular) !important;
+  margin: 0;
+}
+h1 span.count {
+  font-size: var(--font-size-label-large) !important;
+}
+
+h2 {
+  font-size: var(--font-size-headline-small);
+}
+h2.author {
+  color: var(--color-text-heading);
+  font-size: var(--font-size-title-medium);
+  font-weight: var(--font-weight-regular);
+}
+h2.publisher {
+  background-color: var(--lightest-grey);
+}
+h2.edition-title {
+  margin: var(--spacing-stack-sm) 0 0;
+  color: var(--color-text-secondary);
+  font-family: var(--font-family-title);
+  font-weight: var(--font-weight-regular);
+  font-size: var(--font-size-title-medium);
+}
+h2 a {
+  color: var(--color-link);
+  text-decoration: none;
+}
+h2 a:hover {
+  color: var(--color-success-fg);
+  text-decoration: underline;
+}
+
+h1.edition,
+h2.edition {
+  color: var(--black);
+  font-family: var(--font-family-body);
+  font-size: var(--font-size-title-medium);
+  margin: 0;
+  padding: 0;
+  font-weight: var(--font-weight-regular);
+}
+
+h3 {
+  font-size: var(--font-size-title-large);
+}
+
+h4 {
+  font-size: var(--font-size-title-medium);
+}
+h4.publisher {
+  font-family: var(--font-family-body);
+  font-weight: var(--font-weight-regular);
+}
+h4.facetHead {
+  font-family: var(--font-family-body);
+  font-size: var(--font-size-label-medium);
+  font-weight: var(--font-weight-bold);
+  color: var(--black);
+  text-transform: uppercase;
+  margin: 0;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-inline-sm);
+}
+h4.facetHead span.merge {
+  font-family: var(--font-family-body);
+  font-size: var(--font-size-label-small);
+  font-weight: var(--font-weight-regular) !important;
+  text-transform: none !important;
+  /* Not tokenized: must exceed the 16px icon width to avoid text overlap */
+  padding-left: 22px;
+  background: url(/static/images/icons/icon_merge-sm.png) no-repeat 0 0;
+  min-height: 16px;
+}
+
+h5 {
+  font-size: var(--font-size-title-small);
+  font-family: var(--font-family-serif) !important;
+  font-weight: var(--font-weight-regular) !important;
+}
+
+h6 {
+  font-size: var(--font-size-label-medium);
+}
+
+.head h2 a {
+  color: inherit !important;
+  text-decoration: none;
+}
+.head h2 a:hover {
+  text-decoration: underline;
+}
+
+div.head h1,
+div.head h2,
+div.head h3,
+div.head h4,
+div.head h5,
+div.head h6 {
+  margin: 0;
+  padding: 0;
+}
+div.head.rel {
+  position: relative;
+}
+
+dt,
+span.title,
+h6.title {
+  font-size: var(--font-size-label-medium);
+  font-weight: var(--font-weight-regular) !important;
+  font-family: var(--font-family-body);
+  color: var(--color-text-secondary);
+  margin: 0;
+  padding: 0;
+}
+
+.heading span.count {
+  font-size: var(--font-size-label-large) !important;
+}

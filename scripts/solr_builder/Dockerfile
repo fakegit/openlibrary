@@ -1,34 +1,44 @@
 ## This image is where we should execute the Jenkins commands
+# WARNING: This image is pushed up to openlibrary/solrbuilder _manually_ . Changes
+# made to this file WILL NOT be automatically used, you have to manually rebuild/push:
+# docker build -t openlibrary/solr-builder:latest .
+# docker push openlibrary/solr-builder:latest
 
-FROM ubuntu:xenial
-ARG DOCKER_VERSION=5:18.09.0~3-0~ubuntu-xenial
+# Jenkins does not automatically build the following image;
+# If you make changes to this Dockerfile, you will need to run these
+# steps *locally* to create an image + upload to dockerhub for Jenkins:
+## cd scripts/solr_builder
+## docker build -t openlibrary/solr-builder:latest .
+## docker push openlibrary/solr-builder:latest
+
+FROM ubuntu:jammy
+ARG DOCKER_VERSION=5:20.10.23~3-0~ubuntu-jammy
 
 # Docker dependencies
-RUN apt-get -qq update && apt-get install -y \
-    apt-transport-https \
+RUN apt-get -qq update && apt-get install --no-install-recommends -y \
     ca-certificates \
     curl \
-    gnupg-agent \
-    software-properties-common
-
-# Install docker
-RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - \
-    && add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-RUN apt-get -qq update && apt-get install -y \
-    docker-ce=$DOCKER_VERSION \
-    docker-ce-cli=$DOCKER_VERSION \
-    containerd.io
-
-# Install docker-compose
-RUN curl -L "https://github.com/docker/compose/releases/download/1.24.1/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose \
-    && chmod +x /usr/local/bin/docker-compose
-
-# Script dependencies
-RUN apt-get -qq update && apt-get install -y \
-    curl \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    # Script dependencies \
     moreutils \
     wget \
-    xmlstarlet
+    xmlstarlet \
+    && rm -rf /var/lib/apt/lists/*
 
-# Default to bash, not dash!
-RUN ln -sf /bin/bash /bin/sh
+# Install Docker and Docker Compose
+RUN mkdir -m 0755 -p /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && echo  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+RUN apt-get -qq update && apt-get install -y --no-install-recommends \
+    docker-ce=$DOCKER_VERSION \
+    docker-ce-cli=$DOCKER_VERSION \
+    containerd.io \
+    docker-buildx-plugin \
+    docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/* \
+    # Default to bash, not dash! \
+    && ln -sf /bin/bash /bin/sh

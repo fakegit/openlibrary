@@ -1,0 +1,58 @@
+$def with (page)
+
+$if page.key.startswith("/works") or page.key.startswith("/books") or page.key.startswith("/authors"):
+    $ show_wikipedia_citation_link = page.wp_citation_fields
+    $ cur_v = query_param("v", None)
+    $ hist_addition = "?v=" + cur_v if cur_v else ""
+
+    $ rdf = page.key + ".rdf" + hist_addition
+    $ json = page.key + ".json" + hist_addition
+    $ opds = page.key + ".opds" + hist_addition
+    <span id="historyTools" class="pageHistory__tools smaller brown sansserif">
+        $_('Download catalog record:')
+        <a rel="nofollow" href="$rdf">$_("RDF")</a>
+        /
+        <a rel="nofollow" href="$json">$_("JSON")</a>
+        $if page.key.startswith("/books"):
+            /
+            <a rel="nofollow" href="$opds">$_("OPDS")</a>
+        $if show_wikipedia_citation_link:
+            |
+            <ol-popover
+                class="wikipedia-citation-popover"
+                placement="bottom-end"
+                aria-label="$_('Wikipedia citation')"
+            >
+                <button
+                    slot="trigger"
+                    type="button"
+                    class="wikipedia-citation-popover__trigger"
+                    title="$_('Cite this on Wikipedia')"
+                >$_('Wikipedia citation')</button>
+
+                <div class="wikipedia-citation-popover__content">
+                    <h3 class="wikipedia-citation-popover__title">
+                        $:macros.icon("brand-wikipedia", extra_class="wikipedia-citation-popover__logo")
+                        $_("Wikipedia citation")
+                    </h3>
+                    <p class="wikipedia-citation-popover__intro">
+                        $_("Copy and paste this code into your Wikipedia page.")
+                    </p>
+
+                    $ cite = " |".join([k + '=' + v for k, v in page.wp_citation_fields.items() if v])
+                    $# The code stays selectable text; only the glyph is the copy button.
+                    <div class="wikipedia-citation-popover__well">
+                        <code class="copy-code wikipedia-citation-popover__code">{{cite book|$cite}}</code>
+                        <button
+                            type="button"
+                            class="copy-button"
+                            data-wikipedia-citation-copy
+                            aria-label="$_('Copy Wikipedia citation')"
+                        >
+                            $:macros.icon("copy", size="sm", extra_class="copy-button__glyph--copy")
+                            $:macros.icon("check", size="sm", extra_class="copy-button__glyph--check")
+                        </button>
+                    </div>
+                </div>
+            </ol-popover>
+    </span>

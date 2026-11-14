@@ -1,34 +1,46 @@
-"""Caching utilities.
-"""
+"""Caching utilities."""
+
+import asyncio
+import functools
+import hashlib
+import inspect
+import json
 import random
 import string
-import time
 import threading
-import functools
+import time
+from collections.abc import Awaitable, Callable
+from typing import Any, Literal, ParamSpec, TypeVar, cast
 
 import memcache
-import json
 import web
 
 from infogami import config
+from infogami.infobase.client import Nothing
 from infogami.utils import stats
-
+from openlibrary.core.helpers import NothingEncoder
 from openlibrary.utils import olmemcache
+from openlibrary.utils.async_utils import cache_per_event_loop
 from openlibrary.utils.dateutil import MINUTE_SECS
 
-import six
-
-
 __all__ = [
-    "cached_property",
-    "Cache", "MemoryCache", "MemcacheCache", "RequestCache",
-    "memoize", "memcache_memoize", "get_memcache"
+    "Cache",
+    "MemcacheCache",
+    "MemoryCache",
+    "get_memcache",
+    "invalidate",
+    "memcache_memoize",
+    "memoize",
+    "singleflight_cache",
 ]
 
 DEFAULT_CACHE_LIFETIME = 2 * MINUTE_SECS
 
+P = ParamSpec("P")
+T = TypeVar("T")
 
-class memcache_memoize:
+
+class memcache_memoize[**P, T]:
     """Memoizes a function, caching its return values in memcached for each input.
 
     After the timeout, a new thread is spawned to update the value and the old
@@ -44,64 +56,59 @@ class memcache_memoize:
     :param timeout: timeout in seconds after which the return value must be updated
     :param prethread: Function to call on the new thread to set it up
     """
-    def __init__(self, f, key_prefix=None, timeout=MINUTE_SECS, prethread=None):
-        """Creates a new memoized function for ``f``.
-        """
-        self.f = f
+
+    def __init__(
+        self,
+        f: Callable[P, T],
+        key_prefix: str | None = None,
+        timeout: int = MINUTE_SECS,
+        prethread: Callable[[], None] | None = None,
+        hash_args: bool = False,
+    ):
+        """Creates a new memoized function for ``f``."""
+        self.f: Callable[P, T] = f
         self.key_prefix = key_prefix or self._generate_key_prefix()
         self.timeout = timeout
 
-        self._memcache = None
+        self._memcache: memcache.Client | None = None
 
-        self.stats = web.storage(
-            calls=0,
-            hits=0,
-            updates=0,
-            async_updates=0
-        )
-        self.active_threads = {}
+        self.stats = web.storage(calls=0, hits=0, updates=0, async_updates=0)
+        self.active_threads: dict[str, threading.Thread] = {}
         self.prethread = prethread
+        self.hash_args = hash_args
 
-    def _get_memcache(self):
+    @property
+    def memcache(self) -> memcache.Client:
         if self._memcache is None:
             servers = config.get("memcache_servers")
             if servers:
                 self._memcache = memcache.Client(servers)
             else:
                 web.debug("Could not find memcache_servers in the configuration. Used dummy memcache.")
-                try:
-                    import mockcache  # Only supports legacy Python
-                    self._memcache = mockcache.Client()
-                except ImportError:  # Python 3
-                    from pymemcache.test.utils import MockMemcacheClient
-                    self._memcache = MockMemcacheClient()
+                from pymemcache.test.utils import MockMemcacheClient
+
+                self._memcache = MockMemcacheClient()
 
         return self._memcache
 
-    memcache = property(_get_memcache)
-
-    def _generate_key_prefix(self):
+    def _generate_key_prefix(self) -> str:
         try:
             prefix = self.f.__name__ + "_"
-        except (AttributeError, TypeError):
+        except AttributeError, TypeError:
             prefix = ""
 
         return prefix + self._random_string(10)
 
-    def _random_string(self, n):
+    def _random_string(self, n: int) -> str:
         chars = string.ascii_letters + string.digits
         return "".join(random.choice(chars) for i in range(n))
 
-    def __call__(self, *args, **kw):
+    def __call__(self, *args: P.args, **kw: P.kwargs) -> T:
         """Memoized function call.
 
         Returns the cached value when available. Computes and adds the result
         to memcache when not available. Updates asynchronously after timeout.
         """
-        _cache = kw.pop("_cache", None)
-        if _cache == "delete":
-            self.memcache_delete(args, kw)
-            return None
 
         self.stats.calls += 1
 
@@ -120,18 +127,18 @@ class memcache_memoize:
 
         return value
 
-    def update_async(self, *args, **kw):
-        """Starts the update process asynchronously.
-        """
+    def update_async(self, *args: P.args, **kw: P.kwargs) -> None:
+        """Starts the update process asynchronously."""
         t = threading.Thread(target=self._update_async_worker, args=args, kwargs=kw)
-        self.active_threads[t.getName()] = t
+        self.active_threads[t.name] = t
         t.start()
 
-    def _update_async_worker(self, *args, **kw):
+    def _update_async_worker(self, *args: P.args, **kw: P.kwargs) -> None:
         key = self.compute_key(args, kw) + "/flag"
 
         if not self.memcache.add(key, "true"):
             # already somebody else is computing this value.
+            self.active_threads.pop(threading.current_thread().name, None)
             return
 
         try:
@@ -140,12 +147,12 @@ class memcache_memoize:
             self.update(*args, **kw)
         finally:
             # Remove current thread from active threads
-            self.active_threads.pop(threading.currentThread().getName(), None)
+            self.active_threads.pop(threading.current_thread().name, None)
 
             # remove the flag
             self.memcache.delete(key)
 
-    def update(self, *args, **kw):
+    def update(self, *args: P.args, **kw: P.kwargs) -> tuple[T, float]:
         """Computes the value and adds it to memcache.
 
         Returns the computed value.
@@ -156,7 +163,7 @@ class memcache_memoize:
         self.memcache_set(args, kw, value, t)
         return value, t
 
-    def join_threads(self):
+    def join_threads(self) -> None:
         """Waits for all active threads to finish.
 
         Used only in testing.
@@ -164,34 +171,37 @@ class memcache_memoize:
         for name, thread in list(self.active_threads.items()):
             thread.join()
 
-    def encode_args(self, args, kw=None):
+    def encode_args(self, args: tuple, kw: dict | None = None) -> str:
+        """Encodes arguments to construct the memcache key."""
         kw = kw or {}
-        """Encodes arguments to construct the memcache key.
-        """
+
         # strip [ and ] from key
         a = self.json_encode(list(args))[1:-1]
 
         if kw:
-            return a + "-" + self.json_encode(kw)
-        else:
-            return a
+            a = a + "-" + self.json_encode(kw)
+        if self.hash_args:
+            return f"{hashlib.md5(a.encode('utf-8')).hexdigest()}"
+        return a
 
-    def compute_key(self, args, kw):
-        """Computes memcache key for storing result of function call with given arguments.
-        """
-        key = self.key_prefix + "-" + self.encode_args(args, kw)
+    def compute_key(self, args: tuple, kw: dict) -> str:
+        """Computes memcache key for storing result of function call with given arguments."""
+        key = self.key_prefix + "$" + self.encode_args(args, kw)
         return key.replace(" ", "_")  # XXX: temporary fix to handle spaces in the arguments
 
-    def json_encode(self, value):
+    def json_encode(self, value: Any) -> str:
         """json.dumps without extra spaces.
 
         memcache doesn't like spaces in the key.
         """
-        return json.dumps(value, separators=(",", ":"))
+        return json.dumps(
+            [] if isinstance(value, Nothing) else value,
+            separators=(",", ":"),
+            cls=NothingEncoder,
+        )
 
-    def memcache_set(self, args, kw, value, time):
-        """Adds value and time to memcache. Key is computed from the arguments.
-        """
+    def memcache_set(self, args: tuple, kw: dict, value: T, time: float) -> None:
+        """Adds value and time to memcache. Key is computed from the arguments."""
         key = self.compute_key(args, kw)
         json_data = self.json_encode([value, time])
 
@@ -199,80 +209,74 @@ class memcache_memoize:
         self.memcache.set(key, json_data)
         stats.end()
 
-    def memcache_delete(self, args, kw):
+    def memcache_delete(self, args: tuple, kw: dict) -> None:
         key = self.compute_key(args, kw)
         stats.begin("memcache.delete", key=key)
         self.memcache.delete(key)
         stats.end()
 
-    def memcache_get(self, args, kw):
+    def memcache_delete_by_args(self, *args, **kw):
+        """A helper method to let you pass in arguments normally instead of as a tuple and dict"""
+        self.memcache_delete(args, kw)
+
+    def memcache_get(self, args: tuple, kw: dict) -> tuple[T, float] | None:
         """Reads the value from memcache. Key is computed from the arguments.
 
         Returns (value, time) when the value is available, None otherwise.
         """
         key = self.compute_key(args, kw)
         stats.begin("memcache.get", key=key)
-        json_str = self.memcache.get(key)
+        json_str = cast(str, self.memcache.get(key))
         stats.end(hit=bool(json_str))
 
-        return json_str and json.loads(json_str)
+        if json_str:
+            # 5. We must `cast` here. JSON serialization erases types,
+            # so we are telling the type checker to trust us that the
+            # deserialized object matches our generic type T.
+            return cast(tuple[T, float], json.loads(json_str))
+        else:
+            return None
+
 
 ####
 
 
-def cached_property(getter):
-    """Decorator like `property`, but the value is computed on first call and cached.
-
-    class Foo:
-
-        @cached_property
-        def memcache_client(self):
-            ...
-    """
-    name = getter.__name__
-
-    def g(self):
-        if name in self.__dict__:
-            return self.__dict__[name]
-
-        value = getter(self)
-        self.__dict__[name] = value
-        return value
-    return property(g)
-
-
-class Cache(object):
+class Cache:
     """Cache interface."""
+
     def get(self, key):
-        """Returns the value for given key. Returns None if that key is not present in the cache.
-        """
-        raise NotImplementedError()
+        """Returns the value for given key. Returns None if that key is not present in the cache."""
+        raise NotImplementedError
 
     def set(self, key, value, expires=0):
         """Sets a value in the cache.
         If expires is non-zero, the cache may delete that entry from the cache after expiry.
         The implementation can choose to ignore the expires argument.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def add(self, key, value, expires=0):
         """Adds a new entry in the cache. Nothing is done if there is already an entry with the same key.
 
         Returns True if a new entry is added to the cache.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def delete(self, key):
         """Deletes an entry from the cache. No error is raised if there is no entry in present in the cache with that key.
 
         Returns True if the key is deleted.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
 
 class MemoryCache(Cache):
     """Cache implementation in memory.
+
+    Note: expires is ignored. Values stay until deleted or cleared.
+    Use MemcacheCache if you need expiration.
     """
+
     def __init__(self):
         self.d = {}
 
@@ -299,29 +303,43 @@ class MemcacheCache(Cache):
 
     Expects that the memcache servers are specified in web.config.memcache_servers.
     """
-    @cached_property
+
+    @functools.cached_property
     def memcache(self):
-        servers = config.get("memcache_servers", None)
-        if servers:
+        if servers := config.get("memcache_servers", None):
             return olmemcache.Client(servers)
         else:
             web.debug("Could not find memcache_servers in the configuration. Used dummy memcache.")
-            try:
-                import mockcache
-                return mockcache.Client()
-            except ImportError:
-                from pymemcache.test.utils import MockMemcacheClient
-                return MockMemcacheClient()
+            from pymemcache.test.utils import MockMemcacheClient
 
-    def get(self, key):
-        key = web.safestr(key)
+            return MockMemcacheClient()
+
+    def _encode_key(self, key: str) -> str:
+        return cast(str, web.safestr(key))
+
+    def get(self, key: str) -> Any:
+        key = self._encode_key(key)
         stats.begin("memcache.get", key=key)
         value = self.memcache.get(key)
         stats.end(hit=value is not None)
         return value and json.loads(value)
 
-    def set(self, key, value, expires=0):
-        key = web.safestr(key)
+    def get_multi(self, keys: list[str]) -> dict[str, Any]:
+        keys = [self._encode_key(k) for k in keys]
+        stats.begin("memcache.get_multi")
+        d = self.memcache.get_multi(keys)
+        stats.end(hit=bool(d))
+        return {k: json.loads(v) for k, v in d.items()}
+
+    def set_multi(self, mapping: dict[str, Any], expires=0):
+        mapping = {self._encode_key(k): json.dumps(v) for k, v in mapping.items()}
+        stats.begin("memcache.set_multi")
+        d = self.memcache.set_multi(mapping, expires)
+        stats.end()
+        return d
+
+    def set(self, key: str, value: Any, expires=0):
+        key = cast(str, web.safestr(key))
         value = json.dumps(value)
         stats.begin("memcache.set", key=key)
         value = self.memcache.set(key, value, expires)
@@ -344,43 +362,18 @@ class MemcacheCache(Cache):
         return value
 
 
-class RequestCache(Cache):
-    """Request-Local cache.
-
-    The values are cached only in the context of the current request.
-    """
-    @property
-    def d(self):
-        return web.ctx.setdefault("request-local-cache", {})
-
-    def get(self, key):
-        return self.d.get(key)
-
-    def set(self, key, value, expires=0):
-        self.d[key] = value
-
-    def add(self, key, value, expires=0):
-        return self.d.setdefault(key, value) is value
-
-    def delete(self, key):
-        return self.d.pop(key, None) is not None
-
-
 memory_cache = MemoryCache()
 memcache_cache = MemcacheCache()
-request_cache = RequestCache()
 
 
 def get_memcache():
-    return memcache_cache.memcache
+    return memcache_cache
 
 
 def _get_cache(engine):
     d = {
         "memory": memory_cache,
         "memcache": memcache_cache,
-        "memcache+memory": memcache_cache,
-        "request": request_cache
     }
     return d.get(engine)
 
@@ -400,7 +393,6 @@ class memoize:
         Engine to store the results. Available options are:
             * memory: stores the result in memory.
             * memcache: stores the result in memcached.
-            * request: stores the result only in the context of the current request.
 
     * key:
         key to be used in the cache. If this is a string, arguments are append
@@ -439,37 +431,59 @@ class memoize:
         def get_page(key):
             pass
     """
-    def __init__(self, engine="memory", key=None, expires=0, background=False, cacheable=None):
+
+    def __init__(
+        self,
+        engine: Literal["memory", "memcache"],
+        key: str | Callable[..., str | tuple],
+        expires: int = 0,
+        background: bool = False,
+        cacheable: Callable | None = None,
+    ):
         self.cache = _get_cache(engine)
-        self.keyfunc = self._make_key_func(key)
+        self.keyfunc = key if callable(key) else functools.partial(build_memcache_key, key)
         self.cacheable = cacheable
         self.expires = expires
 
-    def _make_key_func(self, key):
-        if isinstance(key, six.string_types):
-            return PrefixKeyFunc(key)
-        else:
-            return key
-
     def __call__(self, f):
-        """Returns the memoized version of f.
-        """
-        @functools.wraps(f)
-        def func(*args, **kwargs):
-            """The memoized function.
+        """Returns the memoized version of f."""
 
-            If this is the first call with these arguments, function :attr:`f` is called and the return value is cached.
-            Otherwise, value from the cache is returned.
-            """
-            key = self.keyfunc(*args, **kwargs)
-            value = self.cache_get(key)
-            if value is None:
-                value = f(*args, **kwargs)
-                self.cache_set(key, value)
-            return value
-        return func
+        if inspect.iscoroutinefunction(f):
+            # Async function - return async wrapper
+            @functools.wraps(f)
+            async def async_func(*args, **kwargs):
+                """The memoized async function.
 
-    def cache_get(self, key):
+                If this is the first call with these arguments, function :attr:`f` is called and the return value is cached.
+                Otherwise, value from the cache is returned.
+                """
+                key = self.keyfunc(*args, **kwargs)
+                value = self.cache_get(key)
+                if value is None:
+                    value = await f(*args, **kwargs)
+                    self.cache_set(key, value)
+                return value
+
+            return async_func
+        else:
+            # Sync function - return sync wrapper (existing behavior)
+            @functools.wraps(f)
+            def func(*args, **kwargs):
+                """The memoized function.
+
+                If this is the first call with these arguments, function :attr:`f` is called and the return value is cached.
+                Otherwise, value from the cache is returned.
+                """
+                key = self.keyfunc(*args, **kwargs)
+                value = self.cache_get(key)
+                if value is None:
+                    value = f(*args, **kwargs)
+                    self.cache_set(key, value)
+                return value
+
+            return func
+
+    def cache_get(self, key: str | tuple):
         """Reads value of a key from the cache.
 
         When key is a string, this is equvivalant to::
@@ -488,7 +502,7 @@ class memoize:
         else:
             return self.cache.get(key)
 
-    def cache_set(self, key, value):
+    def cache_set(self, key: str | tuple, value):
         """Sets a key to a given value in the cache.
 
         When key is a string, this is equvivalant to::
@@ -513,50 +527,98 @@ class memoize:
             return self.cache.set(key, value, expires=self.expires)
 
 
-class PrefixKeyFunc:
-    """A function to generate cache keys using a prefix and arguments.
+def build_memcache_key(prefix: str, *args, **kw) -> str:
+    key = prefix
+
+    if args:
+        key += "-" + json.dumps(args, separators=(",", ":"), sort_keys=True)[1:-1]
+    if kw:
+        key += "-" + json.dumps(kw, separators=(",", ":"), sort_keys=True)
+
+    return key
+
+
+# ── Fleet-wide single-flight cache ──────────────────────────────────────
+#
+# Entries are {"v": <version at compute time>, "at": <completion>, "value"}:
+# wrapped, so None is cacheable and distinguishable from a missing key.
+# Freshness runs on app clocks; the lock lease runs on memcached's, so app
+# clock skew can cost an early or late refresh, never broken exclusion.
+
+
+@cache_per_event_loop
+def _sf_local_locks() -> dict[str, asyncio.Lock]:
+    """One lock per key, per running loop: same-worker callers share one poller."""
+    return {}
+
+
+def _sf_fresh(entry: Any, version: int, ttl: float) -> bool:
+    """Whether a cache entry may be served without a recompute."""
+    return entry is not None and entry["v"] == version and time.time() - entry["at"] < ttl
+
+
+def invalidate(key: str) -> None:
+    """Invalidate every ``singleflight_cache`` entry for ``key``, fleet-wide.
+
+    Bumps the version key; the first reader to notice recomputes and publishes.
+    Get-then-set rather than INCR (the wrapper exposes none), so simultaneous
+    bumps can collide — benign: the version only has to move, never to count,
+    and a lost bump costs one TTL window of staleness.
     """
-    def __init__(self, prefix):
-        self.prefix = prefix
-
-    def __call__(self, *a, **kw):
-        return self.prefix + "-" + self.encode_args(a, kw)
-
-    def encode_args(self, args, kw=None):
-        kw = kw or {}
-        """Encodes arguments to construct the memcache key.
-        """
-        # strip [ and ] from key
-        a = self.json_encode(list(args))[1:-1]
-
-        if kw:
-            return a + "-" + self.json_encode(kw)
-        else:
-            return a
-
-    def json_encode(self, value):
-        """json.dumps without extra spaces and consistent ordering of dictionary keys.
-
-        memcache doesn't like spaces in the key.
-        """
-        return json.dumps(value, separators=(",", ":"), sort_keys=True)
+    mc = get_memcache()
+    # No expiry: an expired version key would read as 0, and an entry
+    # computed under 0 would look fresh again — a lost invalidation.
+    mc.set(f"{key}.v", (mc.get(f"{key}.v") or 0) + 1)
 
 
-def method_memoize(f):
+async def singleflight_cache[T](
+    key: str,
+    compute: Callable[[], Awaitable[T]],
+    *,
+    ttl: float,
+    lock_ttl: int = 30,
+    poll: float = 0.05,
+) -> T:
+    """A TTL cache whose refreshes are single-flight, fleet-wide.
+
+    Fresh → served from the cache, no lock, no upstream I/O. Stale or
+    missing → one winner fleet-wide — ``add`` is atomic on the memcached
+    server — computes and publishes; same-worker callers await the local
+    lock, callers on other workers poll the cache until the value lands
+    (memcache has no push primitive, so every cross-process wait is a poll
+    behind an ``await``).
+
+    Unlike stale-while-revalidate, no caller is ever served a stale value:
+    a stale entry is recomputed before it is returned. The lock is a lease,
+    not a mutex — a holder that outlives ``lock_ttl`` or a memcache restart
+    can overlap with the next winner — safe **only** because ``compute``
+    must be idempotent and side-effect-free: this coordinates *reads*,
+    never writes. Overlap costs one redundant fetch; last set wins; readers
+    converge on the next check. Invalidation is versioned (see
+    ``invalidate``) so a winner that raced a mutation publishes a version
+    no reader treats as current.
     """
-    object-local memoize.
-    Works only for functions with simple arguments; i.e. JSON serializeable
-    """
-    @functools.wraps(f)
-    def g(self, *args, **kwargs):
-        cache = self.__dict__.setdefault('_memoize_cache', {})
-        key = json.dumps({
-            'function': f.__name__,
-            'args': args,
-            'kwargs': kwargs,
-        }, sort_keys=True)
-
-        if key not in cache:
-            cache[key] = f(self, *args, **kwargs)
-        return cache[key]
-    return g
+    mc = get_memcache()
+    local_lock = _sf_local_locks().setdefault(key, asyncio.Lock())
+    async with local_lock:
+        while True:
+            version = mc.get(f"{key}.v") or 0
+            if _sf_fresh((entry := mc.get(key)), version, ttl):
+                return entry["value"]
+            if mc.add(f"{key}.lock", 1, expires=lock_ttl):
+                # We hold the fleet-wide lease: compute, publish, release.
+                try:
+                    value = await compute()
+                    mc.set(key, {"v": version, "at": time.time(), "value": value})
+                    return value
+                finally:
+                    mc.delete(f"{key}.lock")
+            # Another worker holds the lease: poll until its value lands or
+            # the lease lapses, then try to acquire it ourselves.
+            while True:
+                await asyncio.sleep(poll)
+                version = mc.get(f"{key}.v") or 0
+                if _sf_fresh((entry := mc.get(key)), version, ttl):
+                    return entry["value"]
+                if mc.get(f"{key}.lock") is None:
+                    break

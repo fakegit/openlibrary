@@ -1,0 +1,696 @@
+from __future__ import annotations
+
+"""Basic tests for the FastAPI search endpoint."""
+
+import json
+from typing import get_args
+from unittest.mock import MagicMock, patch
+from urllib.parse import urlencode
+
+import pytest
+
+from openlibrary.fastapi.search import FacetField, PublicQueryOptions
+from openlibrary.plugins.worksearch.code import SearchResponse, WorkSearchScheme
+from openlibrary.utils.request_context import create_context_for_script, req_context
+
+
+@pytest.fixture
+def client(fastapi_client):
+    """Alias for backward compatibility with existing tests."""
+    # TODO: refactor to remove this fixture before merging
+    return fastapi_client
+
+
+@pytest.fixture
+def mock_work_search(mock_work_search_async):
+    """Alias for backward compatibility with existing tests."""
+    # TODO: refactor to remove this fixture before merging
+    return mock_work_search_async
+
+
+def search(client, **params):
+    """Helper function to make search requests with query parameters.
+
+    This helper provides a cleaner interface for making search requests
+    by accepting keyword arguments directly instead of building URL strings.
+    """
+    query_string = urlencode(params, doseq=True)
+    return client.get(f"/search.json?{query_string}")
+
+
+class TestSearchEndpoint:
+    """Tests for the /search.json endpoint."""
+
+    def test_search_uses_query_param(self, client, mock_work_search):
+        """Test that the search endpoint uses the 'q' query parameter."""
+        response = search(client, q="lord of the rings")
+
+        assert response.status_code == 200
+        data = response.json()
+
+        # Verify the response contains the query
+        assert data["q"] == "lord of the rings"
+        assert "docs" in data
+        assert "numFound" in data
+
+        # Verify work_search_async was called with the query
+        mock_work_search.assert_called_once()
+        call_args = mock_work_search.call_args
+        query_arg = call_args[0][0]  # First positional argument
+        assert query_arg["q"] == "lord of the rings"
+
+    def test_query_param_takes_precedence_over_individual_params(self, client, mock_work_search):
+        """If both 'query=' and individual params are sent, 'query=' wins completely."""
+        response = search(
+            client,
+            query=json.dumps({"title": "Override"}),
+            title="Should be ignored",
+            author_key=["OL999A"],
+        )
+        assert response.status_code == 200
+        query_dict = mock_work_search.call_args[0][0]
+        assert query_dict == {"title": "Override"}
+
+    @pytest.mark.parametrize(
+        ("query_dict", "description"),
+        [
+            # Simple query with just 'q'
+            ({"q": "python programming"}, "simple q param"),
+            # Query with multiple fields
+            (
+                {"q": "fantasy", "author": "Tolkien", "title": "Ring"},
+                "multiple fields",
+            ),
+            # Query with list values
+            (
+                {"author_key": ["OL1A", "OL2A"], "subject": "fiction"},
+                "list values",
+            ),
+            # Query with boolean fields
+            ({"q": "open access", "has_fulltext": True}, "boolean fields"),
+            # Query with numeric fields
+            ({"q": "history", "first_publish_year": 1990}, "numeric fields"),
+        ],
+    )
+    def test_query_param_parsing(self, client, mock_work_search, query_dict, description):
+        """Test that the 'query' JSON parameter is correctly parsed and passed to work_search_async.
+
+        When the 'query' parameter is specified, it should be JSON-decoded and passed
+        directly as the first positional argument to work_search_async, bypassing
+        the individual query parameter parsing.
+        """
+
+        response = search(client, query=json.dumps(query_dict))
+
+        assert response.status_code == 200, f"Failed for case: {description}"
+        mock_work_search.assert_called_once()
+
+        # Verify the query dict is passed as the first positional argument
+        call_args = mock_work_search.call_args
+        actual_query = call_args[0][0]
+        assert actual_query == query_dict, f"Query mismatch for case: {description}"
+
+    @pytest.mark.parametrize(
+        "invalid_json",
+        [
+            "{not valid json}",
+            '{"unclosed": "brace"',
+            "{'single': 'quotes'}",  # JSON requires double quotes
+            "just a string",
+            "[1, 2, 3",  # unclosed array
+        ],
+    )
+    def test_query_param_invalid_json(self, client, mock_work_search, invalid_json):
+        """Test that invalid JSON in the 'query' parameter returns an error.
+
+        When the 'query' parameter contains malformed JSON, the endpoint should
+        return an error response rather than crashing.
+        """
+        response = search(client, query=invalid_json)
+
+        # Should return a 422 validation error for invalid JSON
+        assert response.status_code == 422
+        mock_work_search.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("params", "expected_kwargs"),
+        [
+            (
+                # It's useful to have limit zero so we can get the total number of results without getting results
+                {"q": "test", "limit": 0},
+                {"page": 1, "limit": 0, "offset": None},
+            ),
+            (
+                {"q": "test", "page": 3, "limit": 10},
+                {"page": 3, "limit": 10, "offset": None},
+            ),
+            (
+                {"q": "test", "offset": 50, "limit": 25},
+                {"offset": 50, "limit": 25, "page": None},
+            ),
+            (
+                {"q": "test", "page": 5, "offset": 30, "limit": 10},
+                {"offset": 30, "limit": 10, "page": None},
+            ),
+            (
+                {"q": "test"},
+                {"limit": 100, "page": 1, "offset": None},
+            ),
+        ],
+    )
+    def test_pagination_variants(self, client, mock_work_search, params, expected_kwargs):
+        """Test pagination behavior for various query parameter combinations.
+
+        The mock is configured to return a generic successful response; the focus is on
+        verifying that ``work_search_async`` receives the correct pagination arguments.
+        """
+        response = search(client, **params)
+        assert response.status_code == 200
+
+        mock_work_search.assert_called_once()
+        call_kwargs = mock_work_search.call_args[1]
+        for key, expected in expected_kwargs.items():
+            assert call_kwargs.get(key) == expected
+
+    def test_response_includes_metadata(self, client, mock_work_search):
+        """Test that the response includes expected metadata fields."""
+
+        response = search(client, q="test", offset=10)
+
+        assert response.status_code == 200
+        data = response.json()
+
+        # Verify metadata fields are present
+        assert "documentation_url" in data
+        assert data["documentation_url"] == "https://openlibrary.org/dev/docs/api/search"
+        assert "q" in data
+        assert data["q"] == "test"
+        assert "offset" in data
+        assert data["offset"] == 10
+        assert "docs" in data
+        # Verify docs is at the end (last key)
+        assert list(data.keys())[-1] == "docs"
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {"limit": -1},
+            {"offset": -1},
+            {"page": 0},
+        ],
+    )
+    def test_pagination_validation_errors(self, client, mock_work_search, params):
+        """Test validation errors for invalid pagination parameters."""
+        response = search(client, q="test", **params)
+
+        # Should return a validation error
+        assert response.status_code == 422
+
+    @pytest.mark.parametrize(
+        ("params", "key_to_check", "expected_value"),
+        [
+            # Case 1: publisher should pass as a string
+            ({"publisher": "Lab of Thought"}, "publisher", "Lab of Thought"),
+            # Case 2: has_fulltext should pass as a boolean
+            ({"has_fulltext": "true"}, "has_fulltext", "true"),
+            ({"has_fulltext": "false"}, "has_fulltext", "false"),
+        ],
+    )
+    def test_search_parameter_types(self, client, mock_work_search, params, key_to_check, expected_value):
+        """Test that specific parameters are passed down with the correct types."""
+
+        # Add a required 'q' param to satisfy potential validation, then merge with params
+        response = search(client, q="test", **params)
+
+        assert response.status_code == 200
+        mock_work_search.assert_called_once()
+
+        # Get the query dictionary passed to the mock
+        query_arg = mock_work_search.call_args[0][0]
+
+        assert key_to_check in query_arg
+        assert query_arg[key_to_check] == expected_value
+
+    def test_arbitrary_query_params_not_passed_down(self, client, mock_work_search):
+        """Test that arbitrary query parameters like osp_count_fake are NOT passed down."""
+
+        # Make a request with osp_count_fake parameter
+        response = search(client, q="test", osp_count_fake="5")
+
+        assert response.status_code == 200
+
+        # Verify work_search_async was called
+        mock_work_search.assert_called_once()
+        call_args = mock_work_search.call_args
+
+        # The query dict should NOT contain the osp_count_fake parameter
+        query_arg = call_args[0][0]  # First positional argument
+        assert "osp_count_fake" not in query_arg
+        assert query_arg["q"] == "test"
+
+    @pytest.mark.parametrize("sort_option", ["old", "new", "title", "ebook_access"])
+    def test_editions_sort_is_forwarded(self, client, mock_work_search, sort_option):
+        """Documented editions.sort must reach work_search_async."""
+        response = search(client, q="test", **{"editions.sort": sort_option})
+
+        assert response.status_code == 200
+        mock_work_search.assert_called_once()
+        query_arg = mock_work_search.call_args[0][0]
+        assert query_arg["editions.sort"] == sort_option
+
+    def test_editions_sort_invalid_is_rejected(self, client, mock_work_search):
+        """An unknown editions.sort is a 422, same as sort on /search/editions.json."""
+        response = search(client, q="test", **{"editions.sort": "bogus"})
+
+        assert response.status_code == 422
+        mock_work_search.assert_not_called()
+
+    def test_editions_sort_empty_is_omitted(self, client, mock_work_search):
+        """An empty editions.sort is left out so Solr keeps its default edition ordering."""
+        response = search(client, q="test", **{"editions.sort": ""})
+
+        assert response.status_code == 200
+        assert "editions.sort" not in mock_work_search.call_args[0][0]
+
+    def test_multiple_author_keys(self, client, mock_work_search):
+        """Test that multiple author_key parameters are parsed correctly.
+        Supporting multiple keys from query params isn't the default so this is important to check.
+        """
+
+        response = search(client, author_key=["OL1A", "OL2A"])
+
+        assert response.status_code == 200
+        mock_work_search.assert_called_once()
+        call_args = mock_work_search.call_args
+        query_arg = call_args[0][0]
+        assert "author_key" in query_arg
+        assert query_arg["author_key"] == ["OL1A", "OL2A"]
+
+    @pytest.mark.parametrize(
+        ("q_value", "expected_status"),
+        [
+            (None, 200),  # q is optional
+            ("python", 200),  # valid
+            ("lord", 200),  # valid
+            ("ab", 422),  # too short
+            ("a", 422),  # too short
+            ("the", 422),  # blocked word
+            ("THE", 422),  # blocked word (case-insensitive)
+            ("the hobbit", 200),  # "the" allowed when not alone
+        ],
+    )
+    def test_q_param_validation(self, client, mock_work_search, q_value, expected_status):
+        """Test that the 'q' parameter is optional, ≥3 chars when present, and not exactly 'the'."""
+        params = {} if q_value is None else {"q": q_value}
+        response = search(client, **params)
+
+        assert response.status_code == expected_status
+
+        if expected_status == 200:
+            mock_work_search.assert_called_once()
+        else:
+            mock_work_search.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("params", "expected_fields"),
+        [
+            # No fields param: should use default fields
+            ({"q": "test"}, sorted(WorkSearchScheme.default_fetched_fields)),
+            # Single field as comma-separated string
+            ({"q": "test", "fields": "title"}, ["title"]),
+            # Multiple fields as comma-separated string
+            (
+                {"q": "test", "fields": "title,author_name,key"},
+                ["title", "author_name", "key"],
+            ),
+            # Fields with spaces (edge case)
+            ({"q": "test", "fields": "title, author_name"}, ["title", "author_name"]),
+        ],
+    )
+    def test_fields_passed_as_list(self, client, mock_work_search, params, expected_fields):
+        """Test that the 'fields' parameter is always passed as a list to work_search_async.
+
+        This ensures that comma-separated field strings are properly split into lists,
+        and that default fields are used when no fields parameter is provided.
+        """
+        response = search(client, doseq=False, **params)
+
+        assert response.status_code == 200
+        mock_work_search.assert_called_once()
+        call_kwargs = mock_work_search.call_args[1]
+
+        assert "fields" in call_kwargs
+        assert isinstance(call_kwargs["fields"], list)
+        assert call_kwargs["fields"] == expected_fields
+
+
+def test_public_api_params():
+    """
+    This test is to ensure that public_api_params doesn't get out of sync with what is in the endpoint.
+    If this test is failing, then you probably need to update the other model with the difference
+    """
+    for param in WorkSearchScheme.public_api_params:
+        assert param in PublicQueryOptions.model_fields
+
+
+class TestOpenAPIDocumentation:
+    """Tests to verify OpenAPI documentation is generated correctly."""
+
+    def test_openapi_contains_search_endpoint(self, client):
+        """Test that the OpenAPI spec contains the /search.json endpoint."""
+        response = client.get("/openapi.json")
+        assert response.status_code == 200
+        openapi = response.json()
+
+        assert "paths" in openapi
+        assert "/search.json" in openapi["paths"]
+
+    def test_openapi_parameters_have_descriptions(self, client):
+        """Test that query parameters in the OpenAPI spec have descriptions.
+
+        This test verifies that the descriptions we define in our Pydantic models
+        are correctly propagated to the OpenAPI schema.
+        """
+        response = client.get("/openapi.json")
+        openapi = response.json()
+
+        search_endpoint = openapi["paths"]["/search.json"]["get"]
+        parameters = search_endpoint.get("parameters", [])
+
+        # Build a dict of parameter name -> parameter info for easier testing
+        params_by_name = {p["name"]: p for p in parameters}
+
+        # Check that specific parameters have descriptions
+        expected_descriptions = {
+            "fields": "The fields to return.",
+            "query": "A full JSON encoded solr query.",
+            "sort": "The sort order of results.",
+            "spellcheck_count": "The number of spellcheck suggestions.",
+        }
+
+        for param_name, expected_desc in expected_descriptions.items():
+            assert param_name in params_by_name, f"Parameter '{param_name}' not found in OpenAPI spec"
+            param = params_by_name[param_name]
+            # Check both top-level description and schema description
+            actual_desc = param.get("description") or param.get("schema", {}).get("description")
+            assert actual_desc == expected_desc, f"Parameter '{param_name}' has description '{actual_desc}', expected '{expected_desc}'"
+
+    def test_debug_openapi_structure(self, client):
+        """Debug test to see the actual OpenAPI structure for search endpoint parameters."""
+        response = client.get("/openapi.json")
+        openapi = response.json()
+
+        search_endpoint = openapi["paths"]["/search.json"]["get"]
+        parameters = search_endpoint.get("parameters", [])
+
+        print("\n\n=== OpenAPI Parameters for /search.json ===")
+        # Only print the parameters we care about for descriptions
+        for param in parameters:
+            if param["name"] in [
+                "fields",
+                "query",
+                "sort",
+                "spellcheck_count",
+                "limit",
+            ]:
+                print(f"\n{param['name']}:")
+                print(f"  top-level description: {param.get('description')}")
+                print(f"  schema description: {param.get('schema', {}).get('description')}")
+                print(f"  schema default: {param.get('schema', {}).get('default')}")
+
+        # This test always passes - it's just for debug output
+        assert True
+
+
+class TestSearchFacetsEndpoint:
+    """Tests for the /search/facets.json endpoint."""
+
+    @pytest.fixture(autouse=True)
+    def req_context_defaults(self):
+        """The endpoint reads solr_editions off req_context, which the test
+        client never populates (conftest patches out set_context_from_fastapi)."""
+        token = req_context.set(create_context_for_script())
+        yield
+        req_context.reset(token)
+
+    def test_requires_field_param(self, fastapi_client, mock_run_solr_query_async):
+        response = fastapi_client.get("/search/facets.json?q=tolkien")
+        # FastAPI enforces required + min_length=1 on `field`, returns 422 when absent
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert any("field" in err["loc"] for err in detail)
+
+    def test_rejects_invalid_field(self, fastapi_client, mock_run_solr_query_async):
+        response = fastapi_client.get("/search/facets.json?field=notafield&q=tolkien")
+        # FastAPI validates FacetField Literal and returns 422 for unknown values
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert any(err.get("input") == "notafield" for err in detail)
+
+    def test_returns_facet_values_for_single_field(self, fastapi_client, mock_run_solr_query_async):
+        response = fastapi_client.get("/search/facets.json?field=language&q=lord+of+the+rings")
+        assert response.status_code == 200
+        data = response.json()
+        assert "language" in data
+        values = data["language"]
+        assert len(values) > 0
+        assert all("value" in v and "count" in v and "label" in v for v in values)
+        assert values[0] == {"value": "eng", "label": "English", "count": 665}
+
+    def test_filters_zero_count_values(self, fastapi_client, mock_run_solr_query_async):
+        response = fastapi_client.get("/search/facets.json?field=language&q=tolkien")
+        assert response.status_code == 200
+        data = response.json()
+        # "Latin" (code "lat") has count=0 in the mock — must not appear
+        assert not any(v["value"] == "lat" for v in data["language"])
+        assert all(v["count"] > 0 for v in data["language"])
+
+    def test_returns_multiple_fields(self, fastapi_client, mock_run_solr_query_async):
+        response = fastapi_client.get("/search/facets.json?field=language&field=subject_facet&q=tolkien")
+        assert response.status_code == 200
+        data = response.json()
+        assert "language" in data
+        assert "subject_facet" in data
+
+    def test_author_facet_key_maps_to_author_facet(self, fastapi_client, mock_run_solr_query_async):
+        """Response key should be 'author_facet' even though Solr returns 'author_key' internally."""
+        response = fastapi_client.get("/search/facets.json?field=author_facet&q=tolkien")
+        assert response.status_code == 200
+        data = response.json()
+        assert "author_facet" in data
+        assert "author_key" not in data
+        assert data["author_facet"] == [{"value": "OL9A", "label": "J.R.R. Tolkien", "count": 123}]
+
+    def test_forwards_list_filters_to_solr(self, fastapi_client, mock_run_solr_query_async):
+        """Repeated list-valued filters must reach the Solr query.
+
+        Under `Depends()` FastAPI bound the params model but dropped every list field,
+        so counts silently ignored the language/subject/author filters the page had on.
+        """
+        fastapi_client.get("/search/facets.json?field=language&q=tolkien&subject_facet=Fiction&subject_facet=Fantasy&author_key=OL9A")
+        solr_query = mock_run_solr_query_async.call_args.args[1]
+        assert solr_query["subject_facet"] == ["Fiction", "Fantasy"]
+        assert solr_query["author_key"] == ["OL9A"]
+
+    def test_field_is_not_forwarded_as_a_filter(self, fastapi_client, mock_run_solr_query_async):
+        """`field` selects what to count; it is not part of the search context."""
+        fastapi_client.get("/search/facets.json?field=language&q=tolkien")
+        assert "field" not in mock_run_solr_query_async.call_args.args[1]
+
+    def test_requests_editions_block_join(self, fastapi_client, mock_run_solr_query_async):
+        """Counts must be faceted over the same result set the page renders.
+
+        The edition block-join in WorkSearchScheme only kicks in when `editions`
+        is among the requested fields; without it the facets are counted over a
+        wider set of works than /search shows.
+        """
+        fastapi_client.get("/search/facets.json?field=language&q=lord")
+        kwargs = mock_run_solr_query_async.call_args.kwargs
+        assert "editions" in kwargs["fields"]
+        assert mock_run_solr_query_async.call_args.args[0].solr_editions is True
+
+    def test_empty_query_returns_valid_response(self, fastapi_client, mock_run_solr_query_async):
+        """No q param should still return a valid (unfiltered) facet list."""
+        response = fastapi_client.get("/search/facets.json?field=language")
+        assert response.status_code == 200
+        assert "language" in response.json()
+
+    def test_facet_field_literal_matches_scheme(self):
+        """FacetField Literal must stay in sync with WorkSearchScheme.facet_fields.
+
+        Guards against drift: if a facet field is added/removed upstream, this
+        fails so the endpoint doesn't silently 422 on (or miss) it.
+        """
+        assert set(get_args(FacetField)) == WorkSearchScheme.facet_fields
+
+
+class TestSearchInsideEndpoint:
+    @pytest.fixture
+    def languages(self, monkeypatch):
+        # resolve_language needs a site context these tests lack.
+        monkeypatch.setattr(
+            "openlibrary.fastapi.search.resolve_language",
+            lambda values: ("ger", "German") if values else None,
+        )
+
+    def test_defaults(self, fastapi_client, mock_fulltext_search_async, languages):
+        response = fastapi_client.get("/search/inside.json?q=hello")
+        assert response.status_code == 200
+        mock_fulltext_search_async.assert_called_once_with(
+            "hello", page=1, offset=None, limit=20, js=True, facets=True, readable=False, phrase=True, language=None
+        )
+
+    def test_facets_can_be_disabled(self, fastapi_client, mock_fulltext_search_async, languages):
+        response = fastapi_client.get("/search/inside.json?q=hello&facets=false&limit=3")
+        assert response.status_code == 200
+        mock_fulltext_search_async.assert_called_once_with(
+            "hello", page=1, offset=None, limit=3, js=True, facets=False, readable=False, phrase=True, language=None
+        )
+
+    def test_filters_reach_the_search_not_the_query(self, fastapi_client, mock_fulltext_search_async, languages):
+        """Language goes out as the FTS name ("German"), not the URL's MARC code."""
+        response = fastapi_client.get("/search/inside.json?q=hello&readable=true&language=ger")
+        assert response.status_code == 200
+        mock_fulltext_search_async.assert_called_once_with(
+            "hello", page=1, offset=None, limit=20, js=True, facets=True, readable=True, phrase=True, language="German"
+        )
+
+    def test_unphrased_query_reaches_the_search(self, fastapi_client, mock_fulltext_search_async, languages):
+        response = fastapi_client.get("/search/inside.json?q=argentina+brazil&phrase=false")
+        assert response.status_code == 200
+        mock_fulltext_search_async.assert_called_once_with(
+            "argentina brazil", page=1, offset=None, limit=20, js=True, facets=True, readable=False, phrase=False, language=None
+        )
+
+    def test_limit_cap_accepts_max_allowed(self, fastapi_client, mock_fulltext_search_async, languages):
+        response = fastapi_client.get("/search/inside.json?q=hello&limit=100")
+        assert response.status_code == 200
+        mock_fulltext_search_async.assert_called_once_with(
+            "hello", page=1, offset=None, limit=100, js=True, facets=True, readable=False, phrase=True, language=None
+        )
+
+    def test_limit_cap_rejects_over_max(self, fastapi_client, mock_fulltext_search_async, languages):
+        response = fastapi_client.get("/search/inside.json?q=hello&limit=101")
+        assert response.status_code == 422
+
+
+class TestEditionSearchEndpoint:
+    """Tests for the /search/editions.json endpoint."""
+
+    def test_returns_200_with_query(self, fastapi_client, mock_edition_solr_query):
+        response = fastapi_client.get("/search/editions.json?q=harry+potter")
+        assert response.status_code == 200
+        data = response.json()
+        assert "numFound" in data
+        assert "num_found" in data
+        assert "docs" in data
+        assert "q" in data
+        assert data["q"] == "harry potter"
+
+    def test_returns_200_without_query(self, fastapi_client, mock_edition_solr_query):
+        response = fastapi_client.get("/search/editions.json")
+        assert response.status_code == 200
+        data = response.json()
+        assert "numFound" in data
+        assert "num_found" in data
+        assert "docs" in data
+        assert data["q"] == ""
+
+    def test_work_key_filter_passed_to_solr_with_work_path(self, fastapi_client, mock_edition_solr_query):
+        response = fastapi_client.get("/search/editions.json?work_key=/works/OL82536W")
+        assert response.status_code == 200
+        call_kwargs = mock_edition_solr_query.call_args[1]
+        extra = call_kwargs.get("extra_params") or []
+        assert any('work_key:"OL82536W"' in v for _, v in extra)
+
+    def test_work_key_filter_passed_to_solr_with_olid(self, fastapi_client, mock_edition_solr_query):
+        response = fastapi_client.get("/search/editions.json?work_key=OL82536W")
+        assert response.status_code == 200
+        call_kwargs = mock_edition_solr_query.call_args[1]
+        extra = call_kwargs.get("extra_params") or []
+        assert any('work_key:"OL82536W"' in v for _, v in extra)
+
+    def test_endpoint_in_openapi_spec(self, fastapi_client):
+        response = fastapi_client.get("/openapi.json")
+        assert response.status_code == 200
+        openapi = response.json()
+        assert "/search/editions.json" in openapi["paths"]
+
+    @pytest.mark.parametrize("sort_option", ["new", "old"])
+    def test_sort_parameter_valid(self, fastapi_client, mock_edition_solr_query, sort_option):
+        response = fastapi_client.get(f"/search/editions.json?sort={sort_option}")
+        assert response.status_code == 200
+        call_kwargs = mock_edition_solr_query.call_args[1]
+        assert call_kwargs.get("sort") == sort_option
+
+    def test_sort_parameter_invalid(self, fastapi_client, mock_edition_solr_query):
+        response = fastapi_client.get("/search/editions.json?sort=invalid_sort_option")
+        assert response.status_code == 422
+
+    def test_pagination_parameters(self, fastapi_client, mock_edition_solr_query):
+        response = fastapi_client.get("/search/editions.json?limit=10&page=2")
+        assert response.status_code == 200
+        call_kwargs = mock_edition_solr_query.call_args[1]
+        assert call_kwargs.get("rows") == 10
+        assert call_kwargs.get("page") == 2
+
+    def test_fields_parameter_parsing(self, fastapi_client, mock_edition_solr_query):
+        response = fastapi_client.get("/search/editions.json?fields=key,title,isbn")
+        assert response.status_code == 200
+        call_kwargs = mock_edition_solr_query.call_args[1]
+        assert call_kwargs.get("fields") == ["key", "title", "isbn"]
+
+
+class TestSearchListsEndpoint:
+    """Tests for /search/lists.json.
+
+    The legacy response shape resolves list documents through the request-scoped
+    site. These cover that path, which had no test coverage before.
+    """
+
+    @staticmethod
+    def _solr_response(*keys):
+        return SearchResponse(
+            facet_counts={},
+            sort="",
+            docs=[{"key": key} for key in keys],
+            num_found=len(keys),
+            solr_select="",
+            raw_resp={"response": {"start": 0}},
+        )
+
+    def test_legacy_shape_resolves_lists_via_request_scoped_site(self, fastapi_client):
+        """The old shape must read the request's own site, not a module-level one."""
+        preview = {"url": "/people/jane/lists/OL1L", "full_url": "https://openlibrary.org/people/jane/lists/OL1L"}
+        current_site = MagicMock()
+        current_site.get_many.return_value = [MagicMock(preview=lambda: preview)]
+
+        with (
+            patch("openlibrary.fastapi.search.run_solr_query_async", autospec=True) as mock_solr,
+            patch("openlibrary.fastapi.search.site") as mock_site_context,
+        ):
+            mock_solr.return_value = self._solr_response("/people/jane/lists/OL1L")
+            mock_site_context.get.return_value = current_site
+
+            response = fastapi_client.get("/search/lists.json?q=dogs")
+
+        assert response.status_code == 200
+        assert response.json() == {"start": 0, "docs": [preview]}
+        mock_site_context.get.assert_called_once_with()
+        current_site.get_many.assert_called_once_with(["/people/jane/lists/OL1L"])
+
+    def test_next_api_shape_does_not_resolve_lists(self, fastapi_client):
+        """`api=next` returns raw solr docs and must not touch the site at all."""
+        with (
+            patch("openlibrary.fastapi.search.run_solr_query_async", autospec=True) as mock_solr,
+            patch("openlibrary.fastapi.search.site") as mock_site_context,
+        ):
+            mock_solr.return_value = self._solr_response("/people/jane/lists/OL1L")
+
+            response = fastapi_client.get("/search/lists.json?q=dogs&api=next")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["docs"] == [{"key": "/people/jane/lists/OL1L"}]
+        assert data["num_found"] == 1
+        mock_site_context.get.assert_not_called()

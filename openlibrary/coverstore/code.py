@@ -1,444 +1,616 @@
-from __future__ import print_function
-
 import array
-import datetime
+import datetime as dt
+import functools
+import io
+import itertools
 import json
 import logging
+import mimetypes
 import os
+import textwrap
+from email.utils import format_datetime, parsedate_to_datetime
+from typing import Annotated, Final, Literal, cast
 
-import memcache
+import httpx
 import requests
 import web
+from fastapi import APIRouter, File, Form, Query, Request, Response
+from fastapi.responses import JSONResponse, RedirectResponse
+from PIL import Image, ImageDraw, ImageFont
+from starlette.convertors import Convertor, register_url_convertor  # codespell:ignore convertors,convertor
 
-from openlibrary.coverstore import config, db, ratelimit
+from openlibrary.coverstore import config, db
 from openlibrary.coverstore.coverlib import read_file, read_image, save_image
+from openlibrary.coverstore.server import load_config
 from openlibrary.coverstore.utils import (
     changequery,
-    download,
+    download_external_image,
+    get_async_session,
+    is_allowed_default_redirect_url,
     ol_get,
     ol_things,
-    random_string,
-    rm_f,
+    safe_redirect_target,
     safeint,
 )
-from openlibrary.plugins.openlibrary.processors import CORSProcessor
+from openlibrary.plugins.upstream.utils import setup_requests
+from openlibrary.utils.request_context import site
+
+if coverstore_config := os.getenv("COVERSTORE_CONFIG"):
+    load_config(coverstore_config)
 
 logger = logging.getLogger("coverstore")
 
-urls = (
-    '/', 'index',
-    '/([^ /]*)/upload', 'upload',
-    '/([^ /]*)/upload2', 'upload2',
-    '/([^ /]*)/([a-zA-Z]*)/(.*)-([SML]).jpg', 'cover',
-    '/([^ /]*)/([a-zA-Z]*)/(.*)().jpg', 'cover',
-    '/([^ /]*)/([a-zA-Z]*)/(.*).json', 'cover_details',
-    '/([^ /]*)/query', 'query',
-    '/([^ /]*)/touch', 'touch',
-    '/([^ /]*)/delete', 'delete',
-)
-app = web.application(urls, locals())
-
-app.add_processor(CORSProcessor())
+# A size is spelled uppercase in a URL ("" being the original upload) and lowercase in
+# db column names (filename_m) and tar paths (m_covers_0000_00.tar).
+CoverSizeUpper = Literal["S", "M", "L", ""]
+CoverSizeLower = Literal["s", "m", "l", ""]
+SIZE_LOWER: Final[dict[CoverSizeUpper, CoverSizeLower]] = {"S": "s", "M": "m", "L": "l", "": ""}
+# books, authors, works -- the rows of the coverstore `category` table. Annotating the
+# handlers is what keeps an unknown category out of db.new(), where get_category_id()
+# would miss and store the cover against a null category_id.
+CoverCategory = Literal["a", "b", "w"]
 
 
-def get_cover_id(olkeys):
+class CoverSizeConvertor(Convertor[str]):  # codespell:ignore convertor
+    """Restricts the ``-S``/``-M``/``-L`` filename suffix to the three real sizes.
+
+    This has to constrain *routing*, not just validate, so that a size-less path
+    falls through to the size-less route: an unrestricted size would make
+    ``/b/isbn/978-0-14-118776-1.jpg`` match as ISBN ``978-0-14-118776`` at size
+    ``1``, and ``/b/id/1-X.jpg`` as size ``X``. Unlike the category, which nothing
+    falls through on and so is left to a ``Literal`` annotation.
+    """
+
+    regex = "[SML]"
+
+    def convert(self, value: str) -> str:
+        return value
+
+    def to_string(self, value: str) -> str:
+        return value
+
+
+register_url_convertor("cover_size", CoverSizeConvertor())
+
+router = APIRouter()
+
+
+class PartialCoverDetails(web.storage):
+    id: int
+    # One of these 4
+    filename: str
+    filename_s: str
+    filename_m: str
+    filename_l: str
+    created: dt.datetime
+
+
+async def get_cover_id(olkeys: list[str]) -> int | None:
     """Return the first cover from the list of ol keys."""
     for olkey in olkeys:
-        doc = ol_get(olkey)
+        doc = await ol_get(olkey)
         if not doc:
             continue
-        is_author = doc['key'].startswith("/authors")
-        covers = doc.get('photos' if is_author else 'covers', [])
+        is_author = doc["key"].startswith("/authors")
+        covers = doc.get("photos" if is_author else "covers", [])
         # Sometimes covers is stored as [None] or [-1] to indicate no covers.
         # If so, consider there are no covers.
         if covers and (covers[0] or -1) >= 0:
             return covers[0]
-
-def _query(category, key, value):
-    if key == 'olid':
-        prefixes = dict(a="/authors/", b="/books/", w="/works/")
-        if category in prefixes:
-            olkey = prefixes[category] + value
-            return get_cover_id([olkey])
-    else:
-        if category == 'b':
-            if key == 'isbn':
-                value = value.replace("-", "").strip()
-                key = "isbn_"
-            if key == 'oclc':
-                key = 'oclc_numbers'
-            olkeys = ol_things(key, value)
-            return get_cover_id(olkeys)
     return None
+
+
+async def _query(category: CoverCategory, key: str, value: str) -> int | None:
+    if key == "olid":
+        prefixes = {"a": "/authors/", "b": "/books/", "w": "/works/"}
+        return await get_cover_id([prefixes[category] + value])
+    elif category == "b":
+        if key == "isbn":
+            value = value.replace("-", "").strip()
+            key = "isbn_"
+        if key == "oclc":
+            key = "oclc_numbers"
+        olkeys = await ol_things(key, value)
+        return await get_cover_id(olkeys)
+    return None
+
 
 ERROR_EMPTY = 1, "No image found"
 ERROR_INVALID_URL = 2, "Invalid URL"
 ERROR_BAD_IMAGE = 3, "Invalid Image"
 
-class index:
-    def GET(self):
-        return '<h1>Open Library Book Covers Repository</h1><div>See <a href="https://openlibrary.org/dev/docs/api/covers">Open Library Covers API</a> for details.</div>'
 
-def _cleanup():
-    web.ctx.pop("_fieldstorage", None)
-    web.ctx.pop("_data", None)
-    web.ctx.env = {}
+def _httpdate(date: dt.datetime) -> str:
+    return format_datetime(date.replace(tzinfo=dt.UTC), usegmt=True)
 
-class upload:
-    def POST(self, category):
-        i = web.input('olid', author=None, file={}, source_url=None, success_url=None, failure_url=None)
 
-        success_url = i.success_url or web.ctx.get('HTTP_REFERRER') or '/'
-        failure_url = i.failure_url or web.ctx.get('HTTP_REFERRER') or '/'
+def _expires_header(seconds: int) -> str:
+    return _httpdate(dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds))
 
-        def error(code__msg):
-            (code, msg) = code__msg
-            print("ERROR: upload failed, ", i.olid, code, repr(msg), file=web.debug)
-            _cleanup()
-            url = changequery(failure_url, errcode=code, errmsg=msg)
-            raise web.seeother(url)
 
-        if i.source_url:
-            try:
-                data = download(i.source_url)
-            except:
-                error(ERROR_INVALID_URL)
-            source_url = i.source_url
-        elif i.file is not None and i.file != {}:
-            data = i.file.value
-            source_url = None
-        else:
-            error(ERROR_EMPTY)
+def is_cached_copy_fresh(request: Request, date: dt.datetime, etag: str) -> bool:
+    """Whether the client's cached copy is still good, i.e. we can answer 304."""
+    if_none_match = {x.strip('" ') for x in request.headers.get("if-none-match", "").split(",")}
+    if "*" in if_none_match or etag in if_none_match:
+        return True
 
-        if not data:
-            error(ERROR_EMPTY)
-
+    if if_modified_since := request.headers.get("if-modified-since", "").split(";")[0].strip():
         try:
-            save_image(data, category=category, olid=i.olid, author=i.author, source_url=i.source_url, ip=web.ctx.ip)
-        except ValueError:
-            error(ERROR_BAD_IMAGE)
+            since = parsedate_to_datetime(if_modified_since)
+        except TypeError, ValueError:
+            return False
+        if since.tzinfo is not None:
+            since = since.astimezone(dt.UTC).replace(tzinfo=None)
+        # HTTP dates have no sub-second precision, so allow a second of slack
+        return date - dt.timedelta(seconds=1) <= since
+    return False
 
-        _cleanup()
-        raise web.seeother(success_url)
 
-class upload2:
-    """openlibrary.org POSTs here via openlibrary/plugins/upstream/covers.py upload
-    """
-    def POST(self, category):
-        i = web.input(olid=None, author=None, data=None, source_url=None, ip=None, _unicode=False)
+@router.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+def index() -> Response:
+    return Response(
+        content=(
+            "<h1>Open Library Book Covers Repository</h1><div>See <a "
+            'href="https://openlibrary.org/dev/docs/api/covers">Open Library Covers '
+            "API</a> for details.</div>"
+        ),
+        media_type="text/html",
+    )
 
-        web.ctx.pop("_fieldstorage", None)
-        web.ctx.pop("_data", None)
 
-        def error(code__msg):
-            (code, msg) = code__msg
-            _cleanup()
-            e = web.badrequest()
-            e.data = json.dumps({"code": code, "message": msg})
-            logger.exception("upload2.POST() failed: " + e.data)
-            raise e
+@router.post("/{category}/upload2", include_in_schema=False)
+async def upload2(
+    category: CoverCategory,
+    olid: Annotated[str | None, Form()] = None,
+    author: Annotated[str | None, Form()] = None,
+    data: Annotated[bytes | None, File()] = None,
+    source_url: Annotated[str | None, Form()] = None,
+    ip: Annotated[str | None, Form()] = None,
+) -> Response:
+    """openlibrary.org POSTs here via openlibrary/plugins/upstream/covers.py upload"""
 
-        source_url = i.source_url
-        data = i.data
+    def error(code__msg: tuple[int, str]) -> JSONResponse:
+        code, msg = code__msg
+        body = json.dumps({"code": code, "message": msg})
+        logger.exception("upload2 failed: " + body)
+        return JSONResponse(status_code=400, content={"code": code, "message": msg})
 
-        if source_url:
-            try:
-                data = download(source_url)
-            except:
-                error(ERROR_INVALID_URL)
-
-        if not data:
-            error(ERROR_EMPTY)
-
+    if source_url:
         try:
-            d = save_image(data, category=category, olid=i.olid, author=i.author, source_url=i.source_url, ip=i.ip)
-        except ValueError:
-            error(ERROR_BAD_IMAGE)
+            data = await download_external_image(source_url)
+        except:
+            return error(ERROR_INVALID_URL)
 
-        _cleanup()
-        return json.dumps({"ok": "true", "id": d.id})
+    if not data:
+        return error(ERROR_EMPTY)
+
+    try:
+        d = save_image(data, category=category, olid=olid, author=author, source_url=source_url, ip=ip)
+    except ValueError:
+        return error(ERROR_BAD_IMAGE)
+
+    return JSONResponse(content={"ok": "true", "id": d.id})
+
 
 def trim_microsecond(date):
     # ignore microseconds
-    return datetime.datetime(*date.timetuple()[:6])
+    return dt.datetime(*date.timetuple()[:6])
 
-
-def zipview_url(item, zipfile, filename):
-    # http or https
-    protocol = web.ctx.protocol
-    return "%(protocol)s://archive.org/download/%(item)s/%(zipfile)s/%(filename)s" % locals()
 
 # Number of images stored in one archive.org item
-IMAGES_PER_ITEM = 10000
+IMAGES_PER_ITEM = 10_000
 
-def zipview_url_from_id(coverid, size):
+
+def zipview_url_from_id(coverid: int, size: CoverSizeUpper, protocol: str = "https") -> str:
     suffix = size and ("-" + size.upper())
-    item_index = coverid/IMAGES_PER_ITEM
+    item_index = coverid // IMAGES_PER_ITEM
     itemid = "olcovers%d" % item_index
     zipfile = itemid + suffix + ".zip"
     filename = "%d%s.jpg" % (coverid, suffix)
-    return zipview_url(itemid, zipfile, filename)
+    return f"{protocol}://archive.org/download/{itemid}/{zipfile}/{filename}"
 
-class cover:
-    def GET(self, category, key, value, size):
-        i = web.input(default="true")
-        key = key.lower()
 
-        def is_valid_url(url):
-            return url.startswith("http://") or url.startswith("https://")
+async def get_ia_cover_url(identifier: str, size: Literal["S", "M", "L"]) -> str | None:
+    url = f"https://archive.org/metadata/{identifier}/metadata"
+    try:
+        resp = await get_async_session().get(url)
+        d = resp.json().get("result", {})
+    except httpx.RequestError, ValueError:
+        return None
 
-        def notfound():
-            if config.default_image and i.default.lower() != "false" and not is_valid_url(i.default):
-                return read_file(config.default_image)
-            elif is_valid_url(i.default):
-                raise web.seeother(i.default)
-            else:
-                raise web.notfound("")
+    # Not a text item or no images or scan is not complete yet
+    if d.get("mediatype") != "texts" or d.get("repub_state", "4") not in ("4", "6") or "imagecount" not in d:
+        return None
 
-        def redirect(id):
-            size_part = size and ("-" + size) or ""
-            url = "/%s/id/%s%s.jpg" % (category, id, size_part)
+    w, h = config.image_sizes[size.upper()]
+    return "https://archive.org/download/%s/page/cover_w%d_h%d.jpg" % (identifier, w, h)
 
-            query = web.ctx.env.get('QUERY_STRING')
-            if query:
-                url += '?' + query
-            raise web.found(url)
 
-        if key == 'isbn':
-            value = value.replace("-", "").strip() # strip hyphens from ISBN
-            # Disabling ratelimit as iptables is taking care of botnets.
-            #value = self.ratelimit_query(category, key, value)
-            value = self.query(category, key, value)
+def get_details(coverid: int, size: CoverSizeLower = "") -> PartialCoverDetails | db.CoverDbDetails | None:
+    # Use tar index if available to avoid db query. We have 0-6M images in tar balls.
+    if coverid < 6_000_000 and size in "sml":
+        path = get_tar_filename(coverid, size)
 
-            # Redirect isbn requests to archive.org.
-            # This will heavily reduce the load on coverstore server.
-            # The max_coveritem_index config parameter specifies the latest
-            # olcovers items uploaded to archive.org.
-            if value and self.is_cover_in_cluster(value):
-                url = zipview_url_from_id(int(value), size)
-                raise web.found(url)
-        elif key == 'ia':
-            url = self.get_ia_cover_url(value, size)
-            if url:
-                raise web.found(url)
-            else:
-                value = None # notfound or redirect to default. handled later.
-        elif key != 'id':
-            value = self.query(category, key, value)
+        if path:
+            key = f"filename_{size}" if size else "filename"
+            return cast(
+                PartialCoverDetails,
+                web.storage({"id": coverid, key: path, "created": dt.datetime(2010, 1, 1)}),
+            )
 
-        if value and safeint(value) in config.blocked_covers:
-            raise web.notfound()
+    return db.details(coverid)
 
-        # redirect to archive.org cluster for large size and original images whenever possible
-        if value and (size == "L" or size == "") and self.is_cover_in_cluster(value):
-            url = zipview_url_from_id(int(value), size)
-            raise web.found(url)
 
-        d = value and self.get_details(value, size.lower())
-        if not d:
-            return notfound()
+def is_cover_in_cluster(coverid: int) -> bool:
+    """Returns True if the cover is moved to archive.org cluster.
+    It is found by looking at the config variable max_coveritem_index.
+    """
+    try:
+        return coverid < IMAGES_PER_ITEM * config.get("max_coveritem_index", 0)
+    except TypeError, ValueError:
+        return False
 
-        # set cache-for-ever headers only when requested with ID
-        if key == 'id':
-            etag = "%s-%s" % (d.id, size.lower())
-            if not web.modified(trim_microsecond(d.created), etag=etag):
-                raise web.notmodified()
 
-            web.header('Cache-Control', 'public')
-            web.expires(100 * 365 * 24 * 3600) # this image is not going to expire in next 100 years.
-        else:
-            web.header('Cache-Control', 'public')
-            web.expires(10*60) # Allow the client to cache the image for 10 mins to avoid further requests
+def get_tar_filename(coverid: int, size: CoverSizeLower) -> str | None:
+    """Returns tarfile:offset:size for given coverid."""
+    tarindex = coverid // 10000
+    index = coverid % 10000
+    array_offset, array_size = get_tar_index(tarindex, size)
 
-        web.header('Content-Type', 'image/jpeg')
-        try:
-            return read_image(d, size)
-        except IOError:
-            raise web.notfound()
+    offset = array_offset and array_offset[index]
+    imgsize = array_size and array_size[index]
 
-    def get_ia_cover_url(self, identifier, size="M"):
-        url = "https://archive.org/metadata/%s/metadata" % identifier
-        try:
-            d = requests.get(url).json().get("result", {})
-        except (IOError, ValueError):
-            return
+    prefix = f"{size}_covers" if size else "covers"
 
-        # Not a text item or no images or scan is not complete yet
-        if d.get("mediatype") != "texts" or d.get("repub_state", "4") not in ["4", "6"] or "imagecount" not in d:
-            return
+    if imgsize:
+        name = "%010d" % coverid
+        return f"{prefix}_{name[:4]}_{name[4:6]}.tar:{offset}:{imgsize}"
+    return None
 
-        w, h = config.image_sizes[size.upper()]
-        return "https://archive.org/download/%s/page/cover_w%d_h%d.jpg" % (identifier, w, h)
 
-    def get_details(self, coverid, size=""):
-        try:
-            coverid = int(coverid)
-        except ValueError:
-            return None
-
-        # Use tar index if available to avoid db query. We have 0-6M images in tar balls.
-        if isinstance(coverid, int) and coverid < 6000000 and size in "sml":
-            path = self.get_tar_filename(coverid, size)
-
-            if path:
-                if size:
-                    key = "filename_%s" % size
-                else:
-                    key = "filename"
-                return web.storage({"id": coverid, key: path, "created": datetime.datetime(2010, 1, 1)})
-
-        return db.details(coverid)
-
-    def is_cover_in_cluster(self, coverid):
-        """Returns True if the cover is moved to archive.org cluster.
-        It is found by looking at the config variable max_coveritem_index.
-        """
-        try:
-            return int(coverid) < IMAGES_PER_ITEM * config.get("max_coveritem_index", 0)
-        except (TypeError, ValueError):
-            return False
-
-    def get_tar_filename(self, coverid, size):
-        """Returns tarfile:offset:size for given coverid.
-        """
-        tarindex = coverid / 10000
-        index = coverid % 10000
-        array_offset, array_size = get_tar_index(tarindex, size)
-
-        offset = array_offset and array_offset[index]
-        imgsize = array_size and array_size[index]
-
-        if size:
-            prefix = "%s_covers" % size
-        else:
-            prefix = "covers"
-
-        if imgsize:
-            name = "%010d" % coverid
-            return "%s_%s_%s.tar:%s:%s" % (prefix, name[:4], name[4:6], offset, imgsize)
-
-    def query(self, category, key, value):
-        return _query(category, key, value)
-
-    ratelimit_query = ratelimit.ratelimit()(query)
-
-@web.memoize
-def get_tar_index(tarindex, size):
+# mypy can't check callers against this signature: functools.cache's stub types its
+# wrapper's __call__ as taking *args: Hashable, erasing the real parameter types.
+# https://github.com/python/mypy/issues/16261
+@functools.cache
+def get_tar_index(tarindex: int, size: CoverSizeLower):
+    assert config.data_root is not None
     path = os.path.join(config.data_root, get_tarindex_path(tarindex, size))
     if not os.path.exists(path):
         return None, None
 
     return parse_tarindex(open(path))
 
-def get_tarindex_path(index, size):
+
+def get_tarindex_path(index: int, size: CoverSizeLower) -> str:
     name = "%06d" % index
     if size:
-        prefix = "%s_covers" % size
+        prefix = f"{size}_covers"
     else:
         prefix = "covers"
 
-    itemname = "%s_%s" % (prefix, name[:4])
-    filename = "%s_%s_%s.index" % (prefix, name[:4], name[4:6])
-    return os.path.join('items', itemname, filename)
+    itemname = f"{prefix}_{name[:4]}"
+    filename = f"{prefix}_{name[:4]}_{name[4:6]}.index"
+    return os.path.join("items", itemname, filename)
 
-def parse_tarindex(file):
-    """Takes tarindex file as file objects and returns array of offsets and array of sizes. The size of the returned arrays will be 10000.
-    """
-    array_offset = array.array('L', [0 for i in range(10000)])
-    array_size = array.array('L', [0 for i in range(10000)])
+
+def parse_tarindex(file: io.TextIOBase):
+    """Takes tarindex file as file objects and returns array of offsets and array of sizes. The size of the returned arrays will be 10000."""
+    array_offset = array.array("L", [0 for i in range(10000)])
+    array_size = array.array("L", [0 for i in range(10000)])
 
     for line in file:
         line = line.strip()
         if line:
             name, offset, imgsize = line.split("\t")
-            coverid = int(name[:10]) # First 10 chars is coverid, followed by ".jpg"
+            coverid = int(name[:10])  # First 10 chars is coverid, followed by ".jpg"
             index = coverid % 10000
             array_offset[index] = int(offset)
             array_size[index] = int(imgsize)
     return array_offset, array_size
 
-class cover_details:
-    def GET(self, category, key, value):
-        d = _query(category, key, value)
 
-        if key == 'id':
-            web.header('Content-Type', 'application/json')
-            d = db.details(value)
-            if d:
-                if isinstance(d['created'], datetime.datetime):
-                    d['created'] = d['created'].isoformat()
-                    d['last_modified'] = d['last_modified'].isoformat()
-                return json.dumps(d)
-            else:
-                raise web.notfound("")
-        else:
-            value = _query(category, key, value)
-            if value is None:
-                return web.notfound("")
-            else:
-                return web.found("/%s/id/%s.json" % (category, value))
+def _serve_default(default: str) -> Response:
+    """The fallback when no cover matched: the configured placeholder, a caller-supplied
+    URL, or a plain 404."""
 
-class query:
-    def GET(self, category):
-        i = web.input(olid=None, offset=0, limit=10, callback=None, details="false", cmd=None)
-        offset = safeint(i.offset, 0)
-        limit = safeint(i.limit, 10)
-        details = i.details.lower() == "true"
+    def is_valid_url(url: str) -> bool:
+        return url.startswith(("http://", "https://"))
 
-        if limit > 100:
-            limit = 100
+    if config.default_image and default.lower() != "false" and not is_valid_url(default):
+        media_type = mimetypes.guess_type(config.default_image)[0] or "image/jpeg"
+        return Response(content=read_file(config.default_image), media_type=media_type)
+    # GHSA-8ffj: only 303 to a vetted OL/IA/cover host, never an arbitrary
+    # attacker-supplied ?default= URL (open redirect / phishing).
+    elif is_allowed_default_redirect_url(default):
+        return RedirectResponse(default, status_code=303)
+    else:
+        return Response(status_code=404)
 
-        if i.olid and ',' in i.olid:
-            i.olid = i.olid.split(',')
-        result = db.query(category, i.olid, offset=offset, limit=limit)
 
-        if i.cmd == "ids":
-            result = dict((r.olid, r.id) for r in result)
-        elif not details:
-            result = [r.id for r in result]
-        else:
-            def process(r):
-                return {
-                    'id': r.id,
-                    'olid': r.olid,
-                    'created': r.created.isoformat(),
-                    'last_modified': r.last_modified.isoformat(),
-                    'source_url': r.source_url,
-                    'width': r.width,
-                    'height': r.height
-                }
-            result = [process(r) for r in result]
+async def _serve_cover(request: Request, category: CoverCategory, key: str, value: str, size: CoverSizeUpper, default: str) -> Response:
+    key = key.lower()
 
-        json_data = json.dumps(result)
-        web.header('Content-Type', 'text/javascript')
-        if i.callback:
-            return "%s(%s);" % (i.callback, json_data)
-        else:
-            return json_data
+    cover_id: int | None = None
+    if key == "isbn":
+        normalized_isbn = value.replace("-", "").strip()  # strip hyphens from ISBN
+        cover_id = await _query(category, key, normalized_isbn)
+    elif key == "ia":
+        # archive.org only derives page images at a named size, so a size-less
+        # request has nothing to redirect to.
+        if size and (url := await get_ia_cover_url(value, size)):
+            return RedirectResponse(url, status_code=302)
+        cover_id = None  # notfound or redirect to default. handled later.
+    elif key != "id":
+        cover_id = await _query(category, key, value)
+    else:
+        cover_id = safeint(value)
 
-class touch:
-    def POST(self, category):
-        i = web.input(id=None, redirect_url=None)
-        redirect_url = i.redirect_url or web.ctx.get('HTTP_REFERRER')
+    if cover_id is None or cover_id in config.blocked_covers:
+        return _serve_default(default)
 
-        id = i.id and safeint(i.id, None)
-        if id:
-            db.touch(id)
-            raise web.seeother(redirect_url)
-        else:
-            return 'no such id: %s' % id
+    # redirect to archive.org cluster for large size and original images whenever possible
+    if size in ("L", "") and is_cover_in_cluster(cover_id):
+        return RedirectResponse(zipview_url_from_id(cover_id, size, request.url.scheme), status_code=302)
 
-class delete:
-    def POST(self, category):
-        i = web.input(id=None, redirect_url=None)
-        redirect_url = i.redirect_url
+    d = get_details(cover_id, SIZE_LOWER[size])
+    if not d:
+        return _serve_default(default)
 
-        id = i.id and safeint(i.id, None)
-        if id:
-            db.delete(id)
-            if redirect_url:
-                raise web.seeother(redirect_url)
-            else:
-                return 'cover has been deleted successfully.'
-        else:
-            return 'no such id: %s' % id
+    headers = {"Cache-Control": "public"}
+    if key == "id":
+        # set cache-for-ever headers only when requested with ID
+        created = trim_microsecond(d.created)
+        etag = f"{d.id}-{SIZE_LOWER[size]}"
+        headers["Last-Modified"] = _httpdate(created)
+        headers["ETag"] = f'"{etag}"'
+        if is_cached_copy_fresh(request, created, etag):
+            return Response(status_code=304, headers=headers)
+
+        # this image is not going to expire in next 100 years.
+        headers["Expires"] = _expires_header(100 * 365 * 24 * 3600)
+    else:
+        # Allow the client to cache the image for 10 mins to avoid further requests
+        headers["Expires"] = _expires_header(10 * 60)
+
+    try:
+        from openlibrary.coverstore import archive
+
+        if d.id >= 8_000_000 and d.uploaded:
+            url = archive.Cover.get_cover_url(d.id, size=size, protocol=request.url.scheme)
+            # A 302 isn't cacheable unless it says so, and this one never changes.
+            return RedirectResponse(url, status_code=302, headers=headers)
+        return Response(content=read_image(d, size), media_type="image/jpeg", headers=headers)
+    except OSError:
+        return Response(status_code=404)
+
+
+@router.api_route("/{category}/{key}/{value}-{size:cover_size}.jpg", methods=["GET", "HEAD"], include_in_schema=False)
+async def cover_sized(
+    request: Request,
+    category: CoverCategory,
+    key: str,
+    value: str,
+    size: Literal["S", "M", "L"],
+    default: Annotated[str, Query()] = "true",
+) -> Response:
+    return await _serve_cover(request, category, key, value, size, default)
+
+
+@router.api_route("/{category}/{key}/{value}.jpg", methods=["GET", "HEAD"], include_in_schema=False)
+async def cover_unsized(
+    request: Request,
+    category: CoverCategory,
+    key: str,
+    value: str,
+    default: Annotated[str, Query()] = "true",
+) -> Response:
+    return await _serve_cover(request, category, key, value, "", default)
+
+
+@router.api_route("/{category}/{key}/{value}.json", methods=["GET", "HEAD"], include_in_schema=False)
+async def cover_details(category: CoverCategory, key: str, value: str) -> Response:
+    if key == "id":
+        d = db.details(safeint(value))
+        if not d:
+            return Response(status_code=404)
+        if isinstance(d["created"], dt.datetime):
+            d["created"] = d["created"].isoformat()
+            d["last_modified"] = d["last_modified"].isoformat()
+        return Response(content=json.dumps(d), media_type="application/json")
+
+    cover_id = await _query(category, key, value)
+    if cover_id is None:
+        return Response(status_code=404)
+    return RedirectResponse(f"/{category}/id/{cover_id}.json", status_code=302)
+
+
+@router.api_route("/{category}/query", methods=["GET", "HEAD"], include_in_schema=False)
+def query(
+    category: CoverCategory,
+    olid: Annotated[str | None, Query()] = None,
+    offset: Annotated[str, Query()] = "0",
+    limit: Annotated[str, Query()] = "10",
+    callback: Annotated[str | None, Query()] = None,
+    details: Annotated[str, Query()] = "false",
+    cmd: Annotated[str | None, Query()] = None,
+) -> Response:
+    olids: str | list[str] | None = olid
+    if olid and "," in olid:
+        olids = olid.split(",")
+
+    result = db.query(category, olids, offset=safeint(offset, 0), limit=min(safeint(limit, 10), 100))
+
+    payload: dict | list
+    if cmd == "ids":
+        payload = {r.olid: r.id for r in result}
+    elif details.lower() != "true":
+        payload = [r.id for r in result]
+    else:
+        payload = [
+            {
+                "id": r.id,
+                "olid": r.olid,
+                "created": r.created.isoformat(),
+                "last_modified": r.last_modified.isoformat(),
+                "source_url": r.source_url,
+                "width": r.width,
+                "height": r.height,
+            }
+            for r in result
+        ]
+
+    json_data = json.dumps(payload)
+    content = f"{callback}({json_data});" if callback else json_data
+    return Response(content=content, media_type="text/javascript")
+
+
+@router.post("/{category}/touch", include_in_schema=False)
+def touch(
+    request: Request,
+    category: CoverCategory,
+    id: Annotated[str | None, Form()] = None,
+    redirect_url: Annotated[str | None, Form()] = None,
+) -> Response:
+    cover_id = id and safeint(id, None)
+    if not cover_id:
+        return Response(content=f"no such id: {cover_id}", media_type="text/plain")
+
+    db.touch(cover_id)
+    return RedirectResponse(safe_redirect_target(redirect_url or request.headers.get("referer")), status_code=303)
+
+
+@router.post("/{category}/delete", include_in_schema=False)
+def delete(
+    category: CoverCategory,
+    id: Annotated[str | None, Form()] = None,
+    redirect_url: Annotated[str | None, Form()] = None,
+) -> Response:
+    cover_id = id and safeint(id, None)
+    if not cover_id:
+        return Response(content=f"no such id: {cover_id}", media_type="text/plain")
+
+    db.delete(cover_id)
+    if redirect_url:
+        return RedirectResponse(safe_redirect_target(redirect_url), status_code=303)
+    return Response(content="cover has been deleted successfully.", media_type="text/plain")
+
+
+@router.post("/{category}/upload", include_in_schema=False)
+async def upload(
+    request: Request,
+    category: CoverCategory,
+    olid: Annotated[str, Form()],
+    author: Annotated[str | None, Form()] = None,
+    file: Annotated[bytes | None, File()] = None,
+    source_url: Annotated[str | None, Form()] = None,
+    success_url: Annotated[str | None, Form()] = None,
+    failure_url: Annotated[str | None, Form()] = None,
+) -> Response:
+    referer = request.headers.get("referer")
+    # Validate the caller-supplied redirect targets so upload cannot be used as
+    # an open redirect (same class as GHSA-8ffj).
+    success = safe_redirect_target(success_url or referer)
+    failure = safe_redirect_target(failure_url or referer)
+
+    def error(code__msg: tuple[int, str]) -> RedirectResponse:
+        code, msg = code__msg
+        logger.error("upload failed, olid=%s code=%s msg=%r", olid, code, msg)
+        return RedirectResponse(changequery(failure, errcode=code, errmsg=msg), status_code=303)
+
+    data = file
+    if source_url:
+        try:
+            data = await download_external_image(source_url)
+        except:
+            return error(ERROR_INVALID_URL)
+
+    if not data:
+        return error(ERROR_EMPTY)
+
+    try:
+        save_image(
+            data,
+            category=category,
+            olid=olid,
+            author=author,
+            source_url=source_url,
+            ip=request.client and request.client.host,
+        )
+    except ValueError:
+        return error(ERROR_BAD_IMAGE)
+
+    return RedirectResponse(success, status_code=303)
+
+
+def render_list_preview_image(lst_key: str):
+    """This function takes a list of five books and puts their covers in the correct
+    locations to create a new image for social-card"""
+    from openlibrary.core.lists.model import List
+
+    lst = cast(List, site.get().get(lst_key))
+    five_covers = itertools.islice(
+        (cover for seed in lst.get_seeds() if seed._type != "subject" and (cover := seed.get_cover())),
+        0,
+        5,
+    )
+    background = Image.open("/openlibrary/static/images/Twitter_Social_Card_Background.png")
+
+    logo = Image.open("/openlibrary/static/images/Open_Library_logo.png")
+
+    W, _H = background.size
+    image = []
+    for cover in five_covers:
+        response = requests.get(f"https://covers.openlibrary.org/b/id/{cover.id}-M.jpg")
+        image_bytes = io.BytesIO(response.content)
+
+        img = Image.open(image_bytes)
+
+        basewidth = 162
+        wpercent = basewidth / float(img.size[0])
+        hsize = int(float(img.size[1]) * float(wpercent))
+        img = img.resize((basewidth, hsize), Image.Resampling.LANCZOS)
+        image.append(img)
+
+    max_height = 0
+    for img in image:
+        max_height = max(img.size[1], max_height)
+    start_width = 63 + 92 * (5 - len(image))
+    for img in image:
+        background.paste(img, (start_width, 174 + max_height - img.size[1]))
+        start_width += 184
+
+    logo = logo.resize((120, 74), Image.Resampling.LANCZOS)
+    background.paste(logo, (880, 14), logo)
+
+    draw = ImageDraw.Draw(background)
+    font_author = ImageFont.truetype("/openlibrary/static/fonts/NotoSans-LightItalic.ttf", 22)
+    font_title = ImageFont.truetype("/openlibrary/static/fonts/NotoSans-SemiBold.ttf", 28)
+
+    para = textwrap.wrap(lst.name or "Untitled List", width=45)
+    current_h = 42
+
+    author_text = "A list on Open Library"
+    if owner := lst.get_owner():
+        author_text = f"A list by {owner.displayname}"
+
+    left, top, right, bottom = font_author.getbbox(author_text)
+    w, h = right - left, bottom - top
+    draw.text(((W - w) / 2, current_h), author_text, font=font_author, fill=(0, 0, 0))
+    current_h += h + 5
+
+    for line in para:
+        left, top, right, bottom = font_title.getbbox(line)
+        w, h = right - left, bottom - top
+        draw.text(((W - w) / 2, current_h), line, font=font_title, fill=(0, 0, 0))
+        current_h += h
+
+    with io.BytesIO() as buf:
+        background.save(buf, format="PNG")
+        return buf.getvalue()
+
+
+def setup():
+    setup_requests(config)
+
+
+setup()

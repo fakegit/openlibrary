@@ -1,58 +1,65 @@
-import os
+"""Postgres fixtures for the async DB integration tests.
+
+- ``pg_proc``: session postgres with ``openlibrary/core/schema.sql`` loaded.
+- ``pg_db``: fresh database per test, with ``web.config.db_parameters``
+  pointed at it so production ``async_db`` code runs unmodified.
+
+Integration tests use ``@pytest.mark.integration`` and stay skipped by
+default. Run them with ``pytest -m integration openlibrary/tests/core/``.
+"""
+
+from __future__ import annotations
+
+import time as _time
+
+# Save before the autouse ``no_sleep`` fixture patches it. The janitor needs a real wait.
+_real_sleep = _time.sleep
+
+from pathlib import Path
+from uuid import uuid4
+
 import pytest
+import web
+from pytest_postgresql import factories
+from pytest_postgresql.janitor import DatabaseJanitor
+
+from openlibrary.core import async_db
+
+# Load the canonical schema directly so tests track schema.sql with no second copy.
+_SCHEMA_PATH = Path(__file__).resolve().parents[2] / "core" / "schema.sql"
+
+pg_proc = factories.postgresql_proc(load=[_SCHEMA_PATH])
+
 
 @pytest.fixture
-def dummy_crontabfile(request):
-    "Creates a dummy crontab file that can be used for to try things"
-    cronfile = os.tmpnam()
-    ip = """* * * * * /bin/true
-* * * * * /bin/true"""
-    f = open(cronfile,"w")
-    f.write(ip)
-    f.close()
-    request.addfinalizer(lambda : os.remove(cronfile))
-    return cronfile
+def pg_db(pg_proc, monkeypatch):
+    """Fresh postgres per test, with ``web.config.db_parameters`` pointed at it."""
+    monkeypatch.setattr("time.sleep", _real_sleep)
 
-@pytest.fixture
-def crontabfile(request):
-    """Creates a file with an actual command that we can use to test
-    running of cron lines"""
-    if os.path.exists("/tmp/crontest"):
-        os.unlink("/tmp/crontest")
-    cronfile = os.tmpnam()
-    ip = "* * * * * touch /tmp/crontest"
-    f = open(cronfile,"w")
-    f.write(ip)
-    f.close()
-    request.addfinalizer(lambda : os.remove(cronfile))
-    return cronfile
-
-@pytest.fixture
-def counter(request):
-    """Returns a decorator that will create a 'counted' version of the
-    functions. The number of times it's been called is kept in the
-    .invocations attribute"""
-    def counter(fn):
-        def _counted(*largs, **kargs):
-            _counted.invocations += 1
-            fn(*largs, **kargs)
-        _counted.invocations = 0
-        return _counted
-    return counter
-
-@pytest.fixture
-def sequence(request):
-    """Returns a function that can be called for sequence numbers
-    similar to web.ctx.site.sequence.get_next"""
-    t = (x for x in range(100))
-    def seq_counter(*largs, **kargs):
-        return next(t)
-    import web
-    # Clean up this mess to mock sequences
-    web.ctx = lambda:0
-    web.ctx.site = lambda:0
-    web.ctx.site.seq = lambda: 0
-    web.ctx.site.seq.next_value = seq_counter
-    # Now run the test
-    return seq_counter
-
+    dbname = f"test_{uuid4().hex[:8]}"
+    with DatabaseJanitor(
+        user=pg_proc.user,
+        host=pg_proc.host,
+        port=pg_proc.port,
+        dbname=dbname,
+        password=pg_proc.password,
+        template_dbname=pg_proc.template_dbname,
+    ):
+        monkeypatch.setitem(
+            web.config,
+            "db_parameters",
+            {
+                "dbn": "postgres",
+                "db": dbname,
+                "user": pg_proc.user,
+                "pw": pg_proc.password or "",
+                "host": pg_proc.host,
+                "port": pg_proc.port,
+            },
+        )
+        # Fresh pool per test database.
+        with async_db._entries_lock:
+            async_db._entries.clear()
+        yield
+        with async_db._entries_lock:
+            async_db._entries.clear()

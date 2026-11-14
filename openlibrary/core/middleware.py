@@ -1,17 +1,20 @@
-"""WSGI middleware used in Open Library.
-"""
-import web
-from six import BytesIO
+"""WSGI middleware used in Open Library."""
+
 import gzip
+from io import BytesIO
+
+import web
+
 
 class GZipMiddleware:
     """WSGI middleware to gzip the response."""
+
     def __init__(self, app):
         self.app = app
 
     def __call__(self, environ, start_response):
         accept_encoding = environ.get("HTTP_ACCEPT_ENCODING", "")
-        if not 'gzip' in accept_encoding:
+        if "gzip" not in accept_encoding:
             return self.app(environ, start_response)
 
         response = web.storage(compress=False)
@@ -24,7 +27,7 @@ class GZipMiddleware:
 
         def compress(text, level=9):
             f = BytesIO()
-            gz = gzip.GzipFile(None, 'wb', level, fileobj=f)
+            gz = gzip.GzipFile(None, "wb", level, fileobj=f)
             gz.write(text)
             gz.close()
             return f.getvalue()

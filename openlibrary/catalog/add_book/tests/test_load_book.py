@@ -1,60 +1,463 @@
 import pytest
+
 from openlibrary.catalog.add_book import load_book
 from openlibrary.catalog.add_book.load_book import (
-    import_author, build_query, InvalidLanguage)
+    author_import_record_to_author,
+    find_entity,
+    import_record_to_edition,
+)
+from openlibrary.catalog.utils import InvalidLanguage
+from openlibrary.core.models import Author, AuthorRemoteIdConflictError
 
 
 @pytest.fixture
 def new_import(monkeypatch):
-    monkeypatch.setattr(load_book, 'find_entity', lambda a: None)
+    monkeypatch.setattr(load_book, "find_entity", lambda a: None)
 
 
 # These authors will be imported with natural name order
 # i.e. => Forename Surname
 natural_names = [
-     {'name': 'Forename Surname'},
-     {'name': 'Surname, Forename', 'personal_name': 'Surname, Forename'},
-     {'name': 'Surname, Forename'},
-     {'name': 'Surname, Forename', 'entity_type': 'person'},
-     ]
+    {"name": "Forename Surname"},
+    {"name": "Surname, Forename", "personal_name": "Surname, Forename"},
+    {"name": "Surname, Forename"},
+    {"name": "Surname, Forename", "entity_type": "person"},
+    # A MARC author carrying a $c title, e.g. "Surname, Forename" + "pseud." (#13853)
+    {"name": "Surname, Forename", "title": "pseud.", "entity_type": "person"},
+]
 
 
 # These authors will be imported with 'name' unchanged
 unchanged_names = [
-     {'name': 'Forename Surname'},
-     {'name': 'Smith, John III, King of Coats, and Bottles',
-         'personal_name': 'Smith, John'},
-     {'name': 'Smith, John III, King of Coats, and Bottles'},
-     {'name': 'Harper, John Murdoch, 1845-'},
-     {'entity_type': 'org', 'name': 'Organisation, Place'},
-     ]
+    {"name": "Forename Surname"},
+    {
+        "name": "Smith, John III, King of Coats, and Bottles",
+        "personal_name": "Smith, John",
+    },
+    {"name": "Smith, John III, King of Coats, and Bottles"},
+    {"name": "Harper, John Murdoch, 1845-"},
+    {"entity_type": "org", "name": "Organisation, Place"},
+    {
+        "entity_type": "org",
+        "name": "首都师范大学 (Beijing, China). 中国诗歌硏究中心",
+    },
+]
 
 
-@pytest.mark.parametrize('author', natural_names)
+@pytest.mark.parametrize("author", natural_names)
 def test_import_author_name_natural_order(author, new_import):
-    result = import_author(author)
-    assert result['name'] == 'Forename Surname'
+    result = author_import_record_to_author(author)
+    assert isinstance(result, dict)
+    assert result["name"] == "Forename Surname"
 
 
-@pytest.mark.parametrize('author', unchanged_names)
+@pytest.mark.parametrize("author", unchanged_names)
 def test_import_author_name_unchanged(author, new_import):
-    expect = author['name']
-    result = import_author(author)
-    assert result['name'] == expect
+    expect = author["name"]
+    result = author_import_record_to_author(author)
+    assert isinstance(result, dict)
+    assert result["name"] == expect
 
 
 def test_build_query(add_languages):
     rec = {
-        'title': 'magic',
-        'languages': ['eng', 'fre'],
-        'authors': [{'name': 'Surname, Forename'}],
-        'description': 'test',
+        "title": "magic",
+        "languages": ["ENG", "fre"],
+        "translated_from": ["yid"],
+        "authors": [{"name": "Surname, Forename"}],
+        "description": "test",
     }
-    q = build_query(rec)
-    assert q['title'] == 'magic'
-    assert q['authors'][0]['name'] == 'Forename Surname'
-    assert q['description'] == {'type': '/type/text', 'value': 'test'}
-    assert q['type'] == {'key': '/type/edition'}
-    assert q['languages'] == [{'key': '/languages/eng'}, {'key': '/languages/fre'}]
+    q = import_record_to_edition(rec)
+    assert q["title"] == "magic"
+    assert q["authors"][0]["name"] == "Forename Surname"
+    assert q["description"] == {"type": "/type/text", "value": "test"}
+    assert q["type"] == {"key": "/type/edition"}
+    assert q["languages"] == [{"key": "/languages/eng"}, {"key": "/languages/fre"}]
+    assert q["translated_from"] == [{"key": "/languages/yid"}]
 
-    pytest.raises(InvalidLanguage, build_query, {'languages': ['wtf']})
+    with pytest.raises(InvalidLanguage):
+        import_record_to_edition({"languages": ["wtf"]})
+
+
+class TestImportAuthor:
+    def add_three_existing_authors(self, mock_site):
+        for num in range(3):
+            existing_author = {
+                "name": f"John Smith {num}",
+                "key": f"/authors/OL{num}A",
+                "type": {"key": "/type/author"},
+            }
+            mock_site.save(existing_author)
+
+    def test_author_match_is_case_insensitive_for_names(self, mock_site):
+        """Ensure name searches for John Smith and JOHN SMITH return the same record."""
+        self.add_three_existing_authors(mock_site)
+        existing_author = {
+            "name": "John Smith",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+        }
+        mock_site.save(existing_author)
+
+        author = {"name": "John Smith"}
+        case_sensitive_author = find_entity(author)
+        author = {"name": "JoHN SmITh"}
+        case_insensitive_author = find_entity(author)
+
+        assert case_insensitive_author is not None
+        assert case_sensitive_author == case_insensitive_author
+
+    def test_author_wildcard_match_with_no_matches_creates_author_with_wildcard(self, mock_site):
+        """This test helps ensure compatibility with production; we should not use this."""
+        self.add_three_existing_authors(mock_site)
+        author = {"name": "Mr. Blobby*"}
+        new_author_name = author_import_record_to_author(author)
+        assert author["name"] == new_author_name["name"]
+
+    def test_first_match_ol_key(self, mock_site):
+        """
+        Highest priority match is OL key.
+        """
+
+        # Author with VIAF
+        author = {
+            "name": "William H. Brewer",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+            "remote_ids": {"viaf": "12345678"},
+        }
+
+        # Another author with VIAF
+        author_different_key = {
+            "name": "William Brewer",
+            "key": "/authors/OL4A",
+            "type": {"key": "/type/author"},
+            "remote_ids": {"viaf": "87654321"},
+        }
+
+        mock_site.save(author)
+        mock_site.save(author_different_key)
+
+        # Look for exact match on OL ID, regardless of other fields.
+        searched_author = {
+            "name": "William H. Brewer",
+            "key": "/authors/OL4A",
+        }
+        found = author_import_record_to_author(searched_author)
+        assert found.key == author_different_key["key"]
+
+    def test_conflicting_ids_cause_error(self, mock_site):
+        # Author with VIAF
+        author = {
+            "name": "William H. Brewer",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+            "remote_ids": {"viaf": "12345678"},
+        }
+
+        # Another author with VIAF
+        author_different_key = {
+            "name": "William Brewer",
+            "key": "/authors/OL4A",
+            "type": {"key": "/type/author"},
+            "remote_ids": {"viaf": "87654321"},
+        }
+
+        mock_site.save(author)
+        mock_site.save(author_different_key)
+
+        # Author with differing ID
+        searched_author = {
+            "name": "William H. Brewer",
+            "key": "/authors/OL4A",
+            "remote_ids": {"viaf": "12345678"},
+        }
+        with pytest.raises(AuthorRemoteIdConflictError):
+            author_import_record_to_author(searched_author)
+
+    def test_name_match_with_a_conflicting_id_is_a_different_author(self, mock_site):
+        mock_site.save({"name": "E. M. Forster", "key": "/authors/OL1A", "type": {"key": "/type/author"}, "remote_ids": {"project_gutenberg": "999"}})
+
+        new = author_import_record_to_author({"name": "E. M. Forster", "remote_ids": {"project_gutenberg": "975"}})
+
+        assert "key" not in new
+        assert new["remote_ids"] == {"project_gutenberg": "975"}
+
+    def test_name_match_without_a_conflicting_id_gains_the_id(self, mock_site):
+        mock_site.save({"name": "E. M. Forster", "key": "/authors/OL1A", "type": {"key": "/type/author"}, "remote_ids": {"viaf": "1"}})
+
+        found = author_import_record_to_author({"name": "E. M. Forster", "remote_ids": {"project_gutenberg": "975"}})
+
+        assert found.key == "/authors/OL1A"
+        assert found["remote_ids"] == {"viaf": "1", "project_gutenberg": "975"}
+
+    def test_second_match_remote_identifier(self, mock_site):
+        """
+        Next highest priority match is any other remote identifier, such as VIAF, Goodreads ID, Amazon ID, etc.
+        """
+
+        # Author with VIAF
+        author = {
+            "name": "William H. Brewer",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+            "remote_ids": {"viaf": "12345678"},
+        }
+
+        # Another author with VIAF
+        author_different_viaf = {
+            "name": "William Brewer",
+            "key": "/authors/OL4A",
+            "type": {"key": "/type/author"},
+            "remote_ids": {"viaf": "87654321"},
+        }
+
+        mock_site.save(author)
+        mock_site.save(author_different_viaf)
+
+        # Look for exact match on VIAF, regardless of name field.
+        searched_author = {
+            "name": "William Brewer",
+            "remote_ids": {"viaf": "12345678"},
+        }
+        found = author_import_record_to_author(searched_author)
+        assert found.key == author["key"]
+
+    def test_third_match_priority_name_and_dates(self, mock_site):
+        """
+        Next highest priority match is name, birth date, and death date.
+        """
+        # Exact name match with no birth or death date
+        author = {
+            "name": "William H. Brewer",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+        }
+
+        # An alternate name is an exact match.
+        author_alternate_name = {
+            "name": "William Brewer",
+            "key": "/authors/OL4A",
+            "alternate_names": ["William H. Brewer"],
+            "type": {"key": "/type/author"},
+        }
+
+        # Exact name, birth, and death date matches.
+        author_with_birth_and_death = {
+            "name": "William H. Brewer",
+            "key": "/authors/OL5A",
+            "type": {"key": "/type/author"},
+            "birth_date": "1829",
+            "death_date": "1910",
+        }
+        mock_site.save(author)
+        mock_site.save(author_alternate_name)
+        mock_site.save(author_with_birth_and_death)
+
+        # Look for exact match on author name and date.
+        searched_author = {
+            "name": "William H. Brewer",
+            "birth_date": "1829",
+            "death_date": "1910",
+        }
+        found = author_import_record_to_author(searched_author)
+        assert found.key == author_with_birth_and_death["key"]
+
+    def test_duplicate_candidates_are_deduplicated(self, mock_site, monkeypatch):
+        """
+        Regression test for #13015: if the same candidate author is found via
+        multiple name queries (e.g. matched on both its name and an alternate
+        name), it must be deduplicated. Otherwise it's appended twice to the
+        match list, incorrectly triggering pick_from_matches() even though
+        there's only one real candidate.
+        """
+        existing_author = {
+            "name": "William Brewer",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+            "alternate_names": ["Bill Brewer"],
+            "birth_date": "1829",
+            "death_date": "1910",
+        }
+        mock_site.save(existing_author)
+
+        # Both the primary name and the alternate name below match the SAME
+        # existing author record above, via two separate query iterations.
+        searched_author = {
+            "name": "William Brewer",
+            "alternate_names": ["Bill Brewer"],
+            "birth_date": "1829",
+            "death_date": "1910",
+        }
+
+        def fail_if_called(author, matches):
+            raise AssertionError("pick_from_matches() should not be called when only one unique candidate exists — deduplication must have failed.")
+
+        # pick_from_matches() is only invoked when there's more than one
+        # *unique* candidate — patch it to fail the test if dedup didn't happen.
+        monkeypatch.setattr(load_book, "pick_from_matches", fail_if_called)
+
+        found = load_book.find_author(searched_author)
+        assert len(found) == 1
+        assert found[0].key == existing_author["key"]
+
+    def test_non_matching_birth_death_creates_new_author(self, mock_site):
+        """
+        If a year in birth or death date isn't an exact match, create a new record,
+        other things being equal.
+        """
+        author_with_birth_and_death = {
+            "name": "William H. Brewer",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+            "birth_date": "1829",
+            "death_date": "1910",
+        }
+        mock_site.save(author_with_birth_and_death)
+
+        searched_and_not_found_author = {
+            "name": "William H. Brewer",
+            "birth_date": "1829",
+            "death_date": "1911",
+        }
+        found = author_import_record_to_author(searched_and_not_found_author)
+        assert isinstance(found, dict)
+        assert found["death_date"] == searched_and_not_found_author["death_date"]
+
+    def test_match_priority_alternate_names_and_dates(self, mock_site):
+        """
+        Matching, as a unit, alternate name, birth date, and death date, get
+        second match priority.
+        """
+        self.add_three_existing_authors(mock_site)
+
+        # No exact name match.
+        author = {
+            "name": "Фёдор Михайлович Достоевский",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+        }
+
+        # Alternate name match with no birth or death date
+        author_alternate_name = {
+            "name": "Фёдор Михайлович Достоевский",
+            "key": "/authors/OL4A",
+            "alternate_names": ["Fyodor Dostoevsky"],
+            "type": {"key": "/type/author"},
+        }
+
+        # Alternate name match with matching birth and death date.
+        author_alternate_name_with_dates = {
+            "name": "Фёдор Михайлович Достоевский",
+            "key": "/authors/OL5A",
+            "alternate_names": ["Fyodor Dostoevsky"],
+            "type": {"key": "/type/author"},
+            "birth_date": "1821",
+            "death_date": "1881",
+        }
+        mock_site.save(author)
+        mock_site.save(author_alternate_name)
+        mock_site.save(author_alternate_name_with_dates)
+
+        searched_author = {
+            "name": "Fyodor Dostoevsky",
+            "birth_date": "1821",
+            "death_date": "1881",
+        }
+        found = author_import_record_to_author(searched_author)
+        assert isinstance(found, Author)
+        assert found.key == author_alternate_name_with_dates["key"]
+
+        # Expect author match on incoming alternate name (comma flipped also):
+        searched_author = {
+            "name": "Фёдор Д.",
+            "alternate_names": ["Dostoevsky, Fyodor"],
+            "birth_date": "1821",
+            "death_date": "1881",
+        }
+        found = author_import_record_to_author(searched_author)
+        assert isinstance(found, Author)
+        assert found.key == author_alternate_name_with_dates["key"]
+
+    def test_last_match_on_surname_and_dates(self, mock_site):
+        """
+        The lowest priority match is an exact surname match + birth and death date matches.
+        """
+        author = {
+            "name": "William Brewer",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+            "birth_date": "1829",
+            "death_date": "1910",
+        }
+        mock_site.save(author)
+
+        searched_author = {
+            "name": "Mr. William H. brewer",
+            "birth_date": "1829",
+            "death_date": "1910",
+        }
+        found = author_import_record_to_author(searched_author)
+        assert found.key == author["key"]
+
+        # But non-exact birth/death date doesn't match.
+        searched_author = {
+            "name": "Mr. William H. brewer",
+            "birth_date": "1829",
+            "death_date": "1911",
+        }
+        found = author_import_record_to_author(searched_author)
+        # No match, so create a new author.
+        assert found == {
+            "type": {"key": "/type/author"},
+            "name": "Mr. William H. brewer",
+            "birth_date": "1829",
+            "death_date": "1911",
+        }
+
+    def test_last_match_on_surname_and_dates_and_dates_are_required(self, mock_site):
+        """
+        Like above, but ensure dates must exist for this match (so don't match on
+        falsy dates).
+        """
+        author = {
+            "name": "William Brewer",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+        }
+        mock_site.save(author)
+
+        searched_author = {
+            "name": "Mr. William J. Brewer",
+            "alternate_names": ["Bill Brewer"],
+        }
+        found = author_import_record_to_author(searched_author)
+        # No match, so a new author is created.
+        assert found == {
+            "name": "Mr. William J. Brewer",
+            "alternate_names": ["Bill Brewer"],
+            "type": {"key": "/type/author"},
+        }
+
+    def test_birth_and_death_date_match_is_on_year_strings(self, mock_site):
+        """
+        The lowest priority match is an exact surname match + birth and death date matches,
+        as shown above, but additionally, use only years on *both* sides, and only for four
+        digit years.
+        """
+        author = {
+            "name": "William Brewer",
+            "key": "/authors/OL3A",
+            "type": {"key": "/type/author"},
+            "birth_date": "September 14th, 1829",
+            "death_date": "11/2/1910",
+        }
+        mock_site.save(author)
+
+        searched_author = {
+            "name": "Mr. William H. brewer",
+            "birth_date": "1829-09-14",
+            "death_date": "November 1910",
+        }
+        found = author_import_record_to_author(searched_author)
+        assert found.key == author["key"]

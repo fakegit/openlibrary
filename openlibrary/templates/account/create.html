@@ -1,75 +1,114 @@
-$def with (form)
+$def with (form, pd_options=[])
+
+$putctx("cssfile", "signup")
+
+$ i18n_strings = {
+    $ "invalid_email_format": _("Must be a valid email address"),
+    $ "username_length_err": _("Must be between 3 and 20 characters"),
+    $ "username_char_err": _("Username may only contain numbers, letters, - or _"),
+    $ "password_length_err": _("Must be between 3 and 20 characters"),
+    $ "missing_pda_err": _("A qualifying program must be selected"),
+    $ "loading_text": _("Loading...")
+    $ }
 
 $# :param openlibrary.plugins.upstream.forms.RegisterForm form:
 
 $var title: $_("Sign Up to Open Library")
 
-<div id="contentHead">
-    <h1>$_("Sign Up")</h1>
-    $if not ctx.user:
-        <p class="instruct">$_("Complete the form below to create a new Internet Archive account.")
-        <span class="attn remind">$_("Each field is required")</span></p>
-</div>
-
-<div id="contentBody">
-
-$def field(input, suffix=''):
-    $# :param openlibrary.utils.form.Input input:
-    $# :param str suffix: HTML to put at bottom of input
-
-    <div class="formElement">
-        <div class="label">
-            <label for="$input.id">$input.description</label>
-            $if input.help:
-                <span class="smaller lighter">$input.help</span>
-        </div>
-        <div class="input">
-            $:input.render()
-            <span class="invalid clearfix" id="$(input.id)Message">$input.note</span>
-            <span class="sansserif smaller lighter">$:suffix</span>
-        </div>
+<div class="ol-page-signup">
+    <div id="contentHead" class="ol-signup-hero">
+        <h1 class="ol-signup-hero__title">$_("Sign Up")</h1>
+        <p class="ol-signup-hero__subtitle">$_("Get your free Open Library card and borrow digital books from the nonprofit Internet Archive")</p>
     </div>
 
-$if ctx.user:
-    $def user_link(): <a href="$ctx.user.key">$ctx.user.displayname</a>
-    <p>$:_("You are already logged into Open Library as %(user)s.", user=str(user_link()))</p>
-    <p>$:_('If you\'d like to create a new, different Open Library account, you\'ll need to <a href="javascript:;" onclick="document.forms[\'logout\'].submit()">log out</a> and start the signup process afresh.')</p>
-$else:
-    <form class="olform create validate" name="signup" method="post" action="">
-        $if form.note:
-            <div class="note">$form.note</div>
+    <div id="contentBody" class="ol-signup-form">
 
-        $def screenname_url(): $_('Your URL'): https://openlibrary.org/people/<span id="userUrl">$(form.username.value or _('screenname'))</span>
+    $if not ctx.user:
+        $:render_template("account/ia_thirdparty_logins")
+        <div class="ol-signup-form__big-or">$_('OR')</div>
 
-        $:field(form.email)
-        $:field(form.username, suffix=str(screenname_url()))
-        $:field(form.password)
-        $:field(form.password2)
+    $def field(input, suffix=''):
+        $# :param openlibrary.utils.form.Input input:
+        $# :param str suffix: HTML to put at bottom of input
 
-        <br/>
-        <label>
-            $:form.ia_newsletter.render() $:form.ia_newsletter.description
-        </label>
-
-        <hr/>
-
-        $if form.has_recaptcha:
-            <div class="formElement">
-                <div class="label smaller lighter">$_("If you have security settings or privacy blockers installed, please disable them to see the reCAPTCHA.")</div>
-                <div class="g-recaptcha" data-sitekey="$form['recaptcha'].public_key"></div>
-                <div class="input">
-                    $if form['recaptcha'].error:
-                        <span class="invalid clearfix">$_('Incorrect. Please try again.')</span>
-                </div>
+        <div class="formElement ol-signup-form__input ol-signup-form__input--$(input.id)">
+            <div class="label">
+                <label for="$input.id">$input.description</label>
+                $if input.help:
+                    <div class="ol-signup-form__note">$input.help</div>
             </div>
-
-        <small>$:_("By signing up, you agree to the Internet Archive's <a href='//archive.org/about/terms.php' target='_blank'>Terms of Service</a>.")</small>
-
-        <div class="formElement bottom">
-            <br/>
-            <button type="submit" name="signup" id="signup" class="larger">$_("Sign Up")</button>
-            <a href="javascript:history.go(-1);" class="smaller attn">$_("Cancel")</a>
+            <div class="ol-signup-form__error" id="$(input.id)Message">$input.note</div>
+            <div class="input">
+                $:input.render()
+                $if input.name == 'password':
+                    <a href="javascript:;" class="password-visibility-toggle ol-signup-form__icon-wrap">
+                        $:macros.icon("eye-off", label=_('Toggle Password Visibility'))
+                    </a>
+                $else:
+                    <div class="ol-signup-form__icon-wrap">
+                        <img src="/static/images/bubble-loader.svg" class="ol-signup-form__icon ol-signup-form__icon--loading" title="$_('Loading...')" alt="$_('Loading...')" style="display:none"/>
+                        $# Wrapped so signup.js can keep show()/hide()-ing a single element:
+                        $# jQuery toggles the inline style, which the macro cannot emit.
+                        <span class="ol-signup-form__icon ol-signup-form__icon--success" style="display:none">$:macros.icon("circle-check", label=_('Success!'))</span>
+                    </div>
+            </div>
+            <div class="ol-signup-form__suffix">$:suffix</div>
         </div>
-    </form>
 
+
+    $if ctx.user:
+        $def user_link(): <a href="$ctx.user.key">$ctx.user.displayname</a>
+        <p>$:_("You are already logged into Open Library as %(user)s.", user=str(user_link()))</p>
+        <p>$:_('If you\'d like to create a new, different Open Library account, you\'ll need to <a href="javascript:;" onclick="document.forms[\'hamburger-logout\'].submit()">log out</a> and start the signup process afresh.')</p>
+    $else:
+        <form id="register" class="olform create create-form" name="signup" method="post" data-i18n="$json_encode(i18n_strings)" action="">
+            $if form.note:
+                <div class="flash-messages">
+                    <div class="error ol-signup-form__info-box">
+                        <span>
+                            $:form.note
+                        </span>
+                    </div>
+                </div>
+
+            $def screenname_url(): $_('Your URL'): https://openlibrary.org/people/<span id="userUrl">$(form.username.value or _('screenname'))</span>
+
+            $:field(form.email)
+            $:field(form.username, suffix=str(screenname_url()))
+            $:field(form.password)
+
+            <div class="ol-signup-form__checkbox">
+                <input type="checkbox" id="ia_newsletter" name="ia_newsletter"/>
+                <label for="ia_newsletter">$:_('I want to receive news, announcements, and resources from the <a href="https://archive.org/">Internet Archive</a>, the non-profit that runs Open Library.')</label>
+            </div>
+            <div id="rpd-checkbox" class="ol-signup-form__checkbox">
+                <input type="checkbox" id="pd-request" name="pd_request" aria-expanded="false" aria-controls="pda-selector"/>
+                <label for="pd-request" id="pd-request-label">$:_('I want to apply* for <a href="https://help.archive.org/help/program-overview/" target="_blank" rel="noopener noreferrer">special print disability access</a> through a qualifying program.')</label>
+            </div>
+            <div id="pda-selector" class="ol-signup-form__select hidden" role="region" aria-labelledby="pd-request-label" aria-hidden="true">
+                <div class="ol-signup-form__error" id="pd_programMessage" role="alert" aria-live="polite" aria-atomic="true"></div>
+                <select id="pd_program" name="pd_program" aria-label="$_('Select qualifying program')" aria-describedby="pd-program-advisory" aria-invalid="false" aria-required="false">
+                    <option value="" disabled selected>$_("Select qualifying program")</option>
+                    $for option in pd_options:
+                        <option value="$option.value" label="$option.label"></option>
+                </select>
+                <span class="email-advisory" id="pd-program-advisory">$_("* Please use the email address associated with this qualifying program. You will receive an email after activation with next steps.")</span>
+            </div>
+            <input type="hidden" id="secret" value="" name="secret" />
+            <input type="hidden" id="access" value="" name="access" />
+            <div class="formElement bottom">
+                <br/>
+                <button type="submit" name="signup" id="signup" class="cta-btn cta-btn--primary">$_("Sign Up with Email")</button>
+                <small class="ol-signup-form__tos">$:_('By signing up, you agree to the Internet Archive\'s <a class="ol-signup-form__link" href="//archive.org/about/terms.php" target="_blank" rel="noopener noreferrer">Terms of Service</a>.')</small>
+                <p class="ol-signup-form__login-hint">$:_('Already have an account? <a href="/account/login">Log in</a>')</p>
+                $ sitekey = classes = callback = ''
+                $if form.has_recaptcha:
+                    $ callback = "data-callback=submitCreateAccountForm"
+                    $ classes = 'g-recaptcha'
+                    $ sitekey = "data-sitekey=%s" % form['recaptcha'].public_key
+                    $:render_template("recaptcha", form['recaptcha'].public_key, error=None, invisible=True)
+                    <div class="$classes" $sitekey $callback data-size="invisible"></div>
+            </div>
+        </form>
+    </div>
 </div>

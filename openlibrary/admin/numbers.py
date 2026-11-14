@@ -6,45 +6,46 @@ All functions prefixed with `admin_range__` will be run for each day and the
 result will be stored as the part after it. e.g. the result of
 admin_range__foo will be stored under the key `foo`.
 
-All functions prefixed with `admin_delta__` will be run for the current
-day and the result will be stored as the part after it. e.g. the
-result of `admin_delta__foo` will be stored under the key `foo`.
-
 All functions prefixed with `admin_total__` will be run for the current
 day and the result will be stored as `total_<key>`. e.g. the result of
-`admin_total__foo` will be stored under the key `total__foo`.
+`admin_total__foo` will be stored under the key `total_foo`.
 
 Functions with names other than the these will not be called from the
 main harness. They can be utility functions.
 
 """
-import calendar
+
 import functools
 import logging
-import requests
-import tempfile
+from datetime import timedelta
 
-import web
+from openlibrary.utils.request_context import site
 
 logger = logging.getLogger(__name__)
 
-class InvalidType(TypeError): pass
-class NoStats(TypeError): pass
 
-sqlitefile = None
+class InvalidType(TypeError):
+    pass
+
+
+class NoStats(TypeError):
+    pass
+
 
 # Utility functions
 def query_single_thing(db, typ, start, end):
     "Query the counts a single type from the things table"
     q1 = "SELECT id as id from thing where key=$typ"
-    typ = '/type/%s'%typ
+    typ = f"/type/{typ}"
     result = db.query(q1, vars=locals())
     try:
         kid = result[0].id
     except IndexError:
-        raise InvalidType("No id for type '/type/%s in the datbase"%typ)
-    q2 = "select count(*) as count from thing where type=%d and created >= '%s' and created < '%s'"% (kid, start, end)
-    result = db.query(q2)
+        raise InvalidType(f"No id for type '/type/{typ} in the database")
+
+    q2 = "SELECT count(*) as count FROM thing WHERE type=$type_id AND created >= $start_date AND created < $end_date"
+    result = db.query(q2, vars={"type_id": kid, "start_date": start, "end_date": end})
+
     count = result[0].count
     return count
 
@@ -55,131 +56,432 @@ def single_thing_skeleton(**kargs):
     `type` is partially applied for admin__[work, edition, user, author, list].
     """
     try:
-        typ   = kargs['type']
-        start = kargs['start'].strftime("%Y-%m-%d")
-        end   = kargs['end'].strftime("%Y-%m-%d %H:%M:%S")
-        db    = kargs['thingdb']
+        typ = kargs["type"]
+        start = kargs["start"].strftime("%Y-%m-%d")
+        end = kargs["end"].strftime("%Y-%m-%d %H:%M:%S")
+        db = kargs["thingdb"]
     except KeyError as k:
-        raise TypeError("%s is a required argument for admin_range__%s"%(k, typ))
+        raise TypeError(f"{k} is a required argument for admin_range__{typ}")
     return query_single_thing(db, typ, start, end)
 
 
-# Public functions that are used by stats.py
-def admin_range__human_edits(**kargs):
-    """Calculates the number of edits between the `start` and `end`
-    parameters done by humans. `thingdb` is the database.
+cached_bot_accounts = None
+
+
+def get_bot_accounts(thingdb=None) -> list[int]:
     """
+    Returns a list of all `thing` table IDs that are associated with
+    bot accounts.
+    """
+    bot_query = """
+        SELECT id
+        FROM thing
+        WHERE key IN (
+          SELECT REPLACE(key, 'account/', '/people/')
+          FROM store
+          WHERE id IN (
+            SELECT store_id
+            FROM store_index
+            WHERE type = 'account'
+              AND name = 'bot'
+              AND value <> 'false'
+          )
+        )
+    """
+    oldb = thingdb
+    return [item.get("id") for item in list(oldb.query(bot_query))]
+
+
+def _get_cached_bot_accounts(thingdb=None) -> list[int]:
+    """
+    Returns a list of `thing` table IDs that are associated with
+    bot accounts.
+
+    Results are cached in the global `cached_bot_accounts`
+    variable.  If this variable is not set, the `get_bot_accounts`
+    function is used to fetch these identifiers.
+    """
+    global cached_bot_accounts
+    if cached_bot_accounts is None:
+        cached_bot_accounts = get_bot_accounts(thingdb=thingdb)
+    return cached_bot_accounts
+
+
+# Public functions that are used by stats.py
+def _count_transactions(db, start, end, where="", **vars):
+    "Transactions between `start` and `end`, narrowed by `where` (an SQL fragment using `vars`)."
+    sql = f"SELECT count(t.id) AS count FROM transaction t WHERE t.created >= $start and t.created < $end{where}"
+    return db.query(sql, vars={"start": start, "end": end, **vars})[0].count
+
+
+def _range_args(fn_name, kargs):
     try:
-        start = kargs['start'].strftime("%Y-%m-%d")
-        end   = kargs['end'].strftime("%Y-%m-%d %H:%M:%S")
-        db    = kargs['thingdb']
+        return kargs["thingdb"], kargs["start"].strftime("%Y-%m-%d"), kargs["end"].strftime("%Y-%m-%d %H:%M:%S")
     except KeyError as k:
-        raise TypeError("%s is a required argument for admin_range__human_edits"%k)
-    q1 = "SELECT count(*) AS count FROM transaction WHERE created >= '%s' and created < '%s'"% (start, end)
-    result = db.query(q1)
-    total_edits = result[0].count
-    q1 = "SELECT count(DISTINCT t.id) AS count FROM transaction t, version v WHERE v.transaction_id=t.id AND t.created >= '%s' and t.created < '%s' AND t.author_id IN (SELECT thing_id FROM account WHERE bot = 't')"% (start, end)
-    result = db.query(q1)
-    bot_edits = result[0].count
-    return total_edits - bot_edits
+        raise TypeError(f"{k} is a required argument for {fn_name}")
+
+
+def admin_range__human_edits(**kargs):
+    "Transactions by non-bot accounts between `start` and `end`, signups and all. See `admin_range__catalog_edits`."
+    db, start, end = _range_args("admin_range__human_edits", kargs)
+    bot_ids = _get_cached_bot_accounts(thingdb=db)
+    return _count_transactions(db, start, end, " AND t.author_id NOT IN $bot_ids", bot_ids=bot_ids)
+
 
 def admin_range__bot_edits(**kargs):
-    """Calculates the number of edits between the `start` and `end`
-    parameters done by bots. `thingdb` is the database.
-    """
+    "Transactions by bot accounts between `start` and `end`."
+    db, start, end = _range_args("admin_range__bot_edits", kargs)
+    bot_ids = _get_cached_bot_accounts(thingdb=db)
+    return _count_transactions(db, start, end, " AND t.author_id IN $bot_ids", bot_ids=bot_ids)
+
+
+# Transactions that aren't edits to the catalog. Every signup writes a `new-account`
+# transaction, and at ~10k signups a day they outnumber real edits several times over.
+NON_EDIT_ACTIONS = (
+    "new-account",
+    "register",
+    "create-stats",
+    "edit-blocked-ips",
+    "edit-usergroup-add-member",
+    "edit-usergroup-delete-member",
+    "bulk-edit-permissions",
+)
+
+
+def admin_range__catalog_edits(**kargs):
+    """Human edits that change the catalog: `admin_range__human_edits` without signups and admin
+    housekeeping. A separate key so the daily docs written before it existed keep their meaning."""
+    db, start, end = _range_args("admin_range__catalog_edits", kargs)
+    bot_ids = _get_cached_bot_accounts(thingdb=db)
+    return _count_transactions(
+        db, start, end, " AND t.action NOT IN $non_edit_actions AND t.author_id NOT IN $bot_ids", bot_ids=bot_ids, non_edit_actions=NON_EDIT_ACTIONS
+    )
+
+
+# Someone making or changing a list; `edit-list-seeds` is a save of what's on it.
+LIST_EDIT_ACTIONS = ("create-list", "edit-list-seeds")
+
+
+def admin_range__list_edits(**kargs):
+    "Counts lists created or edited between `start` and `end`."
+    db, start, end = _range_args("admin_range__list_edits", kargs)
+    return _count_transactions(db, start, end, " AND t.action IN $list_edit_actions", list_edit_actions=LIST_EDIT_ACTIONS)
+
+
+# A changeset that touches a book, work or author record, whatever its action name.
+CATALOG_CHANGE = '"/(books|works|authors)/OL'
+# `data.source` on Tasks saves; matches `openlibrary.contribute.save.SOURCE`. Infogami indexes it in `transaction_index`.
+TASKS_SOURCE = "contribute"
+
+
+def _window_args(fn_name, kargs, days):
+    """The `days` before `end`: rolling windows, since distinct editors don't add up across days.
+
+    `days=1` is the calendar day the gatherer hands in as `start`..`end`, like the other daily keys. For today's hourly
+    run that is midnight to now; a window ending at `end` would be the last 24 hours instead, and a bar per day would
+    double-count the evening before."""
+    if days == 1:
+        return _range_args(fn_name, kargs)
     try:
-        start = kargs['start'].strftime("%Y-%m-%d")
-        end   = kargs['end'].strftime("%Y-%m-%d %H:%M:%S")
-        db    = kargs['thingdb']
+        db, end = kargs["thingdb"], kargs["end"]
     except KeyError as k:
-        raise TypeError("%s is a required argument for admin_range__bot_edits"%k)
-    q1 = "SELECT count(*) AS count FROM transaction t, version v WHERE v.transaction_id=t.id AND t.created >= '%s' and t.created < '%s' AND t.author_id IN (SELECT thing_id FROM account WHERE bot = 't')"% (start, end)
-    result = db.query(q1)
-    count = result[0].count
-    return count
+        raise TypeError(f"{k} is a required argument for {fn_name}")
+    return db, (end - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _count_editors(db, since, end, where="", **vars):
+    "Signed-in, non-bot accounts with a catalog change between `since` and `end`, narrowed by `where`."
+    # `NOT IN ()` is a syntax error, and a dev database may have no bots.
+    bot_ids = _get_cached_bot_accounts(thingdb=db)
+    not_bot = " AND t.author_id NOT IN $bot_ids" if bot_ids else ""
+    sql = f"""
+        WITH editors AS (
+            SELECT DISTINCT t.author_id FROM transaction t
+            WHERE t.created >= $since AND t.created < $end AND t.author_id IS NOT NULL{not_bot} AND t.changes ~ $catalog_change
+        )
+        SELECT count(*) AS count FROM editors e WHERE true{where}
+    """
+    vars = {"since": since, "end": end, "bot_ids": bot_ids, "catalog_change": CATALOG_CHANGE, **vars}
+    return db.query(sql, vars=vars)[0].count
+
+
+def catalog_editors(days, **kargs):
+    "Accounts that changed a catalog record in the `days` before `end`."
+    db, since, end = _window_args(f"admin_range__catalog_editors_{days}d", kargs, days)
+    return _count_editors(db, since, end)
+
+
+def new_catalog_editors(days, **kargs):
+    "Of `catalog_editors`, those whose first catalog change ever falls in the window."
+    db, since, end = _window_args(f"admin_range__new_catalog_editors_{days}d", kargs, days)
+    earlier = " AND NOT EXISTS (SELECT 1 FROM transaction p WHERE p.author_id = e.author_id AND p.created < $since AND p.changes ~ $catalog_change)"
+    return _count_editors(db, since, end, earlier)
+
+
+TASKS_SAVES = "SELECT tx_id FROM transaction_index WHERE key = 'source' AND value = $tasks_source"
+
+
+def _count_tasks_editors(db, since, end):
+    sql = f"SELECT count(DISTINCT t.author_id) AS count FROM transaction t WHERE t.created >= $since AND t.created < $end AND t.id IN ({TASKS_SAVES})"
+    return db.query(sql, vars={"since": since, "end": end, "tasks_source": TASKS_SOURCE})[0].count
+
+
+def tasks_editors(days, **kargs):
+    "Accounts that saved from the Tasks page in the `days` before `end`."
+    db, since, end = _window_args(f"admin_range__tasks_editors_{days}d", kargs, days)
+    return _count_tasks_editors(db, since, end)
+
+
+def tasks_saves(days, **kargs):
+    "Saves made from the Tasks page in the `days` before `end`."
+    db, since, end = _window_args(f"admin_range__tasks_saves_{days}d", kargs, days)
+    return _count_transactions(db, since, end, f" AND t.id IN ({TASKS_SAVES})", tasks_source=TASKS_SOURCE)
+
+
+# The `_1d` keys are what a bar-per-day chart plots; the 7d and 28d windows stay for the headline numbers, and a
+# week or month view samples them at the end of each period.
+admin_range__catalog_editors_1d = functools.partial(catalog_editors, 1)
+admin_range__catalog_editors_7d = functools.partial(catalog_editors, 7)
+admin_range__catalog_editors_28d = functools.partial(catalog_editors, 28)
+admin_range__new_catalog_editors_1d = functools.partial(new_catalog_editors, 1)
+admin_range__new_catalog_editors_7d = functools.partial(new_catalog_editors, 7)
+admin_range__new_catalog_editors_28d = functools.partial(new_catalog_editors, 28)
+admin_range__tasks_editors_1d = functools.partial(tasks_editors, 1)
+admin_range__tasks_editors_7d = functools.partial(tasks_editors, 7)
+admin_range__tasks_editors_28d = functools.partial(tasks_editors, 28)
+admin_range__tasks_saves_1d = functools.partial(tasks_saves, 1)
+admin_range__tasks_saves_28d = functools.partial(tasks_saves, 28)
+
+
+def admin_range__tasks_saves_by_field_1d(**kargs):
+    "The day's Tasks saves by the field they filled, e.g. `{'number_of_pages': 7, 'covers': 2}`. Stored as a dict."
+    db, start, end = _range_args("admin_range__tasks_saves_by_field_1d", kargs)
+    sql = f"""
+        SELECT t.data::json->>'field' AS field, count(*) AS count FROM transaction t
+        WHERE t.created >= $start AND t.created < $end AND t.id IN ({TASKS_SAVES})
+        GROUP BY 1
+    """
+    rows = db.query(sql, vars={"start": start, "end": end, "tasks_source": TASKS_SOURCE})
+    return {row.field: row.count for row in rows if row.field}
+
+
+def admin_range__tasks_saves_by_initiative_1d(**kargs):
+    """The day's Tasks saves by the initiative they count toward, e.g. `{'most-read-2026-11': 9}`. Stored as a dict.
+    A save from before saves named their initiative is left out."""
+    db, start, end = _range_args("admin_range__tasks_saves_by_initiative_1d", kargs)
+    sql = f"""
+        SELECT t.data::json->>'initiative' AS initiative, count(*) AS count FROM transaction t
+        WHERE t.created >= $start AND t.created < $end AND t.id IN ({TASKS_SAVES})
+        GROUP BY 1
+    """
+    rows = db.query(sql, vars={"start": start, "end": end, "tasks_source": TASKS_SOURCE})
+    return {row.initiative: row.count for row in rows if row.initiative}
+
+
+# Initiative counts. The frozen edition lists and the not-found marks live in the store, so these read through
+# `web.ctx.site`, which `stats.setup_ol_config` provides, rather than through `thingdb`.
+def _initiative():
+    from openlibrary.contribute import initiatives
+
+    return initiatives
+
+
+# How far back to look for an ended initiative's last snapshot, so a few nights the job missed don't drop it.
+LAST_SNAPSHOT_DAYS = 14
+
+
+def _last_snapshot(slug: str, before) -> dict | None:
+    """The initiative's figures in the newest count doc before ``before``, or None if none in ``LAST_SNAPSHOT_DAYS`` has them."""
+    from openlibrary.core.admin import initiative_counts
+
+    for days in range(1, LAST_SNAPSHOT_DAYS + 1):
+        if (doc := site.get().store.get((before - timedelta(days=days)).strftime("counts-%Y-%m-%d"))) and (snap := initiative_counts(doc).get(slug)):
+            return snap
+    return None
+
+
+def _initiative_people(db, initiative, since: str, end: str) -> int:
+    """Accounts that saved for ``initiative`` from ``since`` to ``end``. A save names its initiative; one from before saves did
+    is matched by its field, which no two initiatives shared then."""
+    sql = f"""
+        SELECT count(DISTINCT t.author_id) AS count FROM transaction t
+        WHERE t.created >= $since AND t.created < $end AND t.id IN ({TASKS_SAVES})
+          AND COALESCE(t.data::json->>'initiative' = $slug, t.data::json->>'field' IN $fields)
+    """
+    vars = {"since": since, "end": end, "tasks_source": TASKS_SOURCE, "slug": initiative.slug, "fields": list(initiative.fields)}
+    return db.query(sql, vars=vars)[0].count
+
+
+def admin_range__initiatives(**kargs):
+    """Every initiative's progress as of now, by slug: details still open, editions done, details nobody could find, editions
+    on the list, and people who have saved for it since the list was frozen. Stored as a dict, so an initiative added to the
+    registry is counted from the next run, with nothing to set up. Read with `openlibrary.core.admin.initiative_counts`.
+
+    Only for today: a snapshot has no history, and the backfill loop would otherwise stamp today's figures onto every past
+    day. An initiative whose list the web app hasn't frozen yet is left out; this never picks one."""
+    try:
+        start, end = kargs["start"], kargs["end"]
+    except KeyError as k:
+        raise TypeError(f"{k} is a required argument for admin_range__initiatives")
+    # Only the run's first window, which ends at "now", is shorter than a day. Checking the clock instead would
+    # skip the snapshot when a run that started before midnight gets here after it.
+    if end - start >= timedelta(days=1):
+        raise NoStats
+    db, _start, end_str = _range_args("admin_range__initiatives", kargs)
+    initiatives = _initiative()
+    counts = {}
+    # Read fresh, not through the web app's cache. One that ended before this day keeps its last snapshot, carried
+    # into today's doc so pages reading only the last few days still find its final figures.
+    for initiative in initiatives.started(initiatives.read_definitions(site.get())):
+        if initiative.ends_at and initiative.ends_at.replace(tzinfo=None) < start:
+            if last := _last_snapshot(initiative.slug, start):
+                counts[initiative.slug] = last
+            continue
+        if not (frozen := site.get().store.get(initiative.store_key)):
+            continue
+        p = initiatives.progress(initiatives.gaps_for(frozen["editions"], site.get()), initiative.fields, initiative.start)
+        counts[initiative.slug] = {
+            "open": p["open"],
+            "done": p["done"],
+            "not_found": p["not_found"],
+            "editions": p["total"],
+            "percent": p["percent"],
+            "people": _initiative_people(db, initiative, frozen["frozen_at"], end_str),
+        }
+    if not counts:
+        raise NoStats
+    return counts
+
+
+# Tasks saves from $since to $end whose value the record no longer holds; the caller writes the SELECT list.
+TASKS_SAVES_UNDONE = f"""
+    FROM transaction t
+    JOIN thing th ON th.key = t.changes::json->0->>'key'
+    JOIN data saved ON saved.thing_id = th.id AND saved.revision = (t.changes::json->0->>'revision')::int
+    JOIN data latest ON latest.thing_id = th.id AND latest.revision = th.latest_revision
+    WHERE t.created >= $since AND t.created < $end AND t.id IN ({TASKS_SAVES})
+      AND latest.data::jsonb->'type' = saved.data::jsonb->'type'
+      AND NOT COALESCE((latest.data::jsonb -> (t.data::json->>'field')) @> (saved.data::jsonb -> (t.data::json->>'field')), false)
+"""
+
+
+def admin_range__tasks_saves_undone_28d(**kargs):
+    """Tasks saves in the 28 days before `end` whose value the record no longer holds, by undo, revert or a later edit.
+
+    Checked against the record as it is when this runs. Merged or deleted records are left out.
+    """
+    db, since, end = _window_args("admin_range__tasks_saves_undone_28d", kargs, 28)
+    sql = f"SELECT count(*) AS count {TASKS_SAVES_UNDONE}"
+    return db.query(sql, vars={"since": since, "end": end, "tasks_source": TASKS_SOURCE})[0].count
+
+
+def admin_range__tasks_saves_by_initiative_28d(**kargs):
+    """Each initiative's Tasks saves in the 28 days before `end`, as `{slug: {"saves": n, "undone": n}}`: how many, and how
+    many of those the record no longer holds, counted as `tasks_saves_undone_28d` does. Stored as a dict."""
+    db, since, end = _window_args("admin_range__tasks_saves_by_initiative_28d", kargs, 28)
+    vars = {"since": since, "end": end, "tasks_source": TASKS_SOURCE}
+    saves = f"""
+        SELECT t.data::json->>'initiative' AS initiative, count(*) AS count FROM transaction t
+        WHERE t.created >= $since AND t.created < $end AND t.id IN ({TASKS_SAVES})
+        GROUP BY 1
+    """
+    undone = f"SELECT t.data::json->>'initiative' AS initiative, count(*) AS count {TASKS_SAVES_UNDONE} GROUP BY 1"
+    counts = {row.initiative: {"saves": row.count, "undone": 0} for row in db.query(saves, vars=vars) if row.initiative}
+    for row in db.query(undone, vars=vars):
+        if row.initiative in counts:
+            counts[row.initiative]["undone"] = row.count
+    return counts
+
+
+# The fields the headline initiative offers; matches `openlibrary.contribute.initiatives.MOST_READ.fields`. Only the gatherer's own constants go into the SQL.
+TASKS_FIELDS = ("covers", "languages", "number_of_pages", "publishers")
+_cached_other_fills: dict[tuple[str, str], dict[str, int]] = {}
+
+
+def _other_fills(kargs) -> dict[str, int]:
+    """The guardrail's baseline: Tasks fields filled from empty on an edition by a person outside Tasks in the 28 days
+    before `end`, and how many of those values the record no longer holds. Checked like `tasks_saves_undone_28d`, so the
+    two rates compare. One query serves both keys."""
+    db, since, end = _window_args("admin_range__other_fills_28d", kargs, 28)
+    if (since, end) not in _cached_other_fills:
+        bot_ids = _get_cached_bot_accounts(thingdb=db)
+        not_bot = " AND t.author_id NOT IN $bot_ids" if bot_ids else ""
+        empty = "('null'::jsonb, '\"\"'::jsonb, '[]'::jsonb)"
+        fields = ", ".join(f"'{f}'" for f in TASKS_FIELDS)
+        sql = f"""
+            WITH edits AS (
+                SELECT c->>'key' AS key, (c->>'revision')::int AS revision
+                FROM transaction t, jsonb_array_elements(t.changes::jsonb) c
+                WHERE t.created >= $since AND t.created < $end AND t.author_id IS NOT NULL{not_bot}
+                  AND t.changes ~ $edition_change AND t.id NOT IN ({TASKS_SAVES}) AND c->>'key' LIKE $edition_key
+            ),
+            fills AS (
+                SELECT saved.data::jsonb -> f.field AS value, latest.data::jsonb -> f.field AS now
+                FROM edits e
+                JOIN thing th ON th.key = e.key
+                JOIN data saved ON saved.thing_id = th.id AND saved.revision = e.revision
+                JOIN data prev ON prev.thing_id = th.id AND prev.revision = e.revision - 1
+                JOIN data latest ON latest.thing_id = th.id AND latest.revision = th.latest_revision
+                CROSS JOIN unnest(ARRAY[{fields}]) AS f(field)
+                WHERE COALESCE(prev.data::jsonb -> f.field, 'null'::jsonb) IN {empty}
+                  AND COALESCE(saved.data::jsonb -> f.field, 'null'::jsonb) NOT IN {empty}
+                  AND latest.data::jsonb->'type' = saved.data::jsonb->'type'
+            )
+            SELECT count(*) AS filled, count(*) FILTER (WHERE NOT COALESCE(now @> value, false)) AS undone FROM fills
+        """
+        vars = {"since": since, "end": end, "bot_ids": bot_ids, "tasks_source": TASKS_SOURCE, "edition_change": '"/books/OL', "edition_key": "/books/OL%"}
+        row = db.query(sql, vars=vars)[0]
+        _cached_other_fills[(since, end)] = {"filled": row.filled, "undone": row.undone}
+    return _cached_other_fills[(since, end)]
+
+
+def admin_range__other_fills_28d(**kargs):
+    "Tasks fields filled from empty outside Tasks, by people, in the 28 days before `end`: the guardrail's baseline."
+    return _other_fills(kargs)["filled"]
+
+
+def admin_range__other_fills_undone_28d(**kargs):
+    "Of `other_fills_28d`, the values the record no longer holds, checked like `tasks_saves_undone_28d`."
+    return _other_fills(kargs)["undone"]
 
 
 def admin_range__covers(**kargs):
     "Queries the number of covers added between `start` and `end`"
     try:
-        start = kargs['start'].strftime("%Y-%m-%d")
-        end   = kargs['end'].strftime("%Y-%m-%d %H:%M:%S")
-        db    = kargs['coverdb']
+        start = kargs["start"].strftime("%Y-%m-%d")
+        end = kargs["end"].strftime("%Y-%m-%d %H:%M:%S")
+        db = kargs["coverdb"]
     except KeyError as k:
-        raise TypeError("%s is a required argument for admin_range__covers"%k)
-    q1 = "SELECT count(*) as count from cover where created>= '%s' and created < '%s'"% (start, end)
-    result = db.query(q1)
+        raise TypeError(f"{k} is a required argument for admin_range__covers")
+    # Match the parameterized form used by sibling admin_range__* helpers in
+    # this module (see admin_range__bot_edits). `start`
+    # and `end` are derived from `datetime.strftime` so they are not directly
+    # user-controllable today, but using `vars=` keeps this consistent with
+    # the parameterized convention and removes the f-string footgun if a
+    # future caller passes raw input.
+    q1 = "SELECT count(*) as count FROM cover WHERE created >= $start AND created < $end"
+    result = db.query(q1, vars={"start": start, "end": end})
     count = result[0].count
     return count
 
 
-admin_range__works    = functools.partial(single_thing_skeleton, type="work")
+admin_range__works = functools.partial(single_thing_skeleton, type="work")
 admin_range__editions = functools.partial(single_thing_skeleton, type="edition")
-admin_range__users    = functools.partial(single_thing_skeleton, type="user")
-admin_range__authors  = functools.partial(single_thing_skeleton, type="author")
-admin_range__lists    = functools.partial(single_thing_skeleton, type="list")
-admin_range__members  = functools.partial(single_thing_skeleton, type="user")
+admin_range__authors = functools.partial(single_thing_skeleton, type="author")
+admin_range__lists = functools.partial(single_thing_skeleton, type="list")
+admin_range__members = functools.partial(single_thing_skeleton, type="user")
 
-def admin_range__visitors(**kargs):
-    "Finds number of unique IPs to visit the OL website."
-    try:
-        date = kargs['start']
-    except KeyError as k:
-        raise TypeError("%s is a required argument for admin_range__visitors"%k)
-    global sqlitefile
-    if not sqlitefile:
-        sqlitefile = tempfile.mktemp(prefix="sqlite-")
-        url = "http://www.archive.org/download/stats/numUniqueIPsOL.sqlite"
-        logging.debug("  Downloading '%s'", url)
-        with open(sqlitefile, "wb") as f:
-            f.write(requests.get(url).content)
-    db = web.database(dbn="sqlite", db = sqlitefile)
-    d = date.replace(hour = 0, minute = 0, second = 0, microsecond = 0)
-    key = calendar.timegm(d.timetuple())
-    q = "SELECT value AS count FROM data WHERE timestamp = %d"%key
-    result = list(db.query(q))
-    if result:
-        return result[0].count
-    else:
-        logging.debug("  No statistics obtained for %s (%d)", date, key)
-        raise NoStats("No record for %s"%date)
-
-def admin_range__loans(**kargs):
-    """Finds the number of loans on a given day.
-
-    Loan info is written to infobase write log. Grepping through the log file gives us the counts.
-
-    WARNING: This script must be run on the node that has infobase logs.
-    """
-    try:
-        db = kargs['thingdb']
-        start = kargs['start']
-        end = kargs['end']
-    except KeyError as k:
-        raise TypeError("%s is a required argument for admin_total__ebooks"%k)
-    result = db.query(
-        "SELECT count(*) as count FROM stats" +
-        " WHERE type='loan'" +
-        "   AND created >= $start" +
-        "   AND created < $end",
-        vars=locals())
-    return result[0].count
 
 def admin_total__authors(**kargs):
-    db = kargs['thingdb']
+    db = kargs["thingdb"]
     return _count_things(db, "/type/author")
-
-def admin_total__subjects(**kargs):
-    # Anand - Dec 2014 - TODO
-    # Earlier implementation that uses couchdb is gone now
-    return 0
 
 
 def admin_total__lists(**kargs):
     try:
-        db    = kargs['thingdb']
+        db = kargs["thingdb"]
     except KeyError as k:
-        raise TypeError("%s is a required argument for admin_total__lists"%k)
+        raise TypeError(f"{k} is a required argument for admin_total__lists")
     # Computing total number of lists
     q1 = "SELECT id as id from thing where key='/type/list'"
     result = db.query(q1)
@@ -187,57 +489,44 @@ def admin_total__lists(**kargs):
         kid = result[0].id
     except IndexError:
         raise InvalidType("No id for type '/type/list' in the database")
-    q2 = "select count(*) as count from thing where type=%d"% kid
+    q2 = "select count(*) as count from thing where type=%d" % kid
     result = db.query(q2)
     total_lists = result[0].count
     return total_lists
 
 
 def admin_total__covers(**kargs):
-    db = kargs['coverdb']
+    db = kargs["coverdb"]
     return db.query("SELECT count(*) as count FROM cover")[0].count
 
+
 def admin_total__works(**kargs):
-    db = kargs['thingdb']
-    return _count_things(db, '/type/work')
+    db = kargs["thingdb"]
+    return _count_things(db, "/type/work")
+
 
 def admin_total__editions(**kargs):
-    db = kargs['thingdb']
-    return _count_things(db, '/type/edition')
+    db = kargs["thingdb"]
+    return _count_things(db, "/type/edition")
+
 
 def _count_things(db, type):
     type_id = db.where("thing", key=type)[0].id
     result = db.query("SELECT count(*) as count FROM thing WHERE type=$type_id", vars=locals())
     return result[0].count
 
+
 def _query_count(db, table, type, property, distinct=False):
     type_id = db.where("thing", key=type)[0].id
-    key_id = db.where('property', type=type_id, name=property)[0].id
+    key_id = db.where("property", type=type_id, name=property)[0].id
     if distinct:
-        what = 'count(distinct(thing_id)) as count'
+        what = "count(distinct(thing_id)) as count"
     else:
-        what = 'count(thing_id) as count'
-    result = db.select(table, what=what, where='key_id=$key_id', vars=dict(key_id=key_id))
+        what = "count(thing_id) as count"
+    result = db.select(table, what=what, where="key_id=$key_id", vars={"key_id": key_id})
     return result[0].count
 
-def admin_total__ebooks(**kargs):
-    # Anand - Dec 2014
-    # The following implementation is too slow. Disabling for now.
-    return 0
-
-    db = kargs['thingdb']
-    return _query_count(db, "edition_str", "/type/edition", "ocaid")
 
 def admin_total__members(**kargs):
-    db = kargs['thingdb']
-    return _count_things(db, '/type/user')
-
-def admin_delta__ebooks(**kargs):
-    # Anand - Dec 2014 - TODO
-    # Earlier implementation that uses couchdb is gone now
-    return 0
-
-def admin_delta__subjects(**kargs):
-    # Anand - Dec 2014 - TODO
-    # Earlier implementation that uses couchdb is gone now
-    return 0
+    db = kargs["thingdb"]
+    return _count_things(db, "/type/user")

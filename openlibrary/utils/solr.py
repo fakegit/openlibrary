@@ -2,144 +2,281 @@
 
 import logging
 import re
+from collections.abc import Callable, Iterable
+from typing import Literal, TypeVar
+from urllib.parse import urlencode, urlsplit
 
-import requests
+import httpx
 import web
 
-from six.moves import urllib
-
+from openlibrary.utils import server_timing
+from openlibrary.utils.async_utils import async_bridge, cache_per_event_loop
 
 logger = logging.getLogger("openlibrary.logger")
 
-def urlencode(d, doseq=False):
-    """There is a bug in urllib when used with unicode data.
 
-        >>> d = {"q": u"\u0C05"}
-        >>> urllib.parse.urlencode(d)
-        'q=%E0%B0%85'
-        >>> urllib.parse.urlencode(d, doseq=True)
-        'q=%3F'
+T = TypeVar("T")
 
-    This function encodes all the unicode strings in utf-8 before passing them to urllib.
-    """
-    def utf8(d):
-        if isinstance(d, dict):
-            return dict((utf8(k), utf8(v)) for k, v in d.items())
-        elif isinstance(d, list):
-            return [utf8(v) for v in d]
-        else:
-            return web.safestr(d)
+DEFAULT_SOLR_TIMEOUT_SECONDS = 10
+DEFAULT_PASS_TIME_ALLOWED = True
 
-    return urllib.parse.urlencode(utf8(d), doseq=doseq)
+
+SolrRequestLabel = Literal[
+    "UNLABELLED",
+    "BOOK_SEARCH",
+    "BOOK_SEARCH_API",
+    "BOOK_SEARCH_FACETS",
+    "BOOK_SEARCH_READABLE_COUNT",
+    "BOOK_CAROUSEL",
+    "AUTHOR_BOOKS_PAGE",
+    "AUTHOR_BOOKS_READABLE_COUNT",
+    "AUTHOR_BOOKS_PAGE_COUNT",
+    # /get endpoint
+    "GET_WORK_SOLR_DATA",
+    # Subject, publisher pages
+    "SUBJECT_ENGINE_PAGE",
+    "SUBJECT_ENGINE_API",
+    # Cached "Notable authors" widget on subject pages
+    "SUBJECT_NOTABLE_AUTHORS",
+    # Async-loaded publishing-history chart on subject pages
+    "SUBJECT_PUBLISHING_HISTORY",
+    # Async-loaded related-subjects/places/people/times widget on subject pages
+    "SUBJECT_RELATED",
+    # Used for the internal request made by solr to choose the best edition
+    # during a normal book search
+    "EDITION_MATCH",
+    "LIST_SEARCH",
+    "LIST_SEARCH_API",
+    "LIST_CAROUSEL",
+    "SUBJECT_SEARCH",
+    "SUBJECT_SEARCH_API",
+    "AUTHOR_SEARCH",
+    "AUTHOR_SEARCH_API",
+    "EDITION_SEARCH",
+    "EDITION_SEARCH_API",
+    # Picking the editions of a Tasks initiative, once per initiative
+    "CONTRIBUTE_INITIATIVE",
+    "READING_LOG_SORT",
+]
+
 
 class Solr:
     def __init__(self, base_url):
+        """
+        :param base_url: The base url of the solr server/collection. E.g. http://localhost:8983/solr/openlibrary
+        """
         self.base_url = base_url
-        self.host = urllib.parse.urlsplit(self.base_url)[1]
+        self.host = urlsplit(self.base_url)[1]
+        self.get_async_session = cache_per_event_loop(lambda: httpx.AsyncClient(transport=server_timing.TimedTransport("solr")))
 
-    def escape(self, query):
+    @staticmethod
+    def escape(query):
         r"""Escape special characters in the query string
 
-            >>> solr = Solr("")
-            >>> solr.escape("a[b]c")
-            'a\\[b\\]c'
+        >>> Solr.escape("a[b]c")
+        'a\\[b\\]c'
         """
         chars = r'+-!(){}[]^"~*?:\\'
-        pattern = "([%s])" % re.escape(chars)
-        return web.re_compile(pattern).sub(r'\\\1', query)
+        pattern = re.compile("([%s])" % re.escape(chars))
+        return pattern.sub(r"\\\1", query)
 
-    def select(self, query, fields=None, facets=None,
-               rows=None, start=None,
-               doc_wrapper=None, facet_wrapper=None,
-               **kw):
-        """Execute a solr query.
+    async def get_async(
+        self,
+        key: str,
+        fields: list[str] | None = None,
+        doc_wrapper: Callable[[dict], T] = web.storage,
+        request_label: SolrRequestLabel = "UNLABELLED",
+    ) -> T | None:
+        """Get a specific item from solr"""
+        logger.debug(f"solr /get: {key}, {fields}")
+        resp = (
+            await self.get_async_session().get(
+                f"{self.base_url}/get",
+                # It's unclear how field=None is getting in here; a better fix would be at the source.
+                params={
+                    "id": key,
+                    **({"fl": ",".join([field for field in fields if field])} if fields else {}),
+                    "ol.label": request_label,
+                },
+                timeout=DEFAULT_SOLR_TIMEOUT_SECONDS,
+            )
+        ).json()
 
-        query can be a string or a dicitonary. If query is a dictionary, query
-        is constructed by concatinating all the key-value pairs with AND condition.
+        # Solr returns {doc: null} if the record isn't there
+        return doc_wrapper(resp["doc"]) if resp["doc"] else None
+
+    async def get_many_async(
+        self,
+        keys: Iterable[str],
+        fields: Iterable[str] | None = None,
+        doc_wrapper: Callable[[dict], T] = web.storage,
+    ) -> list[T]:
+        ids = list(keys)
+        if not ids:
+            return []
+        logger.debug(f"solr /get: {ids}, {fields}")
+        resp = (
+            await self.get_async_session().post(
+                f"{self.base_url}/get",
+                data={
+                    "ids": ",".join(ids),
+                    **({"fl": ",".join(fields)} if fields else {}),
+                },
+                timeout=DEFAULT_SOLR_TIMEOUT_SECONDS,
+            )
+        ).json()
+        return [doc_wrapper(doc) for doc in resp["response"]["docs"]]
+
+    async def update_in_place_async(
+        self,
+        request,
+        commit: bool = False,
+        _timeout: int | None = DEFAULT_SOLR_TIMEOUT_SECONDS,
+    ):
+        resp = (
+            await self.get_async_session().post(
+                f"{self.base_url}/update?update.partial.requireInPlace=true&commit={commit}",
+                json=request,
+                timeout=_timeout,
+            )
+        ).json()
+        return resp
+
+    async def select_async(
+        self,
+        query,
+        fields=None,
+        facets=None,
+        rows=None,
+        start=None,
+        doc_wrapper=None,
+        facet_wrapper=None,
+        _timeout=DEFAULT_SOLR_TIMEOUT_SECONDS,
+        _pass_time_allowed=DEFAULT_PASS_TIME_ALLOWED,
+        **kw,
+    ):
+        """Asynchronously execute a solr query.
+
+        query can be a string or a dictionary. If query is a dictionary, query
+        is constructed by concatenating all the key-value pairs with AND condition.
         """
-        params = {'wt': 'json'}
+        params = {"wt": "json"}
 
         for k, v in kw.items():
             # convert keys like facet_field to facet.field
-            params[k.replace('_', '.')] = v
+            params[k.replace("_", ".")] = v
 
-        params['q'] = self._prepare_select(query)
+        params["q"] = self._prepare_select(query)
 
         if rows is not None:
-            params['rows'] = rows
-        params['start'] = start or 0
+            params["rows"] = rows
+        params["start"] = start or 0
 
         if fields:
-            params['fl'] = ",".join(fields)
+            params["fl"] = ",".join(fields)
 
         if facets:
-            params['facet'] = "true"
-            params['facet.field'] = []
+            params["facet"] = "true"
+            params["facet.field"] = []
 
             for f in facets:
                 if isinstance(f, dict):
                     name = f.pop("name")
                     for k, v in f.items():
-                        params["f.%s.facet.%s" % (name, k)] = v
+                        params[f"f.{name}.facet.{k}"] = v
                 else:
                     name = f
-                params['facet.field'].append(name)
+                params["facet.field"].append(name)
+
+        json_data = (
+            await self.raw_request(
+                "select",
+                urlencode(params, doseq=True),
+                _timeout=_timeout,
+                _pass_time_allowed=_pass_time_allowed,
+            )
+        ).json()
+
+        return self._parse_solr_result(json_data, doc_wrapper=doc_wrapper, facet_wrapper=facet_wrapper)
+
+    # Non-async versions for backwards compatibility
+    get = async_bridge.wrap(get_async)
+    get_many = async_bridge.wrap(get_many_async)
+    update_in_place = async_bridge.wrap(update_in_place_async)
+    select = async_bridge.wrap(select_async)
+
+    async def raw_request(
+        self,
+        path_or_url: str,
+        payload: str,
+        _timeout: int | None = DEFAULT_SOLR_TIMEOUT_SECONDS,
+        _pass_time_allowed: bool = True,
+    ) -> httpx.Response:
+        """
+        :param _pass_time_allowed: If False, solr will continue processing the query
+            server-side even if the client has timed out. This is useful for when
+            you want a long-running query to complete and populate Solr's caches,
+            which will result in subsequent requests for that same query to possibly
+            not time out.
+        """
+        if path_or_url.startswith("http"):
+            # TODO: Should this only take a path, not a full url? Would need to
+            # update worksearch.code.execute_solr_query accordingly.
+            url = path_or_url
+        else:
+            url = f"{self.base_url}/{path_or_url.lstrip('/')}"
+
+        if _timeout is not None and _pass_time_allowed:
+            if "?" in url:
+                url += f"&timeAllowed={_timeout * 1000}"
+            else:
+                url += f"?timeAllowed={_timeout * 1000}"
 
         # switch to POST request when the payload is too big.
         # XXX: would it be a good idea to switch to POST always?
-        payload = urlencode(params, doseq=True)
-        url = self.base_url + "/select"
         if len(payload) < 500:
-            url = url + "?" + payload
-            logger.info("solr request: %s", url)
-            json_data = requests.get(url, timeout=10).json()
+            sep = "&" if "?" in url else "?"
+            url = url + sep + payload
+            logger.debug("solr request: %s", url)
+            return await self.get_async_session().get(url, timeout=_timeout)
         else:
-            logger.info("solr request: %s ...", url)
-            if not isinstance(payload, bytes):
-                payload = payload.encode("utf-8")
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-            }
-            json_data = requests.post(
-                url, data=payload, headers=headers, timeout=10
-            ).json()
-        return self._parse_solr_result(
-            json_data,
-            doc_wrapper=doc_wrapper,
-            facet_wrapper=facet_wrapper)
+            logger.debug("solr request: %s ...", url)
+            headers = {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
+            return await self.get_async_session().post(url, data=payload, headers=headers, timeout=_timeout)
 
     def _parse_solr_result(self, result, doc_wrapper, facet_wrapper):
-        response = result['response']
+        response = result["response"]
 
         doc_wrapper = doc_wrapper or web.storage
         facet_wrapper = facet_wrapper or (lambda name, value, count: web.storage(locals()))
 
         d = web.storage()
-        d.num_found = response['numFound']
-        d.docs = [doc_wrapper(doc) for doc in response['docs']]
+        d.num_found = response["numFound"]
+        d.partial = bool(result.get("responseHeader", {}).get("partialResults"))
+        d.docs = [doc_wrapper(doc) for doc in response["docs"]]
 
-        if 'facet_counts' in result:
+        if "facet_counts" in result:
             d.facets = {}
-            for k, v in result['facet_counts']['facet_fields'].items():
+            for k, v in result["facet_counts"]["facet_fields"].items():
                 d.facets[k] = [facet_wrapper(k, value, count) for value, count in web.group(v, 2)]
 
-        if 'highlighting' in result:
-            d.highlighting = result['highlighting']
+        if "highlighting" in result:
+            d.highlighting = result["highlighting"]
 
-        if 'spellcheck' in result:
-            d.spellcheck = result['spellcheck']
+        if "spellcheck" in result:
+            d.spellcheck = result["spellcheck"]
 
         return d
 
     def _prepare_select(self, query):
         def escape(v):
             # TODO: improve this
-            return v.replace('"', r'\"').replace("(", "\\(").replace(")", "\\)")
+            return v.replace('"', r"\"").replace("(", "\\(").replace(")", "\\)")
 
         def escape_value(v):
-            if isinstance(v, tuple): # hack for supporting range
-                return "[%s TO %s]" % (escape(v[0]), escape(v[1]))
-            elif isinstance(v, list): # one of
+            if isinstance(v, tuple):  # hack for supporting range
+                return f"[{escape(v[0])} TO {escape(v[1])}]"
+            elif isinstance(v, list):  # one of
                 return "(%s)" % " OR ".join(escape_value(x) for x in v)
             else:
                 return '"%s"' % escape(v)
@@ -150,11 +287,13 @@ class Solr:
                 op = "AND"
             op = " " + op + " "
 
-            q = op.join('%s:%s' % (k, escape_value(v)) for k, v in query.items())
+            q = op.join(f"{k}:{escape_value(v)}" for k, v in query.items())
         else:
             q = query
         return q
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     import doctest
+
     doctest.testmod()

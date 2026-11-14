@@ -1,0 +1,35 @@
+/**
+ * Link Box
+ * https://docs.openlibrary.org/designers/design-pattern-library.html#linkbox
+ */
+
+.link-box {
+  font-size: var(--font-size-body-medium);
+  white-space: normal;
+  word-wrap: break-word;
+}
+
+.link-box h3 {
+  color: var(--color-text-secondary);
+  margin: 0 0 var(--spacing-stack-sm);
+  padding: 0;
+  text-transform: uppercase;
+  display: inline;
+  font-size: var(--font-size-label-medium);
+}
+
+.link-box.link-box--with-header h3 {
+  display: block;
+}
+
+.link-box button.edit-subject-btn {
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+  color: var(--grey);
+}
+
+.link-box .edit-subject-btn:hover {
+  color: var(--dark-grey);
+}

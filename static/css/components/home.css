@@ -1,0 +1,99 @@
+/* Homepage about section */
+
+div.tutorial__item {
+  background-color: var(--book-cover-carousel-cards);
+  border: var(--border-card);
+  border-radius: var(--border-radius-card);
+  padding: var(--spacing-inset-sm);
+  min-width: 220px;
+  height: 100%;
+  box-sizing: border-box;
+}
+
+/* @width-breakpoint-desktop: 960px */
+@media only screen and (min-width: 960px) {
+  div.tutorial__item {
+    min-width: 310px;
+  }
+}
+
+div.tutorial__item:focus {
+  box-shadow: var(--box-shadow-focus);
+}
+
+div.tutorial__item p {
+  margin: 0;
+  font-size: var(--font-size-body-large);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--line-height-tight);
+  overflow-wrap: break-word;
+}
+
+div.tutorial__item p.small {
+  margin-top: var(--spacing-3xs);
+  font-size: var(--font-size-body-small);
+  line-height: var(--line-height-snug);
+}
+
+div.tutorial__item a {
+  display: flex;
+  align-items: center;
+  min-height: 100px;
+  gap: var(--spacing-inline-md);
+}
+
+div.tutorial__item img {
+  flex-shrink: 0;
+  height: 5rem;
+  opacity: 80%;
+}
+
+/* stylelint-disable selector-max-specificity */
+#home-about {
+  display: flex;
+  flex-wrap: wrap;
+  font-size: var(--font-size-body-small);
+}
+
+#home-about-mission {
+  flex: 2;
+  min-width: 300px;
+  max-width: 439px;
+  min-height: 100px;
+  margin-bottom: 20px;
+  font-family: var(--font-family-serif);
+}
+
+#home-about-mission-tldr {
+  padding: 0;
+  margin: 0;
+  font-size: var(--font-size-body-xlarge);
+  line-height: var(--line-height-body);
+  font-family: var(--font-family-serif);
+  color: var(--color-text);
+  font-weight: var(--font-weight-regular);
+}
+/* stylelint-enable selector-max-specificity */
+
+.card__text {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+}
+
+.home-resource-section {
+  flex: 1;
+  font-size: var(--font-size-body-small);
+  min-width: 150px;
+  min-height: 100px;
+  margin-bottom: 20px;
+  padding: 0 var(--spacing-inset-sm);
+}
+
+.home-resource-section li {
+  margin: 1em 0;
+}
+
+.home-resource-section .collapse {
+  margin: 0;
+}

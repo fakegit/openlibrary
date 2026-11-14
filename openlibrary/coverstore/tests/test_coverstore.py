@@ -1,55 +1,62 @@
+from os.path import abspath, dirname, exists, join, pardir
+
 import pytest
 import web
-from os.path import abspath, exists, join, dirname, pardir
+from PIL import Image
 
-from openlibrary.coverstore import config, coverlib
+from openlibrary.coverstore import config, coverlib, utils
 
-static_dir = abspath(join(dirname(__file__), pardir, pardir, pardir, 'static'))
+static_dir = abspath(join(dirname(__file__), pardir, pardir, pardir, "static"))
 
 image_formats = [
-    ['a', 'images/homesplash.jpg'],
-    ['b', 'logos/logo-en.gif'],
-    ['c', 'logos/logo-en.png']
+    ["a", "images/homesplash.jpg"],
+    ["b", "logos/logo-en.gif"],
+    ["c", "logos/logo-en.png"],
 ]
 
+
 @pytest.fixture
-def image_dir(tmpdir):
-    tmpdir.mkdir('localdisk')
-    tmpdir.mkdir('items')
-    tmpdir.mkdir('items', 'covers_0000')
-    tmpdir.mkdir('items', 's_covers_0000')
-    tmpdir.mkdir('items', 'm_covers_0000')
-    tmpdir.mkdir('items', 'l_covers_0000')
+def image_dir(tmpdir, monkeypatch):
+    tmpdir.mkdir("localdisk")
+    tmpdir.mkdir("items")
+    tmpdir.mkdir("items", "covers_0000")
+    tmpdir.mkdir("items", "s_covers_0000")
+    tmpdir.mkdir("items", "m_covers_0000")
+    tmpdir.mkdir("items", "l_covers_0000")
 
-    config.data_root = str(tmpdir)
+    monkeypatch.setattr(config, "data_root", str(tmpdir))
 
-@pytest.mark.parametrize('prefix, path', image_formats)
+
+@pytest.mark.parametrize(("prefix", "path"), image_formats)
 def test_write_image(prefix, path, image_dir):
     """Test writing jpg, gif and png images"""
-    data = open(join(static_dir, path), 'rb').read()
+    with open(join(static_dir, path), "rb") as file:
+        data = file.read()
     assert coverlib.write_image(data, prefix) is not None
 
     def _exists(filename):
         return exists(coverlib.find_image_path(filename))
 
-    assert _exists(prefix + '.jpg')
-    assert _exists(prefix + '-S.jpg')
-    assert _exists(prefix + '-M.jpg')
-    assert _exists(prefix + '-L.jpg')
+    assert _exists(prefix + ".jpg")
+    assert _exists(prefix + "-S.jpg")
+    assert _exists(prefix + "-M.jpg")
+    assert _exists(prefix + "-L.jpg")
 
-    assert open(coverlib.find_image_path(prefix + '.jpg'), 'rb').read() == data
+    with open(coverlib.find_image_path(prefix + ".jpg"), "rb") as file:
+        assert file.read() == data
+
 
 def test_bad_image(image_dir):
-    prefix = config.data_root + '/bad'
-    assert coverlib.write_image(b'', prefix) is None
+    prefix = config.data_root + "/bad"
+    assert coverlib.write_image(b"", prefix) is None
 
-    prefix = config.data_root + '/bad'
-    assert coverlib.write_image(b'not an image', prefix) is None
+    prefix = config.data_root + "/bad"
+    assert coverlib.write_image(b"not an image", prefix) is None
+
 
 def test_resize_image_aspect_ratio():
     """make sure the aspect-ratio is maintained"""
-    from PIL import Image
-    img = Image.new('RGB', (100, 200))
+    img = Image.new("RGB", (100, 200))
 
     img2 = coverlib.resize_image(img, (40, 40))
     assert img2.size == (20, 40)
@@ -63,57 +70,159 @@ def test_resize_image_aspect_ratio():
     img2 = coverlib.resize_image(img, (75, 200))
     assert img2.size == (75, 150)
 
+
 def test_serve_file(image_dir):
     path = static_dir + "/logos/logo-en.png"
 
-    assert coverlib.read_file('/dev/null') == b''
-    assert coverlib.read_file(path) == open(path, "rb").read()
+    assert coverlib.read_file("/dev/null") == b""
+    with open(path, "rb") as file:
+        assert coverlib.read_file(path) == file.read()
 
-    assert coverlib.read_file(path + ":10:20") == open(path, "rb").read()[10:10+20]
+    with open(path, "rb") as file:
+        assert coverlib.read_file(path + ":10:20") == file.read()[10 : 10 + 20]
+
 
 def test_server_image(image_dir):
     def write(filename, data):
-        with open(join(config.data_root, filename), 'wb') as f:
+        with open(join(config.data_root, filename), "wb") as f:
             f.write(data)
 
     def do_test(d):
         def serve_image(d, size):
-            return "".join(coverlib.read_image(d, size).decode('utf-8'))
+            return "".join(coverlib.read_image(d, size).decode("utf-8"))
 
-        assert serve_image(d, '') == 'main image'
-        assert serve_image(d, None) == 'main image'
+        assert serve_image(d, "") == "main image"
+        assert serve_image(d, None) == "main image"
 
-        assert serve_image(d, 'S') == 'S image'
-        assert serve_image(d, 'M') == 'M image'
-        assert serve_image(d, 'L') == 'L image'
+        assert serve_image(d, "S") == "S image"
+        assert serve_image(d, "M") == "M image"
+        assert serve_image(d, "L") == "L image"
 
-        assert serve_image(d, 's') == 'S image'
-        assert serve_image(d, 'm') == 'M image'
-        assert serve_image(d, 'l') == 'L image'
+        assert serve_image(d, "s") == "S image"
+        assert serve_image(d, "m") == "M image"
+        assert serve_image(d, "l") == "L image"
 
     # test with regular images
-    write('localdisk/a.jpg', b'main image')
-    write('localdisk/a-S.jpg', b'S image')
-    write('localdisk/a-M.jpg', b'M image')
-    write('localdisk/a-L.jpg', b'L image')
-
-    d = web.storage(id=1, filename='a.jpg', filename_s='a-S.jpg', filename_m='a-M.jpg', filename_l='a-L.jpg')
-    do_test(d)
-
-    # test with offsets
-    write('items/covers_0000/covers_0000_00.tar', b'xxmain imagexx')
-    write('items/s_covers_0000/s_covers_0000_00.tar', b'xxS imagexx')
-    write('items/m_covers_0000/m_covers_0000_00.tar', b'xxM imagexx')
-    write('items/l_covers_0000/l_covers_0000_00.tar', b'xxL imagexx')
+    write("localdisk/a.jpg", b"main image")
+    write("localdisk/a-S.jpg", b"S image")
+    write("localdisk/a-M.jpg", b"M image")
+    write("localdisk/a-L.jpg", b"L image")
 
     d = web.storage(
         id=1,
-        filename='covers_0000_00.tar:2:10',
-        filename_s='s_covers_0000_00.tar:2:7',
-        filename_m='m_covers_0000_00.tar:2:7',
-        filename_l='l_covers_0000_00.tar:2:7')
+        filename="a.jpg",
+        filename_s="a-S.jpg",
+        filename_m="a-M.jpg",
+        filename_l="a-L.jpg",
+    )
     do_test(d)
 
+    # test with offsets
+    write("items/covers_0000/covers_0000_00.tar", b"xxmain imagexx")
+    write("items/s_covers_0000/s_covers_0000_00.tar", b"xxS imagexx")
+    write("items/m_covers_0000/m_covers_0000_00.tar", b"xxM imagexx")
+    write("items/l_covers_0000/l_covers_0000_00.tar", b"xxL imagexx")
+
+    d = web.storage(
+        id=1,
+        filename="covers_0000_00.tar:2:10",
+        filename_s="s_covers_0000_00.tar:2:7",
+        filename_m="m_covers_0000_00.tar:2:7",
+        filename_l="l_covers_0000_00.tar:2:7",
+    )
+    do_test(d)
+
+
 def test_image_path(image_dir):
-    assert coverlib.find_image_path('a.jpg') == config.data_root + '/localdisk/a.jpg'
-    assert coverlib.find_image_path('covers_0000_00.tar:1234:10') == config.data_root + '/items/covers_0000/covers_0000_00.tar:1234:10'
+    assert coverlib.find_image_path("a.jpg") == config.data_root + "/localdisk/a.jpg"
+    assert coverlib.find_image_path("covers_0000_00.tar:1234:10") == config.data_root + "/items/covers_0000/covers_0000_00.tar:1234:10"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # archive.org download page images (with and without .jpg, cover and title)
+        "https://archive.org/download/goody/page/title",
+        "https://archive.org/download/goody/page/title.jpg",
+        "https://archive.org/download/goody/page/cover",
+        "https://archive.org/download/goody/page/cover.jpg",
+        "http://archive.org/download/goody/page/title.jpg",
+        # with optional size suffix
+        "https://archive.org/download/goody/page/cover_w500_h500",
+        "https://archive.org/download/goody/page/cover_w500.jpg",
+        "https://archive.org/download/goody/page/title_h800.jpg",
+        # archive.org IIIF image service
+        "https://archive.org/services/img/goody/full/pct:600/0/default.jpg",
+        "http://archive.org/services/img/some/nested/id/full/pct:100/0/default.jpg",
+        # covers.openlibrary.org
+        "https://covers.openlibrary.org/b/id/15082914.jpg",
+        "https://covers.openlibrary.org/b/id/15082914-M.jpg",
+        "http://covers.openlibrary.org/b/olid/OL123M-L.jpg",
+        # third-party hosts
+        "https://books.google.com/books?id=foo&printsec=frontcover",
+        "https://commons.wikimedia.org/wiki/File:Example.jpg",
+        "https://m.media-amazon.com/images/I/51abc123.jpg",
+        "https://www.gutenberg.org/cache/epub/1661/pg1661.cover.small.jpg",
+        "https://www.gutenberg.org/cache/epub/1661/pg1661.cover.medium.jpg",
+        "https://www.gutenberg.org/cache/epub/1661/images/cover.jpg",
+        "https://cdn.sanity.io/images/3lm68n5v/production/e7ffe418212f76c942fe906ae66cff17867bd602-190x300.jpg?w=1920&q=75&auto=format",
+        "https://cdn.sanity.io/images/3lm68n5v/production/e7ffe418212f76c942fe906ae66cff17867bd602-190x300.jpg",
+        "https://cdn.sanity.io/images/otherproj/production/e7ffe418212f76c942fe906ae66cff17867bd602-190x300.png",
+    ],
+)
+def test_is_allowed_cover_url_allowed(url):
+    assert utils.is_allowed_cover_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # unrecognised domains
+        "https://evil.com/image.jpg",
+        "https://archive.org.evil.com/download/x/page/title",
+        # SSRF attempts
+        "file:///etc/passwd",
+        "http://localhost/image.jpg",
+        "http://169.254.169.254/latest/meta-data/",
+        # archive.org paths that don't match the allowed patterns
+        "https://archive.org/download/goody/page/script.php",
+        "https://archive.org/download/goody/notpage/title",
+        # ? and # injection into archive.org paths
+        "https://archive.org/download/goody?evil=1/page/title",
+        "https://archive.org/download/goody#evil/page/title",
+        "https://archive.org/services/img/goody?evil/full/pct:600/0/default.jpg",
+        "https://archive.org/services/img/goody#evil/full/pct:600/0/default.jpg",
+        # covers.openlibrary.org with wrong extension
+        "https://covers.openlibrary.org/b/id/15082914.png",
+        # gutenberg.org outside /cache/
+        "https://www.gutenberg.org/ebooks/1661.epub3.images",
+        "https://www.gutenberg.org/cache/",
+        "https://www.gutenberg.org/cache/epub/1661/pg1661.cover.small.jpg?evil=1",
+        # cdn.sanity.io outside /images/
+        "https://cdn.sanity.io/files/3lm68n5v/production/e7ffe418212f76c942fe906ae66cff17867bd602.pdf",
+        "https://cdn.sanity.io/",
+        # empty string and bare domain
+        "",
+        "https://archive.org",
+    ],
+)
+def test_is_allowed_cover_url_rejected(url):
+    assert utils.is_allowed_cover_url(url) is False
+
+
+def test_urldecode():
+    assert utils.urldecode("http://google.com/search?q=bar&x=y") == (
+        "http://google.com/search",
+        {"q": "bar", "x": "y"},
+    )
+    assert utils.urldecode("google.com/search?q=bar&x=y") == (
+        "google.com/search",
+        {"q": "bar", "x": "y"},
+    )
+    assert utils.urldecode("http://google.com/search") == (
+        "http://google.com/search",
+        {},
+    )
+    assert utils.urldecode("http://google.com/") == ("http://google.com/", {})
+    assert utils.urldecode("http://google.com/?") == ("http://google.com/", {})
+    assert utils.urldecode("?q=bar") == ("", {"q": "bar"})

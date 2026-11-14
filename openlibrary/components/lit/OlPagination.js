@@ -1,0 +1,419 @@
+import { LitElement, html, css } from 'lit';
+import './OlIcon.js';
+import { getNextKeyboardFocusIndex } from './utils/keyboard-nav.js';
+
+/**
+ * A pagination component that displays page numbers with navigation controls.
+ *
+ * @element ol-pagination
+ *
+ * @prop {"full" | "arrows"} mode - Display mode: "full" (default) shows page numbers
+ *                       with arrows, "arrows" shows only previous/next arrows (useful
+ *                       when total is unknown)
+ * @prop {"small" | "medium"} size - Default: "medium". Heights track the shared
+ *                                  control-height tokens, so a same-size button lines up.
+ * @prop {Number} totalPages - Total number of pages (required for "full" mode)
+ * @prop {Number} currentPage - Currently selected page (1-indexed)
+ * @prop {Boolean} hasNextPage - Whether a next page exists. Only used in "arrows" mode.
+ *                               In "full" mode, this is derived from totalPages.
+ * @prop {String} baseUrl - Optional base URL for generating page links. When omitted,
+ *                          falls back to the current page URL, preserving all existing
+ *                          query parameters (similar to changequery). Always renders
+ *                          anchor tags for SEO-friendly navigation.
+ * @prop {String} labelPreviousPage - Aria label for "previous page" button (default: "Go to previous page")
+ * @prop {String} labelNextPage - Aria label for "next page" button (default: "Go to next page")
+ * @prop {String} labelGoToPage - Aria label template for page buttons, use {page} as placeholder
+ *                                (default: "Go to page {page}")
+ * @prop {String} labelCurrentPage - Aria label template for current page, use {page} as placeholder
+ *                                   (default: "Page {page}, current page")
+ * @prop {String} labelPagination - Aria label for the navigation landmark (default: "Pagination")
+ *
+ * @fires ol-pagination-change - Fired when a page is selected. detail: { page: Number }
+ *
+ * @example
+ * <!-- Full mode (default): page numbers with arrows -->
+ * <ol-pagination total-pages="50" current-page="1"></ol-pagination>
+ *
+ * @example
+ * <!-- Arrows mode: only prev/next, no total needed -->
+ * <ol-pagination mode="arrows" current-page="3" has-next-page></ol-pagination>
+ *
+ * @example
+ * <!-- Small -->
+ * <ol-pagination size="small" total-pages="50" current-page="1"></ol-pagination>
+ *
+ * @example
+ * <!-- Explicit base URL -->
+ * <ol-pagination total-pages="50" current-page="1" base-url="/search?q=hello"></ol-pagination>
+ *
+ * @example
+ * <!-- Intercept navigation with event -->
+ * <ol-pagination total-pages="50" current-page="1"
+ *     @ol-pagination-change=${(e) => { e.preventDefault(); handlePage(e.detail.page); }}
+ * ></ol-pagination>
+ *
+ * @example
+ * <!-- With translated labels -->
+ * <ol-pagination
+ *     total-pages="50"
+ *     current-page="1"
+ *     label-previous-page="Ir a la página anterior"
+ *     label-next-page="Ir a la página siguiente"
+ *     label-go-to-page="Ir a la página {page}"
+ *     label-current-page="Página {page}, página actual"
+ *     label-pagination="Paginación"
+ * ></ol-pagination>
+ */
+export class OlPagination extends LitElement {
+    static properties = {
+        mode: { type: String },
+        size: { type: String, reflect: true },
+        totalPages: { type: Number, attribute: 'total-pages' },
+        currentPage: { type: Number, attribute: 'current-page' },
+        hasNextPage: { type: Boolean, attribute: 'has-next-page' },
+        baseUrl: { type: String, attribute: 'base-url' },
+        labelPreviousPage: { type: String, attribute: 'label-previous-page' },
+        labelNextPage: { type: String, attribute: 'label-next-page' },
+        labelGoToPage: { type: String, attribute: 'label-go-to-page' },
+        labelCurrentPage: { type: String, attribute: 'label-current-page' },
+        labelPagination: { type: String, attribute: 'label-pagination' },
+        _focusedIndex: { type: Number, state: true }
+    };
+
+    static styles = css`
+        /* Size lives in these three custom properties; the rules below read them. */
+        :host {
+            display: block;
+            font-family: var(--font-family-body);
+            --pagination-item-height: var(--control-height-medium);
+            --pagination-font-size: var(--font-size-body-medium);
+            --pagination-icon-size: 18px;
+        }
+
+        :host([size='small']) {
+            --pagination-item-height: var(--control-height-small);
+            --pagination-font-size: var(--font-size-label-medium);
+            --pagination-icon-size: 16px;
+        }
+
+        .pagination {
+            display: flex;
+            font-size: var(--pagination-font-size);
+            /* Page numbers are control labels, like the buttons beside them. */
+            font-weight: var(--font-weight-button);
+            gap: var(--spacing-inline-xs);
+        }
+
+        /* Height (not padding) locks to the control token; min-width matches it
+           so single-digit pages read as squares. */
+        .pagination-item {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-sizing: border-box;
+            height: var(--pagination-item-height);
+            min-width: var(--pagination-item-height);
+            padding: 0 var(--spacing-inset-xs);
+            border-radius: var(--border-radius-button);
+            background: transparent;
+            color: var(--color-text);
+            line-height: var(--line-height-control);
+            cursor: pointer;
+            text-decoration: none;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .pagination-item ol-icon {
+            width: var(--pagination-icon-size);
+            height: var(--pagination-icon-size);
+        }
+
+        @media (hover: hover) and (pointer: fine) {
+            .pagination-item:hover:not([aria-disabled='true']):not([aria-current='page']) {
+                background: var(--color-hover-overlay);
+            }
+        }
+
+        .pagination-item:active:not([aria-disabled='true']):not([aria-current='page']) {
+            transform: scale(var(--press-scale-compact));
+        }
+
+        .pagination-item:focus {
+            outline: none;
+        }
+
+        .pagination-item:focus-visible {
+            outline: var(--focus-width) solid var(--color-focus-ring);
+            outline-offset: 2px;
+        }
+
+        /* The system's one selected look — shared with ol-button[selected]. */
+        .pagination-item[aria-current='page'] {
+            background-color: var(--color-control-selected-bg);
+            color: var(--color-link);
+            cursor: default;
+            user-select: none;
+        }
+
+        .pagination-item[aria-disabled='true'] {
+            color: var(--color-disabled-fg);
+            cursor: not-allowed;
+        }
+
+        /* No text to inset — min-width centers the icon. */
+        .pagination-arrow {
+            padding: 0;
+        }
+
+        /* Previous points toward the start edge, which is the right under RTL. */
+        :host(:dir(rtl)) .pagination-arrow ol-icon {
+            transform: scaleX(-1);
+        }
+
+        /* Height-matched to the items; natural width, since it's not a target. */
+        .ellipsis {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: var(--pagination-item-height);
+            padding: 0 var(--spacing-inset-xs);
+            color: var(--color-icon-muted);
+            cursor: default;
+            user-select: none;
+        }
+    `;
+
+    /** Arrow icons. Sized by CSS. */
+    static _leftArrowIcon = html`<ol-icon name="chevron-left"></ol-icon>`;
+
+    static _rightArrowIcon = html`<ol-icon name="chevron-right"></ol-icon>`;
+
+    constructor() {
+        super();
+        this.mode = 'full';
+        this.size = 'medium';
+        this.totalPages = 1;
+        this.currentPage = 1;
+        this.hasNextPage = false;
+        this.baseUrl = '';
+        this._focusedIndex = -1;
+
+        // Translatable label defaults (English)
+        this.labelPreviousPage = 'Go to previous page';
+        this.labelNextPage = 'Go to next page';
+        this.labelGoToPage = 'Go to page {page}';
+        this.labelCurrentPage = 'Page {page}, current page';
+        this.labelPagination = 'Pagination';
+    }
+
+    /**
+     * Interpolate a label template by replacing {key} placeholders with values.
+     * @param {String} template - The label template (e.g., "Go to page {page}")
+     * @param {Object} values - Key-value pairs to substitute (e.g., { page: 5 })
+     * @returns {String} The interpolated string
+     */
+    _interpolateLabel(template, values) {
+        return template.replace(/\{(\w+)\}/g, (_, key) => values[key] ?? '');
+    }
+
+    /**
+     * Build URL for a specific page number.
+     * Uses baseUrl if provided, otherwise falls back to the current window location.
+     * This preserves all existing query parameters (like changequery() does).
+     * @param {Number} page - The page number
+     * @returns {String|null} The URL for the page
+     */
+    _getPageUrl(page) {
+        try {
+            const base = this.baseUrl || window.location.href;
+            const url = new URL(base, window.location.origin);
+            if (page === 1) {
+                url.searchParams.delete('page');
+            } else {
+                url.searchParams.set('page', page);
+            }
+            return url.pathname + url.search;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Calculate which page numbers to display based on current page and total pages.
+     * Always shows exactly 5 page numbers max, adjusting position based on current page:
+     * - Near start: 1, 2, 3, 4 ... last (5 total)
+     * - Middle: 1 ... current-1, current, current+1 ... last (5 total)
+     * - Near end: 1 ... last-3, last-2, last-1, last (5 total)
+     * @returns {Array} Array of page numbers and 'ellipsis' markers
+     */
+    _getVisiblePages() {
+        const total = this.totalPages;
+        const current = this.currentPage;
+
+        if (total <= 5) return [...Array(total)].map((_, i) => i + 1);
+        if (current <= 3) return [1, 2, 3, 4, 'ellipsis-right', total];
+        if (current >= total - 2) return [1, 'ellipsis-left', total - 3, total - 2, total - 1, total];
+
+        return [1, 'ellipsis-left', current - 1, current, current + 1, 'ellipsis-right', total];
+    }
+
+    /**
+     * Get all focusable elements in the pagination
+     * @returns {Array} Array of focusable elements (buttons or anchors)
+     */
+    _getFocusableElements() {
+        return Array.from(this.shadowRoot.querySelectorAll('.pagination-item:not([aria-disabled="true"])'));
+    }
+
+    /**
+     * Handle keyboard navigation within the pagination
+     * @param {KeyboardEvent} e
+     */
+    _handleKeyDown(e) {
+        const focusable = this._getFocusableElements();
+        const target = getNextKeyboardFocusIndex(e.key, {
+            count: focusable.length,
+            current: focusable.indexOf(this.shadowRoot.activeElement),
+            orientation: 'horizontal',
+            wrap: false
+        });
+        if (target === -1) return;
+        e.preventDefault();
+        focusable[target].focus();
+    }
+
+    /**
+     * Navigate to a specific page
+     * @param {Number} page - The page number to navigate to
+     */
+    _goToPage(page) {
+        const maxPage = this.mode === 'arrows' ? Infinity : this.totalPages;
+        if (page < 1 || page > maxPage || page === this.currentPage) {
+            return;
+        }
+
+        const event = new CustomEvent('ol-pagination-change', {
+            detail: { page },
+            bubbles: true,
+            composed: true,
+            cancelable: true
+        });
+        this.dispatchEvent(event);
+        if (event.defaultPrevented) return;
+
+        this.currentPage = page;
+    }
+
+    /**
+     * Handle click on anchor-based page links.
+     * Dispatches the ol-pagination-change event to allow interception.
+     * If the event is cancelled via preventDefault(), anchor navigation is also prevented.
+     * @param {Event} e - Click event
+     * @param {Number} page - The page number
+     */
+    _handlePageClick(e, page) {
+        const event = new CustomEvent('ol-pagination-change', {
+            detail: { page },
+            bubbles: true,
+            composed: true,
+            cancelable: true
+        });
+        this.dispatchEvent(event);
+        if (event.defaultPrevented) {
+            e.preventDefault();
+            this.currentPage = page;
+        }
+    }
+
+    /**
+     * Render a pagination item (button or anchor based on URL mode)
+     * @param {Object} options - Render options
+     * @param {Number} options.page - Target page number
+     * @param {String} options.label - Aria label for the item
+     * @param {String} options.className - Additional CSS class
+     * @param {TemplateResult} options.content - Content to render inside the item
+     * @returns {TemplateResult} Lit template for the button or anchor
+     */
+    _renderPaginationItem({ page, label, className = '', content }) {
+        const url = this._getPageUrl(page);
+        const isCurrent = page === this.currentPage;
+        const ariaCurrent = isCurrent ? 'page' : 'false';
+
+        if (url) {
+            return html`
+                <a
+                    href=${url}
+                    class="pagination-item ${className}"
+                    aria-label=${label}
+                    aria-current=${ariaCurrent}
+                    @click=${e => this._handlePageClick(e, page)}
+                    >${content}</a
+                >
+            `;
+        }
+
+        return html`
+            <button class="pagination-item ${className}" aria-label=${label} aria-current=${ariaCurrent} @click=${() => this._goToPage(page)}>
+                ${content}
+            </button>
+        `;
+    }
+
+    /**
+     * Render a single page button/link or ellipsis
+     * @param {Number|String} page - Page number or 'ellipsis-left'/'ellipsis-right'
+     * @returns {TemplateResult} Lit template for the button or anchor
+     */
+    _renderPageButton(page) {
+        if (typeof page === 'string' && page.startsWith('ellipsis')) {
+            return html`<span class="ellipsis" aria-hidden="true">•••</span>`;
+        }
+
+        const isCurrent = page === this.currentPage;
+        const label = isCurrent ? this._interpolateLabel(this.labelCurrentPage, { page }) : this._interpolateLabel(this.labelGoToPage, { page });
+
+        return this._renderPaginationItem({ page, label, content: page });
+    }
+
+    /**
+     * Render a navigation arrow (previous or next)
+     * @param {String} direction - 'prev' or 'next'
+     * @returns {TemplateResult} Lit template for the arrow
+     */
+    _renderNavArrow(direction) {
+        const isPrev = direction === 'prev';
+        const isDisabled = isPrev ? this.currentPage === 1 : this.mode === 'arrows' ? !this.hasNextPage : this.currentPage === this.totalPages;
+
+        if (isDisabled && this.mode !== 'arrows') return html``;
+
+        if (isDisabled) {
+            const label = isPrev ? this.labelPreviousPage : this.labelNextPage;
+            const icon = isPrev ? OlPagination._leftArrowIcon : OlPagination._rightArrowIcon;
+            return html` <span class="pagination-item pagination-arrow" aria-disabled="true" aria-label=${label}>${icon}</span> `;
+        }
+
+        const page = isPrev ? this.currentPage - 1 : this.currentPage + 1;
+        const label = isPrev ? this.labelPreviousPage : this.labelNextPage;
+        const icon = isPrev ? OlPagination._leftArrowIcon : OlPagination._rightArrowIcon;
+
+        return this._renderPaginationItem({
+            page,
+            label,
+            className: 'pagination-arrow',
+            content: icon
+        });
+    }
+
+    render() {
+        const isArrows = this.mode === 'arrows';
+        const visiblePages = isArrows ? [] : this._getVisiblePages();
+
+        return html`
+            <nav class="pagination" role="navigation" aria-label=${this.labelPagination} @keydown=${this._handleKeyDown}>
+                ${this._renderNavArrow('prev')} ${visiblePages.map(page => this._renderPageButton(page))} ${this._renderNavArrow('next')}
+            </nav>
+        `;
+    }
+}
+
+customElements.define('ol-pagination', OlPagination);

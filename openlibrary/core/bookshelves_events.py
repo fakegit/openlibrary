@@ -1,0 +1,205 @@
+from dataclasses import dataclass
+from datetime import datetime
+from enum import IntEnum
+
+from openlibrary.core.async_db import class_row, execute, fetch_all, fetch_one, fetch_val
+
+from . import db  # noqa: TID251
+
+
+class BookshelfEvent(IntEnum):
+    START = 1
+    UPDATE = 2
+    FINISH = 3
+
+    @classmethod
+    def has_value(cls, value: int) -> bool:
+        return value in (item.value for item in BookshelfEvent.__members__.values())
+
+
+@dataclass(frozen=True, slots=True)
+class CheckInEvent:
+    """A row from the ``bookshelves_events`` table."""
+
+    id: int
+    username: str
+    work_id: int
+    edition_id: int
+    event_type: int
+    event_date: str
+
+
+class BookshelvesEvents(db.CommonExtras):
+    TABLENAME = "bookshelves_events"
+    NULL_EDITION_ID = -1
+
+    # Create methods:
+    @classmethod
+    async def create_event(
+        cls,
+        username: str,
+        work_id: int,
+        edition_id: int | None,
+        event_date: str,
+        event_type=BookshelfEvent.START.value,
+    ) -> int:
+        row = await fetch_one(
+            f"INSERT INTO {cls.TABLENAME} (username, work_id, edition_id, event_type, event_date) "
+            "VALUES (%(username)s, %(work_id)s, %(edition_id)s, %(event_type)s, %(event_date)s) RETURNING id",
+            {
+                "username": username,
+                "work_id": work_id,
+                "edition_id": edition_id or cls.NULL_EDITION_ID,
+                "event_type": event_type,
+                "event_date": event_date,
+            },
+        )
+        assert row is not None
+        return row["id"]
+
+    # Read methods:
+    @classmethod
+    async def select_by_id(cls, pid: int) -> CheckInEvent | None:
+        """The event with ``id = pid``, or None if it does not exist."""
+        query = f"SELECT id, username, work_id, edition_id, event_type, event_date FROM {cls.TABLENAME} WHERE id = %(id)s"
+        return await fetch_one(query, {"id": pid}, row_factory=class_row(CheckInEvent))
+
+    @classmethod
+    def get_latest_event_date(cls, username, work_id, event_type):
+        oldb = db.get_db()
+
+        data = {
+            "username": username,
+            "work_id": work_id,
+            "event_type": event_type,
+        }
+
+        query = (
+            f"SELECT id, event_date FROM {cls.TABLENAME}"
+            " WHERE username=$username AND work_id=$work_id"
+            " AND event_type=$event_type"
+            " ORDER BY event_date DESC LIMIT 1"
+        )
+
+        results = list(oldb.query(query, vars=data))
+        return results[0] if results else None
+
+    @classmethod
+    async def get_latest_event_dates(cls, username: str, work_ids: list[int], event_type: int) -> dict[int, dict]:
+        """`get_latest_event_date` for a batch: work_id -> {id, event_date}, only for works with an event."""
+        if not work_ids:
+            return {}
+        query = (
+            f"SELECT DISTINCT ON (work_id) id, work_id, event_date FROM {cls.TABLENAME}"
+            " WHERE username=%(username)s AND work_id = ANY(%(work_ids)s)"
+            " AND event_type=%(event_type)s"
+            " ORDER BY work_id, event_date DESC"
+        )
+        rows = await fetch_all(query, {"username": username, "work_ids": work_ids, "event_type": event_type})
+        return {row["work_id"]: {"id": row["id"], "event_date": row["event_date"]} for row in rows}
+
+    @classmethod
+    def get_user_yearly_read_counts(cls, username: str) -> list[tuple[int, int]]:
+        """Returns books read by year for a given user."""
+        results = db.get_db().query(
+            """
+                SELECT
+                    substring(event_date from 1 for 4) as year,
+                    count(DISTINCT work_id) as count
+                FROM bookshelves_events
+                WHERE username=$username AND event_type=$event_type
+                GROUP BY year
+                ORDER BY year DESC
+            """,
+            vars={
+                "username": username,
+                "event_type": BookshelfEvent.FINISH,
+            },
+        )
+
+        return [(int(row.year), row.count) for row in results]
+
+    @classmethod
+    def select_by_book_user_and_type(cls, username, work_id, edition_id, event_type):
+        oldb = db.get_db()
+
+        data = {
+            "username": username,
+            "work_id": work_id,
+            "edition_id": edition_id,
+            "event_type": event_type,
+        }
+
+        where = """
+            username=$username AND
+            work_id=$work_id AND
+            edition_id=$edition_id AND
+            event_type=$event_type
+        """
+
+        return list(oldb.select(cls.TABLENAME, where=where, vars=data))
+
+    @classmethod
+    async def count_distinct_work_ids_by_user_type_and_year(cls, username: str, event_type: int, year: int) -> int:
+        """Distinct works with an event of ``event_type`` in ``year``."""
+        query = (
+            f"SELECT count(DISTINCT work_id) FROM {cls.TABLENAME}"
+            " WHERE username = %(username)s AND event_type = %(event_type)s"
+            " AND event_date LIKE %(event_date)s"
+        )
+        return await fetch_val(
+            query,
+            {
+                "username": username,
+                "event_type": event_type,
+                "event_date": f"{year}%",
+            },
+        )
+
+    # Update methods:
+    @classmethod
+    async def update_event(cls, pid: int, edition_id: int | None = None, event_date: str | None = None, data: str | None = None) -> None:
+        """Update the given fields on an event. A no-op when no fields are passed."""
+        updates: dict[str, str | int | datetime] = {}
+        if event_date:
+            updates["event_date"] = event_date
+        if data:
+            updates["data"] = data
+        if edition_id:
+            updates["edition_id"] = edition_id
+        if not updates:
+            return
+        updates["updated"] = datetime.now()
+        params = {"id": pid, **updates}
+        assignments = ", ".join(f"{column} = %({column})s" for column in updates)
+        await execute(f"UPDATE {cls.TABLENAME} SET {assignments} WHERE id = %(id)s", params)
+
+    @classmethod
+    def update_event_date(cls, pid, event_date):
+        oldb = db.get_db()
+
+        where_clause = "id=$id"
+        where_vars = {"id": pid}
+        update_time = datetime.now()
+
+        return oldb.update(
+            cls.TABLENAME,
+            where=where_clause,
+            vars=where_vars,
+            updated=update_time,
+            event_date=event_date,
+        )
+
+    # Delete methods:
+    @classmethod
+    async def delete_by_id(cls, pid: int) -> None:
+        await execute(f"DELETE FROM {cls.TABLENAME} WHERE id = %(id)s", {"id": pid})
+
+    @classmethod
+    def delete_by_username(cls, username):
+        oldb = db.get_db()
+
+        where_clause = "username=$username"
+        where_vars = {"username": username}
+
+        return oldb.delete(cls.TABLENAME, where=where_clause, vars=where_vars)

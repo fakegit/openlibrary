@@ -1,41 +1,34 @@
-$def with (a, b)
+$def with (a, b, show_header=True)
 
 $var title: $_("Diff on %s", a.key)
 
 $putctx("robots", "noindex,nofollow")
 
-<div id="contentHead">
+$if show_header:
+    <div id="contentHead">
+        $:macros.databarDiff(path=a.key)
 
-    $:macros.databarDiff()
+        $if a.type.key in ["/type/edition", "/type/work", "/type/page"]:
+            $ title = a.title or a.key
+        $elif a.type.key in ["/type/author"]:
+            $ title = a.name or a.key
+        $else:
+            $ title = a.key
 
-    $if a.type.key in ["/type/edition", "/type/work", "/type/page"]:
-        $ title = a.title or a.key
-    $elif a.type.key in ["/type/author"]:
-        $ title = a.name or a.key
-    $else:
-        $ title = a.key
-
-    <h2 class="collapse"><a href="$a.key">$title</a> &rarr; Diff</h2>
-
-    <div id="legend">
-       <dl>
-           <dd class="add">$_("Added")</dd>
-           <dd class="mod">$_("Modified")</dd>
-           <dd class="rem">$_("Removed")</dd>
-           <dd class="unmod">$_("Not changed")</dd>
-       </dl>
+        <h2 class="collapse"><a href="$a.key">$title</a> &rarr; Diff</h2>
     </div>
-
-</div>
 
 $def display_revision(page):
     <div class="small sansserif">
-        <a href="$changequery({}, v=page.revision)"><span class="uppercase"><strong>$_("Revision %d", page.revision)</strong></span></a>
+        <a href="$changequery({}, v=page.revision, _path=page.key)"><span class="uppercase"><strong>$_("Revision %d", page.revision)</strong></span></a>
         $ v = get_version(page.key, page.revision)
-        $if v.author:
-            <span class="brown">$_('by') <a href="$v.author.key">$v.author.displayname</a> $datestr(v.created)</span>
+        $if v:
+            $if v.author:
+                <span class="brown">$_('by') <a href="$v.author.key">$v.author.displayname</a> $datestr(v.created)</span>
+            $else:
+                <span class="brown">$_('by Anonymous') $datestr(v.created)</span>
         $else:
-            <span class="brown">$_('by Anonymous') $datestr(v.created)</span>
+            <span class="brown">$_('by Anonymous')</span>
     </div>
 
 $def diff_covers(p, a, b):
@@ -44,11 +37,11 @@ $def diff_covers(p, a, b):
             <td class="diff-header-side">$p</td>
             <td class="diff-body">
                 $for img in a[p]:
-                    <img src="$get_coverstore_url()/b/id/$img-M.jpg"/>
+                    <img src="$get_coverstore_public_url()/b/id/$img-M.jpg"/>
             </td>
             <td class="diff-body">
                 $for img in b[p]:
-                    <img src="$get_coverstore_url()/b/id/$img-M.jpg"/>
+                    <img src="$get_coverstore_public_url()/b/id/$img-M.jpg"/>
             </td>
         </tr>
 
@@ -57,7 +50,7 @@ $def listdiff(name, a, b):
     <tr>
         <td class="diff-header-side" style="vertical-align: top;">$name</td>
         <td colspan="2">
-        <table style="width: 100%;">
+        <table class="no-table-collapse" style="width: 100%;">
         $for key, ai, a, bi, b in diffresults:
             <tbody class="$key">
             <tr>
@@ -84,6 +77,7 @@ $def diff_display(name, value):
             <span>$value.excerpt</span>
         $elif value.key:
             <a href="$value.key">$(value.name or value.title or value.key)</a>
+            <span class="smallest sansserif"> - <a href="$value.key?m=history" style="text-decoration: none;">$_("history")</a></span>
             <span style="display: block" class="link wrap">$value.key</span>
         $else:
             $ value = value.dict()
@@ -91,7 +85,16 @@ $def diff_display(name, value):
 
 <div id="contentBody" class="diff">
 
-    <table class="revisions" summary="$_('Differences')">
+    <div id="legend">
+       <dl>
+           <dd class="add">$_("Added")</dd>
+           <dd class="mod">$_("Modified")</dd>
+           <dd class="rem">$_("Removed")</dd>
+           <dd class="unmod">$_("Not changed")</dd>
+       </dl>
+    </div>
+
+    <table class="revisions no-table-collapse" summary="$_('Differences')">
         <colgroup class="l"><col class="line" /><col class="content" /></colgroup>
         <colgroup class="r"><col class="line" /><col class="content" /></colgroup>
         <thead>
@@ -113,11 +116,11 @@ $def diff_display(name, value):
                     return thingdiff("/type/text", "table_of_contents", a.get_toc_text(), b.get_toc_text())
                 elif p == "title_prefix":
                     return thingdiff("/type/string", "title_prefix", a[p].strip(), b[p].strip())
-                elif p == "authors":
+                elif p == "authors" and a.type.key == "/type/work":
                     label = "authors"
                     t = "/type/author"
-                    ap = a.get_authors()
-                    bp = b.get_authors()
+                    ap = [val.author for val in a.authors]
+                    bp = [val.author for val in b.authors]
                 else:
                     ap = a[p]
                     bp = b[p]
@@ -153,6 +156,5 @@ $def diff_display(name, value):
             </tr>
         </tbody>
     </table>
-    <div class="clearfix"></div>
 
 </div>

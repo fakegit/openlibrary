@@ -1,0 +1,90 @@
+import { SHELF } from '../../../../components/lit/utils/books-api.js';
+import { showToast } from '../../../../components/lit/toast.js';
+import { queueAction } from '../utils.js';
+
+export function initRatingHandlers(ratingForms) {
+    for (const form of ratingForms) {
+        form.addEventListener('submit', function (e) {
+            handleRatingSubmission(e, form);
+        });
+    }
+}
+
+function handleRatingSubmission(event, form) {
+    event.preventDefault();
+    // Continue only if selected star is different from previous rating
+    if (!event.submitter.classList.contains('star-selected')) {
+        // Construct form data object:
+        const formData = new FormData(form);
+        let rating;
+        if (event.submitter.value) {
+            rating = Number(event.submitter.value);
+            formData.append('rating', event.submitter.value);
+        }
+
+        // Make AJAX call
+        fetch(form.action, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/x-www-form-urlencoded'
+            },
+            body: new URLSearchParams(formData)
+        })
+            .then(response => {
+                if (response.status === 401) {
+                    if (event.submitter && event.submitter.id) {
+                        const label = form.querySelector(`label[for="${event.submitter.id}"]`);
+                        if (label) {
+                            const { action, title, type } = label.dataset;
+                            if (action && title && type) {
+                                queueAction(action, title, window.location.pathname + window.location.search, type);
+                            }
+                        }
+                    }
+                    window.location.href = `/account/login?redirect=${encodeURIComponent(window.location.pathname + window.location.search)}`;
+                    return;
+                }
+                if (!response.ok) {
+                    throw new Error('Ratings update failed');
+                }
+                // Update view to deselect all stars
+                form.querySelectorAll('.star-selected').forEach(elem => {
+                    elem.classList.remove('star-selected');
+                    if (elem.hasAttribute('property')) {
+                        elem.removeAttribute('property');
+                    }
+                });
+
+                const clearButton = form.querySelector('.star-messaging');
+                if (rating) {
+                    // A rating was added or updated
+                    // Update view to show patron's new star rating:
+                    clearButton.classList.remove('hidden');
+                    form.querySelectorAll(`.star-${rating}`).forEach(elem => {
+                        elem.classList.add('star-selected');
+                        if (elem.tagName === 'LABEL') {
+                            elem.setAttribute('property', 'ratingValue');
+                        }
+                    });
+                } else {
+                    // A rating was deleted
+                    clearButton.classList.add('hidden');
+                }
+                announceRating(form.dataset.workKey, rating ?? null);
+            })
+            .catch(error => {
+                showToast(error.message, { type: 'error' });
+            });
+    }
+}
+
+/**
+ * Tell the page's shelf buttons. Mirrors the server, which auto-shelves a
+ * rated book as Already Read only when it is unshelved or on Want to Read.
+ */
+export function announceRating(workKey, rating) {
+    if (!workKey) return;
+    let shelf = document.querySelector(`ol-shelf-button[work-key="${workKey}"]`)?.shelf ?? null;
+    if (rating && (shelf === null || shelf === SHELF.WANT_TO_READ)) shelf = SHELF.ALREADY_READ;
+    document.dispatchEvent(new CustomEvent('ol-book-state-change', { detail: { key: workKey, shelf, rating } }));
+}

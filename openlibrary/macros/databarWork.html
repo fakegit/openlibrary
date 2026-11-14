@@ -1,109 +1,87 @@
-$def with (page, editions_page=False)
-
-$if page.type.key == '/type/work' and page.edition_count == 1:
-    $ edit_url = page.editions[0].key + '?m=edit'
-$elif page.type.key in ["/type/work", "/type/edition", "/type/author"]:
-    $ edit_url = page.url(suffix="/edit")
-$else:
-    $ edit_url = page.key + "?m=edit"
+$def with (page, affiliate_links, editions_page=False, render_times={}, lending_state=None)
 
 $ viewbook = "//%s/stream/XXX?ref=ol" % bookreader_host()
-$ prices = page.key.startswith('/books/')
-
-$ oclc_numbers = (page.oclc_numbers and page.oclc_numbers[0]) or ""
-$ isbn_13 = page.get_isbn13()
-$ isbn_10 = page.get_isbn10()
-
-$ asin = None
-$if page.get('identifiers'):
-    $if page.identifiers.get('amazon'):
-        $ asin = page.identifiers.amazon[0]
-
-$if isbn_10 and not asin:
-    $ asin = isbn_10
 
 <div class="Tools">
   <div id="read">
     $if page.volumes:
       <h3 class="header">
         <span class="icon read"></span>
-        <span class="head">Browse</span>
+        <span class="head">$_("Browse")</span>
       </h3>
       $for v in page.volumes:
         $if v.ia_id != "-":
           <div class="panel">
-            <p><a href="$viewbook.replace('XXX', v.ia_id)">View Volume $v.volume_number</a></p>
+            <p><a href="$viewbook.replace('XXX', v.ia_id)">$_('View Volume %(num)d', num=v.volume_number)</a></p>
           </div>
 
     <div class="panel">
       <div class="btn-notice read-options" id="read-options">
 
         <div class="illustration edition-cover">
-          $:render_template('covers/book_cover', page)
+          $# The reader's shelf as a badge over the cover, like a carousel card;
+          $# work.css hides it until the book is on one. book-state.js keeps it
+          $# in step with the split button below.
+          $ shelf_badge = shelf_button_for(page, variant='icon', size='large') if (page.type.key == '/type/work' or page.get('works')) else None
+          $:render_template('covers/book_cover', page, preload=True, overlay=shelf_badge)
           $# Don't display add/change cover link for /books/ia:foo00bar pages
           $if not page.is_fake_record():
               $:render_template('covers/change', page, ".edition-cover .bookCover img")
         </div>
 
-        $:macros.DonateModal(page, ids={'isbn': isbn_13, 'asin': asin, 'prices': True})
-
         $ work = (page.works and page.works[0]) or page
         $ edition = page.works and page
-        $ lists_widget = render_template('lists/widget', edition or work, include_rating=True, include_header=False, include_widget=True, include_showcase=False, user_lists_only=False)
 
-        $:macros.LoanStatus(page, allow_expensive_availability_check=editions_page, secondary_action=editions_page, check_sponsorship=editions_page, sponsorship_help=editions_page, check_loan_status=editions_page, post=lists_widget)
+        $# Looked up once here, not inside the notes macro: modal_links renders
+        $# twice (desktop + mobile) and the macro ran the query on each. Both the
+        $# sidebar link and the dialog read it; None for logged-out patrons.
+        $ notes_username = ctx.user and ctx.user.key.split('/')[-1]
+        $ user_book_note = work.get_users_notes(notes_username, edition.key.split('/')[-1]) if (notes_username and work and edition) else None
 
-        $if editions_page and page.get('ocaid') and not page.is_access_restricted() and page.ia_metadata:
-          $:macros.DownloadOptions(page)
 
-      </div>
-    </div>
+        $ render_times['databarWork: LoanStatus'] = time()
+        $:macros.LoanStatus(page, is_book_page=editions_page, check_loan_status=editions_page, lending_state=lending_state)
+        $ render_times['databarWork: LoanStatus'] = time() - render_times['databarWork: LoanStatus']
 
-    $ prices = page.key.startswith('/books/')
+        $if editions_page:
+          <ol-popover class="buy-popover" aria-label="$_('Buy this book')">
+            <button slot="trigger" type="button" class="ol-button-static buy-popover__trigger">
+              $_("Buy")
+              $:macros.icon("chevron-down", size="sm", extra_class="buy-popover__chevron")
+            </button>
+            <div class="buy-options">
+              $:affiliate_links
+            </div>
+          </ol-popover>
 
-    $ oclc_numbers = (page.oclc_numbers and page.oclc_numbers[0]) or ""
-    $ isbn_13 = page.get_isbn13()
-    $ isbn_10 = page.get_isbn10()
+        $ render_times['databarWork: List widget'] = time()
+        $:render_template('lists/widget', edition or work, include_rating=True, async_load=True)
+        $ render_times['databarWork: List widget'] = time() - render_times['databarWork: List widget']
 
-    $ asin = None
-    $if page.get('identifiers'):
-        $if page.identifiers.get('amazon'):
-            $ asin = page.identifiers.amazon[0]
-
-    $if isbn_10 and not asin:
-        $ asin = isbn_10
-    <div class="panel">
-      <div class="btn-notice">
-        $:macros.WorldcatLink(isbn=isbn_13, oclc_numbers=oclc_numbers, referer=page.url(relative=False))
-
-        <div class="cta-section">
-          <p class="cta-section-title">$_('Buy this book')</p>
-          $:macros.AffiliateLinks(page, {'isbn': isbn_13, 'asin': asin, 'prices': prices})
-        </div>
-      </div>
-    </div>
-
-    <div class="panel list-view">
-      <div class="btn-notice">
-          $if ctx.get('share_links'):
-            $:macros.SocialShare(ctx.get('share_links'), request.home + page.key)
-        </div>
-    </div>
-
-    $if edition and edition.sponsorship_data:
-      <div class="sponsorship-card">
-        $if edition.sponsorship_data.donor:
-          $ donor = edition.sponsorship_data.donor
-          $if edition.sponsorship_data.donor_account:
-            $ donor = edition.sponsorship_data.donor_account.render_link()
-          $:_('This book was generously donated by %(donor)s', donor=donor)
-        $else:
-          $_('This book was generously donated anonymously')
         <hr>
-        $if edition.sponsorship_data.donor_msg:
-          <q>$edition.sponsorship_data.donor_msg</q>
+        $ share_url = request.home + (edition or work).key
+
+        $ render_times['databarWork: Modal Links - Desktop'] = time()
+        $:render_template("type/edition/modal_links", work, edition, share_url, user_note=user_book_note)
+        $ render_times['databarWork: Modal Links - Desktop'] = time() - render_times['databarWork: Modal Links - Desktop']
+
+        <div class="readers-stats__wrapper mobile">
+          $:macros.StarRatingsStats(work, mobile=True, ratings=False)
+
           <hr>
-        <a href="/sponsorship" class="learn-more">$_("Learn more about Book Sponsorship")</a>
+          $ render_times['databarWork: Modal Links - Mobile'] = time()
+          $:render_template("type/edition/modal_links", work, edition, share_url, mobile=True, user_note=user_book_note)
+          $ render_times['databarWork: Modal Links - Mobile'] = time() - render_times['databarWork: Modal Links - Mobile']
+        </div>
+
+        $if editions_page:
+          $ render_times['databarWork: Book provider'] = time()
+          $ book_provider = get_book_provider(page)
+          $ availability = (page.availability or {}) if hasattr(page, 'availability') else {}
+          $if book_provider and ((availability.get('is_readable') or availability.get('status') == 'open') or book_provider.get_access(page).to_solr_str() == "public"):
+            $:book_provider.render_download_options(page)
+          $ render_times['databarWork: Book provider'] = time() - render_times['databarWork: Book provider']
       </div>
+    </div>
   </div>
 </div>

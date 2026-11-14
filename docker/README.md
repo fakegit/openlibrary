@@ -1,51 +1,75 @@
-# Welcome to the new Docker based Open Library development environment!
+# Docker Guide
 
-## Setup/Teardown Commands
+This guide covers everything Docker-related for local Open Library development. For the fastest path to your first contribution, start with the [Quick Start](https://docs.openlibrary.org/developers/quick-start.html) guide.
 
-### For Windows Users Only
+## Install Docker
 
-**Note:** If you get permission issues while executing these commands please run git bash shell as an Administrator.
+**Linux** users (including those using a VM) can install `Docker Engine` or `Docker Desktop` (see the [Docker FAQ](https://docs.docker.com/desktop/faqs/linuxfaqs/) to determine which is right for you).
 
-```bash
-# Configure Git to convert CRLF to LF line endings on commit
-git config --global core.autocrlf input
+- Docker Engine: <https://docs.docker.com/engine/install/#server>
 
-# Enable Symlinks
-git config core.symlinks true
+**Windows** and **macOS** users should use `Docker Desktop`.
 
-# Reset the repo (removes any changes you've made to files!)
-git reset --hard HEAD
+- Docker Desktop: <https://docs.docker.com/get-docker/>
+
+For **macs** using an `M1 Chip`, please make sure that Docker Desktop Preferences `General / Use Docker Compose V2` is checked, enabling Docker to run without requiring `Rosetta 2`.
+
+### Test Docker
+
+Before continuing, ensure Docker is correctly configured by running the `hello-world` container.
+
+```sh
+docker run hello-world
 ```
 
-### Prerequisites & Troubleshooting
+The output should include a `Hello from Docker!` message. If Docker is unable to pull the `hello-world:latest` image from Docker Hub, try disabling your VPN if one is installed.
 
-Before attempting to build openlibrary using the docker instructions below, please follow this checklist. If you encounter an error, this section may serve as a troubleshooting guide:
+Linux users, note the lack of `sudo` before `docker run hello-world`. See the [Linux post-installation instructions](https://docs.docker.com/engine/install/linux-postinstall/) if you see a permission denied error.
 
-- Install `docker-ce`: https://docs.docker.com/get-docker/ (tested with version 19.*)
-- Install `docker-compose`: https://docs.docker.com/compose/install/
-- Make sure you `git clone` openlibrary using `ssh` instead of `https` as git submodules (e.g. `infogami` and `acs`) may not fetch correctly otherwise. You can modify an existing openlibrary repository using `git remote rm origin` and then `git remote add origin git@github.com:internetarchive/openlibrary.git`
+## Prepare your system
 
-### For All Users
-All commands are from the project root directory:
+> [!IMPORTANT]
+> **Windows** users should see [Fix line endings, symlinks, and git submodules](https://docs.openlibrary.org/developers/tools/git.html#fix-line-endings-symlinks-and-git-submodules-only-for-windows-users-not-using-a-linux-vm). Skipping those steps will likely prevent the containers from coming up.
 
-```bash
-# build images
-docker-compose build # 15+ min (Win10Home/Dec 2018)
+We recommend adjusting Docker's resource settings to use at least 4GB of RAM and 2GB of swap. The defaults of 2GB RAM and 1GB swap are likely to cause the error `Killed` when running `build-assets` to build JS dependencies.
 
-# start the app
-docker-compose up    # Ctrl-C to stop
-docker-compose up -d # or, start in detached (silent) mode
+## Build the project
 
-# stop the app (if started in detached mode)
-docker-compose down
+To build the project, `cd` into the project root directory (where `compose.yaml` is located) and run:
 
-# start specific service
-docker-compose up --no-deps -d solr
-
-# remove all volumes (i.e. reset all databases); perform WHILE RUNNING
-docker-compose stop
-docker-compose rm -v
+```sh
+docker compose build
 ```
+
+The build process may take more than 15 minutes on older hardware or slower networks. If it times out and fails, simply re-run the command.
+
+If you encounter any build errors, please check the [Troubleshooting](#troubleshooting) section below or [browse our issues tagged with docker](https://github.com/internetarchive/openlibrary/issues?q=is%3Aissue%20label%3A%22Module%3A%20Docker%22).
+
+## Run the app
+
+```sh
+docker compose up    # Ctrl-C to stop
+docker compose up -d # or, start in detached (silent) mode
+```
+
+If the frontend watch command reports missing icon assets, generate them from the project root and then start the watcher again:
+
+```sh
+docker compose run --rm home make icons
+docker compose run --rm home npm run watch
+```
+
+This is especially likely on a first checkout or when setting up on a new machine.
+
+You will know the environment is done loading when the text stops furiously scrolling by and you see the following repeating every few seconds on the console:
+
+```log
+infobase_1      | 172.19.0.5:45716 - - [16/Feb/2023 16:54:10] "HTTP/1.1 GET /openlibrary.org/log/2023-02-16:0" - 200 OK
+infobase_1      | 172.19.0.5:45730 - - [16/Feb/2023 16:54:15] "HTTP/1.1 GET /openlibrary.org/log/2023-02-16:0" - 200 OK
+infobase_1      | 172.19.0.5:41790 - - [16/Feb/2023 16:54:20] "HTTP/1.1 GET /openlibrary.org/log/2023-02-16:0" - 200 OK
+```
+
+At this point, visit <http://localhost:8080> and you should see the Open Library banner image with "development version" emblazoned upon it to signify that it's running from your local development server.
 
 This exposes the following ports:
 
@@ -56,106 +80,230 @@ This exposes the following ports:
 | 8983 | Solr                   |
 | 7075 | Cover store            |
 
-For example, to access Solr admin, go to http://localhost:8983/solr/admin/
+For example, to access Solr admin, go to <http://localhost:8983/solr/admin/>
 
 ## Code Updates
 
-While running the `oldev` container, gunicorn is configured to auto-reload modified files. To see the effects of your changes in the running container, the following apply:
+> [!TIP]
+> When the Open Library code within your local docker image falls behind the code upstream, you can typically `git pull` the latest changes from GitHub without having to rebuild all your docker image(s).
 
-- **Editing python files or web templates?** Simply save the file; gunicorn will auto-reload it.
-- **Editing frontend css or js?** Run `docker-compose run --rm home npm run-script build-assets`. This will re-generate the assets in the persistent `ol-build` volume mount (so the latest changes will be available between stopping / starting  `web` containers). Note, if you want to view the generated output you will need to attach to the container (`docker-compose exec web bash`) to examine the files in the volume, not in your local dir.
-- **Editing pip packages?** Rebuild the `home` service: `docker-compose build home`
-- **Editing npm packages?** Run `docker-compose run --rm home npm install` (see [#2032](https://github.com/internetarchive/openlibrary/issues/2032) for why)
-- **Editing core dependencies?** You will most likely need to do a full rebuild. This shouldn't happen too frequently. If you are making this sort of change, you will know exactly what you are doing ;) See [Developing the Dockerfile](#developing-the-dockerfile).
+These instructions are for contributors who have **already** built Open Library using Docker, but may have made or pulled changes to their codebase that conflict with what's baked into the image.
 
-## Useful Runtime Commands
+Building the Open Library project can take a while and most of its images don't change often, so we only want to rebuild them when necessary. When a docker image is created, its dependencies (`pip`, `npm`, `apt-get`) are frozen in time and will be inherited by any container based from it.
 
-See Docker's docs for more: https://docs.docker.com/compose/reference/overview
+Occasionally, there will be cases when changes we pull or make to our codebase will require changes to our docker environment -- for instance, the addition of a python dependency, npm package, or changes to our js/vue/css that require assets to be rebuilt. In most of these cases, because the `openlibrary` repo is volume mounted, we can use the pattern `docker compose run --rm home <command>` to spin up a temporary container with instructions that run build commands to ensure our environment has all the necessary dependencies. For instance, if changes have been made to:
 
-```bash
-# Read a service's logs (replace `web` with service name)
-docker-compose logs web # Show all logs (onetime)
-docker-compose logs -f --tail=10 web # Show last 10 lines and follow
+| Change                                                          | Fix                                                                                                                                                                                                         |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`pip` python package dependencies** (e.g. `requirements.txt`) | rebuild just the `home` image with: `docker compose build home`                                                                                                                                             |
+| **`npm` packages**                                              | run `docker compose run --rm home npm install --no-audit` (see [#2032](https://github.com/internetarchive/openlibrary/issues/2032) for why)                                                                 |
+| **`js`, `vue`, `css`** and other static front-end assets        | perform a complete rebuild of assets using `docker compose run --rm home npm run build-assets`, or follow the [Frontend Guide](https://docs.openlibrary.org/developers/frontend/frontend-guide.html) to rebuild only certain asset types. |
 
-# Analyze a container
-docker-compose exec web bash # Launch terminal in `web` service
+> [!WARNING]
+> In the off-chance you find yourself needing to edit core dependencies like `apt-get` or networking, you will most likely need to do a [full rebuild](#fully-resetting-your-environment). If you are making this sort of change, you will know exactly what you are doing. See [Developing the Dockerfile](#developing-the-dockerfile).
 
-# Run tests
-docker-compose run --rm home make test
+> [!TIP]
+> In addition to using `docker compose run --rm home <command>` to spin up a temporary container to produce an artifact, you can also use `docker compose exec -it home <command>` to run the fix directly on the running container. This may also allow you to test one-off changes that might otherwise require a [full rebuild](#fully-resetting-your-environment). Use caution with this approach as you may end up breaking your container and causing a restart loop.
 
-# Install Node.js modules (if you get an error running tests)
-# Important: npm jobs need to be run inside the Docker environment.
-docker-compose run --rm home npm install
-# build JS/CSS assets:
-docker-compose run --rm home npm run build-assets
+## Teardown commands
+
+```sh
+cd path/to/your/cloned/openlibrary
+# stop the app (if started in detached mode)
+docker compose down
+
+# start specific service
+docker compose up --no-deps -d solr
+
+# remove all volumes (i.e. reset all databases); perform WHILE RUNNING
+docker compose stop
+docker compose rm -v
 ```
 
 ## Fully Resetting Your Environment
 
-Been away for a while? Are you getting strange errors you weren't getting before? Sometimes changes are made to the docker configs which could cause your local environment to break. To do a full reset of your docker environment so that you have the latest of everything:
+Been away for a while? Are you getting strange errors you weren't getting before? Sometimes changes are made to the docker configs which could cause your local environment to break.
+To do a full reset, run the following script from the root of the repo:
 
+[`scripts/fully_reset_environment.sh`](https://github.com/internetarchive/openlibrary/blob/master/scripts/fully_reset_environment.sh)
+
+```sh
+bash scripts/fully_reset_environment.sh
 ```
-# Stop the site
-docker-compose down
 
-# Build the latest oldev image, whilst also pulling the latest olbase image from docker hub
-# (Takes a while; ~20min for me)
-docker-compose build --pull
+## Troubleshooting
 
-# Remove any old containers; if you use docker for something special, and have containers you don't want to lose, be careful with this. But you likely don't :)
-docker container prune
+### "openlibrary-web-1 | exec docker/ol-web-start.sh: no such file or directory" OR "/usr/bin/env: 'python\r': No such file or directory"
 
-# Remove volumes that might have outdated dependencies/code
-docker volume rm openlibrary_ol-build openlibrary_ol-nodemodules openlibrary_ol-vendor
+These errors may appear in different containers or with different file names, but look for file-not-found type errors where `\r` is in the filename, or there's `exec`, a path that seems to exist, and a `no such file or directory` error, e.g. `openlibrary-web-1 | exec docker/ol-web-start.sh: no such file or directory`
 
-# Bring it back up again
-docker-compose up -d
+The likely cause here is that text files were given CRLF line endings during cloning+checkout. See [Fix line endings, symlinks, and git submodules](https://docs.openlibrary.org/developers/tools/git.html#fix-line-endings-symlinks-and-git-submodules-only-for-windows-users-not-using-a-linux-vm).
+
+Note: after fixing this error, be on the lookout for another error that will appear almost immediately after running `docker compose up` that mentions something about the `role` of `openlibrary` not existing. Read on for how to address that.
+
+### An error similar to: FATAL: role "openlibrary" does not exist
+
+Look for errors that appear very soon after running `docker compose up` that come from the `openlibrary-db-1` container when it first starts mentioning something about the `role` of `openlibrary` not existing.
+
+In this case, try the steps in [Fully Resetting Your Environment](#fully-resetting-your-environment).
+
+Note: please update this README with the exact wording of the error if you run into it.
+
+### "OSError: [Errno 12] Cannot allocate memory: '/openlibrary/openlibrary/core'"
+
+`OSError: [Errno 12] Cannot allocate memory:` could occur in conjunction with `/openlibrary/openlibrary/core` or any number of files. Simply try increasing free RAM or increasing swap/page file/virtual memory for your operating system.
+
+### "No module named 'infogami'"
+
+The following should populate the target of the `infogami` symbolic link (i.e. `vendor/infogami/`):
+
+```sh
+cd path/to/your/cloned/openlibrary
+git submodule init; git submodule sync; git submodule update
+```
+
+Windows users may need to see [Fix line endings, symlinks, and git submodules](https://docs.openlibrary.org/developers/tools/git.html#fix-line-endings-symlinks-and-git-submodules-only-for-windows-users-not-using-a-linux-vm).
+
+### "no configuration file provided: not found" when running `docker compose <command>`
+
+Ensure you're running `docker compose` commands from within the `local-openlibrary-dev-directory`.
+
+### ConnectionError: HTTPConnectionPool(host='solr', port=8983)
+
+The full error is something like (line breaks added):
+
+```log
+/openlibrary/openlibrary/templates/home/index.html: error in processing
+ template: ConnectionError: HTTPConnectionPool(host='solr', port=8983):
+Max retries exceeded with url: /solr/openlibrary/select (Caused by
+NameResolutionError("<urllib3.connection.HTTPConnection object at
+0x77a95c4e7f90>: Failed to resolve 'solr' ([Errno -2] Name or service
+not known)")) (falling back to default template)
+```
+
+The following should get everything running again:
+
+```sh
+docker compose down
+docker container ls -a
+# If you see any openlibrary containers here, remove them with `docker rm -f NAME`
+docker network ls
+# If you see any open library networks here, remove them with `docker network rm NAME`
+docker compose up  # or docker compose up -d
+```
+
+If you're curious and want to understand what happened, and why the above likely fixes it, first, verify the `solr` container is running (e.g. `docker ps | grep solr`, and then look for something like `openlibrary-solr-1` that isn't `solr-updater`.) If the `solr` container isn't running, simply start it with `docker compose up solr` (or `docker compose up -d solr`) and that should fix it. If `solr` is running, verify too that you can also connect to solr at <http://localhost:8983/solr/#/>. If you can't, something else is likely wrong.
+
+If the `solr` container is running and the error persists, one cause seems to be that the containers sometimes become disconnected from `openlibrary_webnet` (though this could happen with `openlibrary_dbnet` too). `openlibrary-web-1`/`web` should be connected to both `openlibrary_webnet` and `openlibrary_dbnet`, but when this problem occurs, instead only one is connected. E.g.:
+
+```sh
+docker container inspect --format '{{.NetworkSettings.Networks}}' openlibrary-web-1
+# output: map[openlibrary_dbnet:0xc00037c1c0]
+```
+
+Because you've read this far, you can now directly fix the problem without removing the containers and networks. Simply reconnect the container to the network:
+
+```sh
+docker network connect openlibrary_webnet openlibrary-web-1  # or `openlibrary_dbnet` as the case may be.
+docker container inspect --format '{{.NetworkSettings.Networks}}' openlibrary-web-1
+# output: map[openlibrary_dbnet:0xc00016c460 openlibrary_webnet:0xc00016c540]
+```
+ 11874/hotfix/add-selinux-relabel-bind-mount-option-on-selinux-compose
+No restart is required. If `webnet` no longer exists, recreating it _should_ fix things: `docker network create openlibrary_webnet`.
+
+To understand a bit more about what's going on here, there are docker networks configured in `compose.yaml`. The containers should be able to resolve one another based on the container names (e.g. `web` and `solr`), assuming `compose.yaml` has them on the same netork. For more, see [Networking in Compose](https://docs.docker.com/compose/networking/).
+
+### npm fails with `ENOTEMPTY: directory not empty, rmdir ...` (Docker Desktop on macOS)
+
+Commands that run npm inside a container (e.g. `make css`/`js`, `npm run build-assets`, or `npm install`) fail consistently with an error such as:
+
+```log
+npm error code ENOTEMPTY
+npm error syscall rmdir
+npm error path /openlibrary/node_modules/vite/dist
+npm error ENOTEMPTY: directory not empty, rmdir '/openlibrary/node_modules/vite/dist'
+make: *** [Makefile:20: node_modules] Error 217
+```
+
+Sometimes accompanied by `npm ls` reporting packages as `UNMET DEPENDENCY` even though the directories visibly exist. On macOS, one known cause is Docker Desktop's **Docker VMM (beta)** virtual machine backend corrupting writes to named volumes (such as `ol-nodemodules`, the volume backing `/openlibrary/node_modules`).
+
+To resolve:
+
+1. In Docker Desktop, go to Settings → General → **Virtual machine options** and switch from "Docker VMM" to the **Apple Virtualization framework** (it's fine to keep VirtioFS selected for file sharing), then Apply & restart.
+2. Recreate the corrupted volume so it's repopulated from a healthy state:
+
+   ```sh
+   docker rm openlibrary-web-1 openlibrary-home-1  # only if these exited containers still reference the volume
+   docker volume rm openlibrary_ol-nodemodules
+   ```
+
+3. Re-run your npm command, e.g. `docker compose run --rm web make css`. (If other `*_ol-nodemodules` volumes were populated while Docker VMM was active — e.g. volumes for other clones/worktrees — recreate them the same way.)
+
+### Permission denied errors on SELinux
+
+SELinux implements [Mandatory Access Controls (MAC)](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/7/html/virtualization_security_guide/sect-virtualization_security_guide-svirt-mac). Even if normal file permissions (user/group/other) would allow access, SELinux can still block resulting in permission denied errors. By adding the `z` or `Z` [bind mount options for Docker/Podman](https://docs.docker.com/engine/storage/bind-mounts/#configure-the-selinux-label) this allows the container process to access the files, by changing the MAC label.
+
+`compose.selinux.yaml` contains these label overrides to allow the containers to run with Docker or Podman within SELinux enabled systems.
+
+`podman-compose -f compose.yaml -f compose.override.yaml -f compose.selinux.yaml up -d`
+
+## Technical notes
+ master
+
+No restart is required. If `webnet` no longer exists, recreating it _should_ fix things: `docker network create openlibrary_webnet`.
+
+To understand a bit more about what's going on here, there are docker networks configured in `compose.yaml`. The containers should be able to resolve one another based on the container names (e.g. `web` and `solr`), assuming `compose.yaml` has them on the same network. For more, see [Networking in Compose](https://docs.docker.com/compose/networking/).
+
+## Useful Runtime Commands
+
+See Docker's docs for more: <https://docs.docker.com/compose/reference/overview>
+
+```sh
+# Read a service's logs (replace `web` with service name)
+docker compose logs web # Show all logs (onetime)
+docker compose logs -f --tail=10 web # Show last 10 lines and follow
+
+# Analyze a container
+docker compose exec web bash # Launch terminal in `web` service
+
+# Run tests
+docker compose run --rm home make test
+
+# Install Node.js modules (if you get an error running tests)
+# Important: npm jobs need to be run inside the Docker environment.
+docker compose run --rm home npm install --no-audit
+# build JS/CSS assets:
+docker compose run --rm home npm run build-assets
+```
+
+```sh
+# Launch a temporary container and run tests
+docker compose run --rm home make test
+
+# Run Open Library using a local copy of Infogami for development
+
+docker compose down && \
+    docker compose -f compose.yaml -f compose.override.yaml -f compose.infogami-local.yaml up -d && \
+    docker compose logs -f --tail=10 web
+
+# In your browser, navigate to http://localhost:8080
+
+# To test Open Library on another version of Python, modify Dockerfile.olbase and then
+# rebuild olbase (see above) and oldev (`docker compose build`)
 ```
 
 ## Developing the Dockerfile
 
 If you need to make changes to the dependencies in Dockerfile.olbase, rebuild it with:
 
-```bash
+```sh
 docker build -t openlibrary/olbase:latest -f docker/Dockerfile.olbase . # 30+ min (Win10Home/Dec 2018)
 ```
 
-This image is automatically rebuilt when master is pushed to at https://hub.docker.com/r/openlibrary/olbase .
+This image is automatically rebuilt on deploy by ol-home0 and is pushed to at <https://hub.docker.com/r/openlibrary/olbase>.
 
 If you're making changes you think might affect Docker Hub, you can create a branch starting with `docker-test`, e.g. `docker-test-py2py3` (no weird chars), to trigger a build in docker hub at e.g. `openlibrary/olbase:docker-test-py2py3`.
 
-## Updating the Docker Image
+## Debugging and Profiling the Docker Image
 
-Pull the changes into your openlibrary repository: ```git pull```
-
-When pulling down new changes you will need to rebuild the JS/CSS assets:
-```bash
-# build JS/CSS assets:
-docker-compose run --rm home npm run build-assets
-```
-Note: This is only if you already have an existing docker image, this command is unnecessary the first time you build.
-
-## Other Commands
-
-https://github.com/internetarchive/openlibrary/wiki/Deployment-Guide#ol-web1
-
-```bash
-# Launch a temporary container and run tests
-docker-compose run --rm home make test
-
-# Run Open Library using a local copy of Infogami for development
-
-docker-compose down && \
-    docker-compose -f docker-compose.yml -f docker-compose.override.yml -f docker-compose.infogami-local.yml up -d && \
-    docker-compose logs -f --tail=10 web
-
-# In your browser, navigate to http://localhost:8080
-
-# Test Open Library on another version of Python that is in `.python-version` and ol-dev
-# PYENV_VERSION can currently be set to: 3.8.6 (default), or 3.9.4
-docker-compose down && \
-    PYENV_VERSION=3.9.4 docker-compose up -d && \
-    docker-compose logs -f --tail=10 web
-
-# In your browser, navigate to http://localhost:8080
-```
+See [Debugging and Performance Profiling](https://docs.openlibrary.org/advanced/debugging-and-performance-profiling.html) for more information on how to attach a debugger when running in the Docker Container.
